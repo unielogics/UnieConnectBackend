@@ -1,0 +1,104 @@
+import { FastifyInstance } from 'fastify';
+import crypto from 'crypto';
+import { config } from '../config/env';
+import { exchangeCodeForTokens } from '../services/amazon-auth';
+import { ChannelAccount } from '../models/channel-account';
+import { User } from '../models/user';
+
+// Simple in-memory state store; replace with durable storage if needed
+const pendingStates = new Map<
+  string,
+  {
+    userId: string;
+    region: string;
+    createdAt: number;
+  }
+>();
+
+function buildAuthorizeUrl(state: string, redirectUri: string) {
+  const base = 'https://sellercentral.amazon.com/apps/authorize/consent';
+  const url = new URL(base);
+  url.searchParams.set('application_id', config.amazon.clientId);
+  url.searchParams.set('state', state);
+  url.searchParams.set('redirect_uri', redirectUri);
+  url.searchParams.set('version', 'beta');
+  return url.toString();
+}
+
+export async function amazonAuthRoutes(fastify: FastifyInstance) {
+  fastify.get('/auth/amazon/start', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+
+    const region = String((req.query as any)?.region || config.amazon.region || 'na').toLowerCase();
+    const redirectUri = config.amazon.redirectUri || `${config.amazon.appBaseUrl}/api/v1/auth/amazon/callback`;
+    if (!config.amazon.clientId || !config.amazon.clientSecret || !redirectUri) {
+      return reply.code(500).send({ error: 'Amazon credentials not configured' });
+    }
+
+    const state = crypto.randomBytes(16).toString('hex');
+    pendingStates.set(state, { userId, region, createdAt: Date.now() });
+
+    const url = buildAuthorizeUrl(state, redirectUri);
+    return reply.redirect(url);
+  });
+
+  fastify.get('/auth/amazon/callback', async (req: any, reply) => {
+    const { state, spapi_oauth_code: code, selling_partner_id, marketplace_ids } = req.query as any;
+    if (!state || !code) return reply.code(400).send({ error: 'state and spapi_oauth_code are required' });
+
+    const ctx = pendingStates.get(String(state));
+    if (!ctx) return reply.code(400).send({ error: 'Invalid or expired state' });
+    pendingStates.delete(String(state));
+
+    const userDoc = await User.findById(ctx.userId).exec();
+    if (!userDoc) return reply.code(401).send({ error: 'Unauthorized' });
+
+    try {
+      const token = await exchangeCodeForTokens(String(code), config.amazon.redirectUri);
+      const expiresAt = new Date(Date.now() + (token.expires_in || 0) * 1000);
+
+      const marketplaces =
+        typeof marketplace_ids === 'string'
+          ? String(marketplace_ids)
+              .split(',')
+              .map((m) => m.trim())
+              .filter(Boolean)
+          : Array.isArray(marketplace_ids)
+          ? (marketplace_ids as string[]).map((m) => String(m)).filter(Boolean)
+          : [];
+
+      const account = await ChannelAccount.findOneAndUpdate(
+        { userId: userDoc._id, channel: 'amazon', sellingPartnerId: selling_partner_id || undefined },
+        {
+          userId: userDoc._id,
+          channel: 'amazon',
+          sellingPartnerId: selling_partner_id || undefined,
+          marketplaceIds: marketplaces,
+          region: ctx.region,
+          accessToken: token.access_token, // satisfy required field; short-lived
+          refreshToken: token.refresh_token,
+          lwaRefreshToken: token.refresh_token,
+          lwaAccessToken: token.access_token,
+          lwaAccessTokenExpiresAt: expiresAt,
+          status: 'active',
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      ).exec();
+
+      return reply.send({
+        success: true,
+        accountId: account?._id,
+        sellingPartnerId: selling_partner_id,
+        marketplaceIds: marketplaces,
+        region: ctx.region,
+        expiresAt,
+      });
+    } catch (err: any) {
+      fastify.log.error({ err, state }, 'Amazon auth failed');
+      return reply.code(500).send({ error: 'Amazon auth failed', detail: err?.message });
+    }
+  });
+}
+
+
