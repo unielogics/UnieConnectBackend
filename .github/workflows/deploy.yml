@@ -32,11 +32,13 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
             set -e
-            REPO="unielogics/UnieConnectBackend"
-            APP_DIR="/var/www/unie-backend"
+            REPO="${{ github.repository }}"
+            APP_DIR="${{ secrets.EC2_APP_PATH }}"
 
-            mkdir -p "$APP_DIR"
-            cd "$APP_DIR"
+            echo "Using APP_DIR=\$APP_DIR and REPO=\$REPO"
+
+            mkdir -p "\$APP_DIR"
+            cd "\$APP_DIR"
 
             if [ -d ".git" ]; then
               git fetch --all
