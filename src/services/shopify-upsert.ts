@@ -5,6 +5,7 @@ import { Customer } from '../models/customer';
 import { CustomerExternal } from '../models/customer-external';
 import { Order } from '../models/order';
 import { OrderLine } from '../models/order-line';
+import { upsertAuditFromShopify } from './audit-ingest';
 
 export type UpsertContext = {
   channelAccountId: string;
@@ -162,7 +163,16 @@ export async function upsertOrder(body: any, ctx: UpsertContext) {
     ).exec();
   }
 
+  await upsertAuditFromShopify({
+    userId,
+    channelAccountId,
+    log,
+    orderDoc: order,
+    rawOrder: body,
+  });
+
   log?.info?.({ externalOrderId, lines: lines.length }, 'Shopify order upserted');
+  return order;
 }
 
 async function ensureCustomer(rawCustomer: any, ctx: UpsertContext) {

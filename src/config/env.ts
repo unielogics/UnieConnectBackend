@@ -18,6 +18,7 @@ export const config = {
     clientId: process.env.EBAY_CLIENT_ID || '',
     clientSecret: process.env.EBAY_CLIENT_SECRET || '',
     ruName: process.env.EBAY_RU_NAME || '', // eBay Redirect URI (RuName)
+    redirectUri: process.env.EBAY_REDIRECT_URI || process.env.EBAY_RU_NAME || '',
     scope:
       process.env.EBAY_SCOPE ||
       [
@@ -43,5 +44,23 @@ export const config = {
   },
   dbUrl: process.env.DB_URL || '',
   authSecret: process.env.AUTH_SECRET || 'change-me',
+  rateShopping: {
+    apiUrl: process.env.RATE_SHOPPING_API_URL || '',
+    apiKey: process.env.RATE_SHOPPING_API_KEY || '',
+    ttlMs: Number(process.env.RATE_SHOPPING_TTL_MS || 7 * 24 * 60 * 60 * 1000), // default 7 days
+  },
+  shippo: {
+    apiKey: process.env.SHIPPO_API_KEY || '',
+    mockMode: String(process.env.SHIPPO_MOCK_MODE || '').toLowerCase() === 'true',
+    defaultFrom: {
+      city: process.env.SHIPPO_FROM_CITY || 'Los Angeles',
+      state: process.env.SHIPPO_FROM_STATE || 'CA',
+      postalCode: process.env.SHIPPO_FROM_POSTAL || '90001',
+      country: process.env.SHIPPO_FROM_COUNTRY || 'US',
+    },
+  },
+  geoapify: {
+    apiKey: process.env.GEOAPIFY_API_KEY || '',
+  },
 };
 

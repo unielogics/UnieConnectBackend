@@ -5,6 +5,7 @@ import { Order } from '../models/order';
 import { OrderLine } from '../models/order-line';
 import { Customer } from '../models/customer';
 import { CustomerExternal } from '../models/customer-external';
+import { upsertAuditFromAmazon } from './audit-ingest';
 
 type PullResult = { orders?: number };
 
@@ -150,6 +151,16 @@ async function upsertOrderWithItems(
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).exec();
   }
+
+  // Audit ingest
+  await upsertAuditFromAmazon({
+    userId,
+    channelAccountId,
+    log,
+    orderDoc,
+    rawOrder: order,
+    items,
+  });
 
   log.info({ externalOrderId, lines: items.length }, 'amazon order upserted');
 }
