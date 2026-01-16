@@ -31,7 +31,6 @@ export async function findCachedQuote(params: {
     $or: [{ expiresAt: { $exists: false } }, { expiresAt: { $gt: now } }],
   })
     .sort({ updatedAt: -1 })
-    .lean()
     .exec();
 }
 
@@ -77,9 +76,9 @@ export async function getOrCreateQuote(params: {
       expiresAt: ttlMs ? new Date(Date.now() + ttlMs) : undefined,
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
-  ).lean();
+  );
 
-  return quote as IRateShoppingQuote;
+  return quote as unknown as IRateShoppingQuote;
 }
 
 export async function callRateShoppingApi(input: {

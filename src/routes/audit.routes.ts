@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
+import { PipelineStage } from 'mongoose';
 import { AuditOrderLine } from '../models/audit-order-line';
 import { getOrCreateQuote, findCachedQuote } from '../services/rate-shopping';
 import { shippoRateQuote } from '../services/shippo-rate-shopping';
@@ -10,7 +11,7 @@ export async function auditRoutes(fastify: FastifyInstance) {
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
 
     const match = { userId: new Types.ObjectId(userId), dataQualityStatus: 'valid' as const };
-    const pipeline = [
+    const pipeline: PipelineStage[] = [
       { $match: match },
       {
         $group: {
@@ -36,7 +37,7 @@ export async function auditRoutes(fastify: FastifyInstance) {
           },
         },
       },
-      { $sort: { orders: -1 } },
+      { $sort: { orders: -1 as 1 | -1 } },
     ];
 
     const heatmap = await AuditOrderLine.aggregate(pipeline).exec();
@@ -48,7 +49,7 @@ export async function auditRoutes(fastify: FastifyInstance) {
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
 
     const match = { userId: new Types.ObjectId(userId), dataQualityStatus: 'valid' as const };
-    const pipeline = [
+    const pipeline: PipelineStage[] = [
       { $match: match },
       {
         $addFields: {
@@ -81,7 +82,7 @@ export async function auditRoutes(fastify: FastifyInstance) {
           },
         },
       },
-      { $sort: { year: -1, quarter: -1 } },
+      { $sort: { year: -1 as 1 | -1, quarter: -1 as 1 | -1 } },
     ];
 
     const summary = await AuditOrderLine.aggregate(pipeline).exec();
@@ -191,6 +192,16 @@ export async function auditRoutes(fastify: FastifyInstance) {
     }
 
     try {
+      const fetchQuote =
+        cacheOnly === true
+          ? undefined
+          : async () => {
+              if (Number.isFinite(quoteOverride)) {
+                return { amount: Number(quoteOverride), currency };
+              }
+              return shippoRateQuote({ toCity: city, toState: state, toZip: postalCode, weightLbs, itemCount });
+            };
+
       const quote = await getOrCreateQuote({
         city,
         state,
@@ -198,14 +209,7 @@ export async function auditRoutes(fastify: FastifyInstance) {
         itemCount,
         currency,
         ttlMs,
-        fetchQuote: cacheOnly
-          ? undefined
-          : async () => {
-              if (Number.isFinite(quoteOverride)) {
-                return { amount: Number(quoteOverride), currency };
-              }
-              return shippoRateQuote({ toCity: city, toState: state, toZip: postalCode, weightLbs, itemCount });
-            },
+        ...(fetchQuote ? { fetchQuote } : {}),
       });
       return { quote };
     } catch (err: any) {

@@ -23,13 +23,14 @@ type ShippoRate = {
 const SHIPPO_API_BASE = 'https://api.goshippo.com';
 
 function buildAddress(city: string, state: string, zip?: string, country?: string): ShippoAddress {
-  return {
+  const addr: ShippoAddress = {
     city,
     state,
-    zip,
     country: country || 'US',
     street1: 'Approximate address', // Shippo requires a street; we use a placeholder to get a quote
   };
+  if (zip) addr.zip = zip;
+  return addr;
 }
 
 export async function shippoRateQuote(params: {

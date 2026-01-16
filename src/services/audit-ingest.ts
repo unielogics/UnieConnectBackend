@@ -15,7 +15,14 @@ function dataQuality(shipTo: ShipTo | undefined, shippingLabelPresent?: boolean)
   return { status: reasons.length ? 'excluded' : 'valid', reasons };
 }
 
-function sumCosts(costs?: { fulfillment?: number; label?: number; prep?: number; thirdParty?: number }) {
+type CostFields = {
+  fulfillment?: number | undefined;
+  label?: number | undefined;
+  prep?: number | undefined;
+  thirdParty?: number | undefined;
+};
+
+function sumCosts(costs?: CostFields) {
   if (!costs) return undefined;
   const total = ['fulfillment', 'label', 'prep', 'thirdParty']
     .map((k) => (costs as any)[k])
