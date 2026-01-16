@@ -27,14 +27,20 @@ jobs:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_APP_PATH: ${{ secrets.EC2_APP_PATH }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 $EC2_USER@$EC2_HOST << 'EOF'
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $EC2_USER@$EC2_HOST << 'EOF'
             set -e
-            cd $EC2_APP_PATH
+            APP_DIR=$EC2_APP_PATH
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
 
-            if [ ! -d ".git" ]; then
-              git clone https://github.com/$REPO .
-            else
+            if [ -d ".git" ]; then
               git fetch --all
+              git reset --hard origin/main
+            else
+              rm -rf ./*
+              git init
+              git remote add origin https://github.com/$REPO.git
+              git fetch
               git reset --hard origin/main
             fi
 
@@ -43,7 +49,6 @@ jobs:
             # Optional build step (uncomment if you want to build on server)
             # npm run build
 
-            # Zero-downtime reload
             pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
             pm2 save
           EOF
