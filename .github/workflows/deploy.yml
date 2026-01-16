@@ -36,6 +36,7 @@ jobs:
 
             # Pull or clone
             if [ -d ".git" ]; then
+              git remote set-url origin https://github.com/unielogics/UnieConnectBackend.git || git remote add origin https://github.com/unielogics/UnieConnectBackend.git
               git fetch --all
               git reset --hard origin/main
             else
