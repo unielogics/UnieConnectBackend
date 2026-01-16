@@ -32,6 +32,13 @@ jobs:
 
             echo "Deploying repository $REPO (branch $BRANCH) to $APP_DIR"
 
+            # Ensure Node 20+
+            NODE_MAJOR=$(node -v 2>/dev/null | sed 's/v//;s/\..*//')
+            if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 20 ]; then
+              echo "Node 20+ required on EC2. Current: $(node -v 2>/dev/null || echo missing)"
+              exit 1
+            fi
+
             # Ensure the directory exists
             mkdir -p "$APP_DIR"
             cd "$APP_DIR"
@@ -49,12 +56,14 @@ jobs:
               git reset --hard origin/$BRANCH
             fi
 
-            # Install dependencies
-            npm install --production
+# Install dependencies (include dev deps for build), then prune
+npm ci || npm install
 
-            # Build step (required to produce dist/server.js)
-            node -v
-            npm run build
+# Build step (required to produce dist/server.js)
+npm run build
+
+# Prune dev deps for runtime
+npm prune --production || true
 
             # --- 3. PM2 zero-downtime reload ---
             pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
