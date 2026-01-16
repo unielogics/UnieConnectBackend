@@ -23,37 +23,36 @@ jobs:
       - name: Deploy to EC2
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            set -e
+set -e
 
-            # Hardcoded values directly in the EC2 shell
-            APP_DIR="/var/www/unie-backend"
-            REPO="https://github.com/unielogics/UnieConnectBackend.git"
+# Hardcoded deployment path
+APP_DIR="/var/www/unie-backend"
 
-            echo "Deploying repo $REPO to $APP_DIR"
+echo "Deploying repository https://github.com/unielogics/UnieConnectBackend.git to $APP_DIR"
 
-            # Ensure directory exists
-            mkdir -p "$APP_DIR"
-            cd "$APP_DIR"
+# Ensure the directory exists
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
 
-            # Pull or clone
-            if [ -d ".git" ]; then
-              git fetch --all
-              git reset --hard origin/main
-            else
-              rm -rf ./*
-              git init
-              git remote add origin "$REPO"
-              git fetch
-              git reset --hard origin/main
-            fi
+# Pull or clone
+if [ -d ".git" ]; then
+  git fetch --all
+  git reset --hard origin/main
+else
+  rm -rf ./*
+  git init
+  git remote add origin https://github.com/unielogics/UnieConnectBackend.git
+  git fetch
+  git reset --hard origin/main
+fi
 
-            # Install dependencies
-            npm install --production
+# Install dependencies
+npm install --production
 
-            # Optional build step
-            # npm run build
+# Optional build step
+# npm run build
 
-            # Zero-downtime reload with PM2
-            pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
-            pm2 save
-            EOF
+# Zero-downtime reload with PM2
+pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
+pm2 save
+EOF
