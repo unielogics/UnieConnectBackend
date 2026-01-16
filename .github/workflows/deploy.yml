@@ -56,14 +56,14 @@ jobs:
               git reset --hard origin/$BRANCH
             fi
 
-# Install dependencies (include dev deps for build), then prune
-npm ci || npm install
+            # Install dependencies (include dev deps for build), then prune
+            npm ci || npm install
 
-# Build step (required to produce dist/server.js)
-npm run build
+            # Build step (required to produce dist/server.js)
+            npm run build
 
-# Prune dev deps for runtime
-npm prune --production || true
+            # Prune dev deps for runtime
+            npm prune --production || true
 
             # --- 3. PM2 zero-downtime reload ---
             pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
