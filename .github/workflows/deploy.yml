@@ -30,6 +30,10 @@ jobs:
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 $EC2_USER@$EC2_HOST << 'EOF'
             set -e
             APP_DIR=$EC2_APP_PATH
+            if [ -z "$APP_DIR" ]; then
+              echo "EC2_APP_PATH is not set. Please set the secret EC2_APP_PATH to your deploy directory." >&2
+              exit 1
+            fi
             mkdir -p "$APP_DIR"
             cd "$APP_DIR"
 
