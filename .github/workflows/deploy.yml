@@ -30,19 +30,20 @@ jobs:
 
       - name: Deploy to EC2
         run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
-            set -e
-            REPO="${{ github.repository }}"
-            APP_DIR="${{ secrets.EC2_APP_PATH }}"
-            if [ -z "$APP_DIR" ]; then
-              echo "EC2_APP_PATH is not set. Please set the secret EC2_APP_PATH to your deploy directory." >&2
-              exit 1
-            fi
-            if [ -z "$REPO" ]; then
-              echo "REPO is not set." >&2
-              exit 1
-            fi
+          APP_DIR="${{ secrets.EC2_APP_PATH }}"
+          REPO="${{ github.repository }}"
+          if [ -z "$APP_DIR" ]; then
+            echo "EC2_APP_PATH is not set. Please set the secret EC2_APP_PATH to your deploy directory." >&2
+            exit 1
+          fi
+          if [ -z "$REPO" ]; then
+            echo "REPO is not set." >&2
+            exit 1
+          fi
 
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+            APP_DIR="$APP_DIR" REPO="$REPO" bash -s <<'EOF'
+            set -e
             mkdir -p "$APP_DIR"
             cd "$APP_DIR"
 
