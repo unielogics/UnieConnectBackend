@@ -23,39 +23,39 @@ jobs:
       - name: Deploy to EC2
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-set -e
+            set -e
 
-# --- 1. Hardcoded deployment path & repo ---
-APP_DIR="/var/www/unie-backend"
-REPO="https://github.com/unielogics/UnieConnectBackend.git"
-BRANCH="main"
+            # --- 1. Hardcoded deployment path & repo ---
+            APP_DIR="/var/www/unie-backend"
+            REPO="https://github.com/unielogics/UnieConnectBackend.git"
+            BRANCH="main"
 
-echo "Deploying repository $REPO (branch $BRANCH) to $APP_DIR"
+            echo "Deploying repository $REPO (branch $BRANCH) to $APP_DIR"
 
-# Ensure the directory exists
-mkdir -p "$APP_DIR"
-cd "$APP_DIR"
+            # Ensure the directory exists
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
 
-# --- 2. Pull or clone ---
-if [ -d ".git" ]; then
-  git remote set-url origin "$REPO" || git remote add origin "$REPO"
-  git fetch --all
-  git reset --hard origin/$BRANCH
-else
-  rm -rf ./*
-  git init
-  git remote add origin "$REPO"
-  git fetch
-  git reset --hard origin/$BRANCH
-fi
+            # --- 2. Pull or clone ---
+            if [ -d ".git" ]; then
+              git remote set-url origin "$REPO" || git remote add origin "$REPO"
+              git fetch --all
+              git reset --hard origin/$BRANCH
+            else
+              rm -rf ./*
+              git init
+              git remote add origin "$REPO"
+              git fetch
+              git reset --hard origin/$BRANCH
+            fi
 
-# Install dependencies
-npm install --production
+            # Install dependencies
+            npm install --production
 
-# Optional: build step (uncomment if needed)
-# npm run build
+            # Optional: build step (uncomment if needed)
+            # npm run build
 
-# --- 3. PM2 zero-downtime reload ---
-pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
-pm2 save
+            # --- 3. PM2 zero-downtime reload ---
+            pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
+            pm2 save
 EOF
