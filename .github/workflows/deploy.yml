@@ -13,6 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.EC2_HOST }}" ]; then echo "EC2_HOST missing"; exit 1; fi
+          if [ -z "${{ secrets.EC2_USER }}" ]; then echo "EC2_USER missing"; exit 1; fi
+          if [ -z "${{ secrets.EC2_SSH_KEY }}" ]; then echo "EC2_SSH_KEY missing"; exit 1; fi
+          if [ -z "${{ secrets.EC2_APP_PATH }}" ]; then echo "EC2_APP_PATH missing"; exit 1; fi
+          echo "Secrets present (values masked)."
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
