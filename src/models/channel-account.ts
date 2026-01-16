@@ -4,6 +4,7 @@ export interface IChannelAccount extends Document {
   userId: Types.ObjectId;
   channel: string;
   shopDomain?: string;
+  externalSellerId?: string; // eBay seller username or external seller id when available
   accessToken: string;
   refreshToken?: string;
   expiresAt?: Date;

@@ -6,13 +6,14 @@ import { ChannelAccount } from '../models/channel-account';
 import { runRefresh } from '../services/shopify-cron';
 
 // In-memory state store; replace with persistent nonce table if needed.
-const states = new Map<string, { tenantId?: string; createdAt: number }>();
+const states = new Map<string, { tenantId?: string; sellerId?: string | undefined; createdAt: number }>();
 
 export async function ebayAuthRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/ebay/start', async (request, reply) => {
     const tenantId = String((request.query as any)?.tenantId || '');
+    const sellerId = (request.query as any)?.sellerId ? String((request.query as any).sellerId) : undefined;
     const state = crypto.randomBytes(16).toString('hex');
-    states.set(state, { tenantId, createdAt: Date.now() });
+    states.set(state, { tenantId, sellerId, createdAt: Date.now() });
     const url = buildEbayAuthUrl(state);
     return reply.redirect(url);
   });
@@ -20,7 +21,8 @@ export async function ebayAuthRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/ebay/callback', async (request, reply) => {
     const { code, state } = request.query as any;
     if (!code) return reply.code(400).send({ error: 'code required' });
-    if (!state || !states.has(state)) {
+    const stateEntry = state ? states.get(state) : undefined;
+    if (!state || !stateEntry) {
       fastify.log.warn({ state }, 'eBay auth callback with missing/expired state');
     }
 
@@ -43,6 +45,7 @@ export async function ebayAuthRoutes(fastify: FastifyInstance) {
           expiresAt: token.expiresAt,
           status: 'active',
           lastCronAt: new Date(0),
+          ...(stateEntry?.sellerId ? { externalSellerId: stateEntry.sellerId } : {}),
         },
         { upsert: true, new: true },
       ).exec();

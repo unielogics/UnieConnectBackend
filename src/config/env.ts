@@ -62,5 +62,9 @@ export const config = {
   geoapify: {
     apiKey: process.env.GEOAPIFY_API_KEY || '',
   },
+  corsOrigins: (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
 };
 

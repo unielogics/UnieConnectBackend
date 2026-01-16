@@ -27,7 +27,7 @@ async function start() {
   });
   await connectMongo();
   await app.register(cors, {
-    origin: true,
+    origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
