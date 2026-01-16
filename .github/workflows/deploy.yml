@@ -13,13 +13,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify required secrets
-        run: |
-          if [ -z "${{ secrets.EC2_HOST }}" ]; then echo "EC2_HOST missing"; exit 1; fi
-          if [ -z "${{ secrets.EC2_USER }}" ]; then echo "EC2_USER missing"; exit 1; fi
-          if [ -z "${{ secrets.EC2_SSH_KEY }}" ]; then echo "EC2_SSH_KEY missing"; exit 1; fi
-          echo "Secrets present (values masked)."
-
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -29,18 +22,18 @@ jobs:
 
       - name: Deploy to EC2
         run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             set -e
 
-            # Hardcoded values
+            # Hardcoded values directly in the EC2 shell
             APP_DIR="/var/www/unie-backend"
             REPO="https://github.com/unielogics/UnieConnectBackend.git"
 
             echo "Deploying repo $REPO to $APP_DIR"
 
-            # Ensure the directory exists
-            mkdir -p "\$APP_DIR"
-            cd "\$APP_DIR"
+            # Ensure directory exists
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
 
             # Pull or clone
             if [ -d ".git" ]; then
@@ -49,7 +42,7 @@ jobs:
             else
               rm -rf ./*
               git init
-              git remote add origin $REPO
+              git remote add origin "$REPO"
               git fetch
               git reset --hard origin/main
             fi
@@ -63,4 +56,4 @@ jobs:
             # Zero-downtime reload with PM2
             pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
             pm2 save
-          EOF
+EOF
