@@ -18,7 +18,6 @@ jobs:
           if [ -z "${{ secrets.EC2_HOST }}" ]; then echo "EC2_HOST missing"; exit 1; fi
           if [ -z "${{ secrets.EC2_USER }}" ]; then echo "EC2_USER missing"; exit 1; fi
           if [ -z "${{ secrets.EC2_SSH_KEY }}" ]; then echo "EC2_SSH_KEY missing"; exit 1; fi
-          if [ -z "${{ secrets.EC2_APP_PATH }}" ]; then echo "EC2_APP_PATH missing"; exit 1; fi
           echo "Secrets present (values masked)."
 
       - name: Setup SSH
@@ -32,32 +31,36 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
             set -e
-            REPO="${{ github.repository }}"
-            APP_DIR="${{ secrets.EC2_APP_PATH }}"
 
-            echo "Using APP_DIR=\$APP_DIR and REPO=\$REPO"
+            # Hardcoded values
+            APP_DIR="/var/www/unie-backend"
+            REPO="https://github.com/unielogics/UnieConnectBackend.git"
 
+            echo "Deploying repo $REPO to $APP_DIR"
+
+            # Ensure the directory exists
             mkdir -p "\$APP_DIR"
             cd "\$APP_DIR"
 
+            # Pull or clone
             if [ -d ".git" ]; then
               git fetch --all
               git reset --hard origin/main
             else
               rm -rf ./*
               git init
-              git remote add origin https://github.com/$REPO.git
+              git remote add origin $REPO
               git fetch
               git reset --hard origin/main
             fi
 
+            # Install dependencies
             npm install --production
 
-            # Optional build step (uncomment if you want to build on server)
+            # Optional build step
             # npm run build
 
+            # Zero-downtime reload with PM2
             pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
             pm2 save
           EOF
-
-
