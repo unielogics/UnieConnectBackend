@@ -5,7 +5,8 @@ import path from 'path';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 export const config = {
-  port: Number(process.env.PORT || 4000),
+  // Default to 80 so it can run behind an ALB/Nginx without extra env.
+  port: Number(process.env.PORT || 80),
   rabbitUrl: process.env.RABBITMQ_URL || '',
   shopify: {
     clientId: process.env.SHOPIFY_CLIENT_ID || '',
