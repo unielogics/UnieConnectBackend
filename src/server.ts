@@ -37,6 +37,13 @@ async function start() {
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   });
+
+  // Root health check (no prefix)
+  app.get('/health', async () => ({
+    status: 'ok',
+    service: 'UnieConnect',
+    ts: new Date().toISOString(),
+  }));
   // Register all routes under /api/v1 to match redirect/webhook URLs
   app.register(async (instance) => {
     await registerRoutes(instance);
