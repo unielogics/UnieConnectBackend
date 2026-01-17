@@ -7,7 +7,7 @@ import { startShopifyCron } from './services/shopify-cron';
 import { startAmazonCron } from './services/amazon-cron';
 
 async function start() {
-  const app = Fastify({ logger: true });
+  const app = Fastify({ logger: true, trustProxy: true });
 
   // Request/response tracing for observability
   app.addHook('onRequest', async (req) => {
