@@ -26,8 +26,13 @@ async function start() {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
   await connectMongo();
+  const allowedOrigins =
+    config.corsOrigins && config.corsOrigins.length > 0
+      ? config.corsOrigins
+      : ['https://unieconnect.com', 'https://user.unieconnect.com', 'https://admin.unieconnect.com'];
+
   await app.register(cors, {
-    origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
+    origin: allowedOrigins,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,

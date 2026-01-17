@@ -104,3 +104,4 @@ export async function customerRoutes(fastify: FastifyInstance) {
 
 
 
+
