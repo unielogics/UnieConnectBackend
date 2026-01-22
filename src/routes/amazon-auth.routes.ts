@@ -1,4 +1,5 @@
 import { FastifyInstance } from 'fastify';
+import fetch from 'node-fetch';
 import crypto from 'crypto';
 import { config } from '../config/env';
 import { exchangeCodeForTokens } from '../services/amazon-auth';
@@ -46,6 +47,9 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
     const wantsJson =
       String(req.headers.accept || '').includes('application/json') ||
       String((req.query as any)?.format || '').toLowerCase() === 'json';
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'oauth-start-pre',hypothesisId:'H4',location:'src/routes/amazon-auth.routes.ts:44',message:'amazon start wantsJson decision',data:{accept:req.headers.accept,format:(req.query as any)?.format,wantsJson,region},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
     if (wantsJson) {
       return reply.send({ url });
     }
