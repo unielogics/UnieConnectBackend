@@ -20,8 +20,20 @@ export async function registerRoutes(app: FastifyInstance) {
   // Attach user if Authorization bearer token is provided
   app.addHook('preHandler', async (req: any, _reply) => {
     const auth = req.headers.authorization;
-    if (auth?.startsWith('Bearer ')) {
-      const token = auth.slice(7);
+    const parseCookies = (cookieHeader: string | undefined) => {
+      if (!cookieHeader) return {};
+      return cookieHeader.split(';').reduce<Record<string, string>>((acc, part) => {
+        const [rawKey, ...rest] = part.trim().split('=');
+        if (!rawKey) return acc;
+        acc[rawKey] = decodeURIComponent(rest.join('='));
+        return acc;
+      }, {});
+    };
+    const token =
+      auth?.startsWith('Bearer ')
+        ? auth.slice(7)
+        : parseCookies(req.headers.cookie || '')['unie-token'];
+    if (token) {
       try {
         req.user = jwt.verify(token, config.authSecret);
       } catch {

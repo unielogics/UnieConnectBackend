@@ -22,6 +22,18 @@ export async function authRoutes(fastify: FastifyInstance) {
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
     const token = jwt.sign({ userId: user._id, email: user.email }, config.authSecret, { expiresIn: '7d' });
+    const host = String(req.headers.host || '');
+    const isProdHost = host.endsWith('unieconnect.com');
+    const cookieParts = [
+      `unie-token=${encodeURIComponent(token)}`,
+      'Path=/',
+      'HttpOnly',
+      `Max-Age=${7 * 24 * 60 * 60}`,
+      isProdHost ? 'Secure' : '',
+      isProdHost ? 'SameSite=None' : 'SameSite=Lax',
+      isProdHost ? 'Domain=.unieconnect.com' : '',
+    ].filter(Boolean);
+    reply.header('Set-Cookie', cookieParts.join('; '));
     req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'login success');
     return { token };
   });
