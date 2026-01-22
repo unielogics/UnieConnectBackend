@@ -16,9 +16,10 @@ function buildAuthorizeUrl(state: string, redirectUri: string, region: string) {
   const base =
     baseByRegion[region as keyof typeof baseByRegion] ?? baseByRegion.na;
   const url = new URL(base);
+  const cleanRedirectUri = redirectUri.trim().replace(/^=+/, '');
   url.searchParams.set('application_id', config.amazon.clientId);
   url.searchParams.set('state', state);
-  url.searchParams.set('redirect_uri', redirectUri);
+  url.searchParams.set('redirect_uri', cleanRedirectUri);
   url.searchParams.set('version', 'beta');
   return url.toString();
 }

@@ -13,11 +13,12 @@ type EbayTokenResponse = {
 const EBAY_TOKEN_ENDPOINT = `${config.ebay.apiBaseUrl}/identity/v1/oauth2/token`;
 
 export function buildEbayAuthUrl(state: string) {
+  const normalizedScope = config.ebay.scope.split(/\s+/).filter(Boolean).join(' ');
   const params = new URLSearchParams({
     client_id: config.ebay.clientId,
     redirect_uri: config.ebay.ruName,
     response_type: 'code',
-    scope: config.ebay.scope,
+    scope: normalizedScope,
     state,
   });
   return `${config.ebay.authBaseUrl}/oauth2/authorize?${params.toString()}`;
