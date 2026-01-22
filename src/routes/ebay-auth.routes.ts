@@ -6,6 +6,7 @@ import { User } from '../models/user';
 import { ChannelAccount } from '../models/channel-account';
 import { runRefresh } from '../services/shopify-cron';
 import { OAuthState } from '../models/oauth-state';
+import { config } from '../config/env';
 
 export async function ebayAuthRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/ebay/start', async (request, reply) => {
@@ -26,6 +27,9 @@ export async function ebayAuthRoutes(fastify: FastifyInstance) {
     const wantsJson =
       String(request.headers.accept || '').includes('application/json') ||
       String((request.query as any)?.format || '').toLowerCase() === 'json';
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'oauth-start-pre',hypothesisId:'H6',location:'src/routes/ebay-auth.routes.ts:25',message:'ebay start config snapshot',data:{clientIdPresent:Boolean(config.ebay.clientId),ruNamePresent:Boolean(config.ebay.ruName),authBaseUrlPresent:Boolean(config.ebay.authBaseUrl),scopeLength:config.ebay.scope.length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
     // #region agent log
     fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'oauth-start-pre',hypothesisId:'H3',location:'src/routes/ebay-auth.routes.ts:25',message:'ebay start wantsJson decision',data:{accept:request.headers.accept,format:(request.query as any)?.format,wantsJson,hasAuth:Boolean(userId)},timestamp:Date.now()})}).catch(()=>{});
     // #endregion agent log
