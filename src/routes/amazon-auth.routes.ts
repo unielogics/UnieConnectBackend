@@ -7,12 +7,13 @@ import { User } from '../models/user';
 import { OAuthState } from '../models/oauth-state';
 
 function buildAuthorizeUrl(state: string, redirectUri: string, region: string) {
-  const baseByRegion: Record<string, string> = {
+  const baseByRegion = {
     na: 'https://sellercentral.amazon.com/apps/authorize/consent',
     eu: 'https://sellercentral-europe.amazon.com/apps/authorize/consent',
     fe: 'https://sellercentral.amazon.co.jp/apps/authorize/consent',
-  };
-  const base = baseByRegion[region] || baseByRegion.na;
+  } as const;
+  const base =
+    baseByRegion[region as keyof typeof baseByRegion] ?? baseByRegion.na;
   const url = new URL(base);
   url.searchParams.set('application_id', config.amazon.clientId);
   url.searchParams.set('state', state);
