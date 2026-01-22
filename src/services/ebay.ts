@@ -13,7 +13,7 @@ type EbayTokenResponse = {
 const EBAY_TOKEN_ENDPOINT = `${config.ebay.apiBaseUrl}/identity/v1/oauth2/token`;
 
 export function buildEbayAuthUrl(state: string) {
-  const normalizedScope = config.ebay.scope.split(/\s+/).filter(Boolean).join(' ');
+  const normalizedScope = config.ebay.scope.replace(/\\/g, ' ').split(/\s+/).filter(Boolean).join(' ');
   const params = new URLSearchParams({
     client_id: config.ebay.clientId,
     redirect_uri: config.ebay.ruName,
@@ -34,10 +34,11 @@ export async function exchangeEbayCodeForToken(code: string) {
 }
 
 export async function refreshEbayAccessToken(refreshToken: string) {
+  const normalizedScope = config.ebay.scope.replace(/\\/g, ' ').split(/\s+/).filter(Boolean).join(' ');
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
-    scope: config.ebay.scope,
+    scope: normalizedScope,
   });
   return performTokenRequest(body);
 }
