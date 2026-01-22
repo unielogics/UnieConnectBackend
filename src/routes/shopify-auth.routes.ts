@@ -6,9 +6,7 @@ import { exchangeCodeForToken, registerWebhooks } from '../services/shopify';
 import { User } from '../models/user';
 import { ChannelAccount } from '../models/channel-account';
 import { runRefresh } from '../services/shopify-cron';
-
-// In-memory placeholder; replace with DB persistence.
-const accounts = new Map<string, any>();
+import { OAuthState } from '../models/oauth-state';
 
 function buildInstallUrl(shop: string, state: string) {
   const params = new URLSearchParams({
@@ -22,18 +20,34 @@ function buildInstallUrl(shop: string, state: string) {
 
 export async function shopifyAuthRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/shopify/start', async (request, reply) => {
+    const userId = (request as any).user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const shop = String((request.query as any)?.shop || '');
     const tenantId = String((request.query as any)?.tenantId || '');
     if (!shop || !tenantId) return reply.code(400).send({ error: 'shop and tenantId required' });
     const state = crypto.randomBytes(16).toString('hex');
+    await OAuthState.create({
+      provider: 'shopify',
+      state,
+      userId,
+      tenantId,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    });
     const url = buildInstallUrl(shop, state);
+    const wantsJson =
+      String(request.headers.accept || '').includes('application/json') ||
+      String((request.query as any)?.format || '').toLowerCase() === 'json';
+    if (wantsJson) {
+      return reply.send({ url });
+    }
     return reply.redirect(url);
   });
 
   fastify.get('/auth/shopify/callback', async (request, reply) => {
     const { shop, code, state } = request.query as any;
-    if (!shop || !code) return reply.code(400).send({ error: 'shop and code required' });
-    void state; // TODO: verify state against nonce storage.
+    if (!shop || !code || !state) return reply.code(400).send({ error: 'shop, code, and state required' });
+    const stateDoc = await OAuthState.findOneAndDelete({ provider: 'shopify', state: String(state) }).exec();
+    if (!stateDoc) return reply.code(400).send({ error: 'Invalid or expired state' });
 
     try {
       const token = await exchangeCodeForToken(shop, code);
@@ -57,11 +71,7 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
       ];
       await registerWebhooks({ shop, accessToken: token, address, topics });
 
-      const userId = (request as any).user?.userId;
-      if (!userId) {
-        return reply.code(401).send({ error: 'Unauthorized' });
-      }
-      const userDoc = await User.findById(userId).exec();
+      const userDoc = await User.findById(stateDoc.userId).exec();
       if (userDoc) {
         const account = await ChannelAccount.findOneAndUpdate(
           { userId: userDoc._id, channel: 'shopify', shopDomain: shop },
@@ -77,7 +87,7 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
         }
       }
 
-      return reply.send({ success: true, shop, token });
+      return reply.send({ success: true, shop });
     } catch (err: any) {
       fastify.log.error({ err, shop }, 'Shopify auth failed');
       return reply.code(500).send({ error: 'Shopify auth failed', detail: err?.message });

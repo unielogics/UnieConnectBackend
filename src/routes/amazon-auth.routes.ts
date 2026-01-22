@@ -4,19 +4,15 @@ import { config } from '../config/env';
 import { exchangeCodeForTokens } from '../services/amazon-auth';
 import { ChannelAccount } from '../models/channel-account';
 import { User } from '../models/user';
+import { OAuthState } from '../models/oauth-state';
 
-// Simple in-memory state store; replace with durable storage if needed
-const pendingStates = new Map<
-  string,
-  {
-    userId: string;
-    region: string;
-    createdAt: number;
-  }
->();
-
-function buildAuthorizeUrl(state: string, redirectUri: string) {
-  const base = 'https://sellercentral.amazon.com/apps/authorize/consent';
+function buildAuthorizeUrl(state: string, redirectUri: string, region: string) {
+  const baseByRegion: Record<string, string> = {
+    na: 'https://sellercentral.amazon.com/apps/authorize/consent',
+    eu: 'https://sellercentral-europe.amazon.com/apps/authorize/consent',
+    fe: 'https://sellercentral.amazon.co.jp/apps/authorize/consent',
+  };
+  const base = baseByRegion[region] || baseByRegion.na;
   const url = new URL(base);
   url.searchParams.set('application_id', config.amazon.clientId);
   url.searchParams.set('state', state);
@@ -37,9 +33,21 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
     }
 
     const state = crypto.randomBytes(16).toString('hex');
-    pendingStates.set(state, { userId, region, createdAt: Date.now() });
+    await OAuthState.create({
+      provider: 'amazon',
+      state,
+      userId,
+      region,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    });
 
-    const url = buildAuthorizeUrl(state, redirectUri);
+    const url = buildAuthorizeUrl(state, redirectUri, region);
+    const wantsJson =
+      String(req.headers.accept || '').includes('application/json') ||
+      String((req.query as any)?.format || '').toLowerCase() === 'json';
+    if (wantsJson) {
+      return reply.send({ url });
+    }
     return reply.redirect(url);
   });
 
@@ -47,11 +55,10 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
     const { state, spapi_oauth_code: code, selling_partner_id, marketplace_ids } = req.query as any;
     if (!state || !code) return reply.code(400).send({ error: 'state and spapi_oauth_code are required' });
 
-    const ctx = pendingStates.get(String(state));
-    if (!ctx) return reply.code(400).send({ error: 'Invalid or expired state' });
-    pendingStates.delete(String(state));
+    const stateDoc = await OAuthState.findOneAndDelete({ provider: 'amazon', state: String(state) }).exec();
+    if (!stateDoc) return reply.code(400).send({ error: 'Invalid or expired state' });
 
-    const userDoc = await User.findById(ctx.userId).exec();
+    const userDoc = await User.findById(stateDoc.userId).exec();
     if (!userDoc) return reply.code(401).send({ error: 'Unauthorized' });
 
     try {
@@ -75,7 +82,7 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
           channel: 'amazon',
           sellingPartnerId: selling_partner_id || undefined,
           marketplaceIds: marketplaces,
-          region: ctx.region,
+          region: stateDoc.region,
           accessToken: token.access_token, // satisfy required field; short-lived
           refreshToken: token.refresh_token,
           lwaRefreshToken: token.refresh_token,
@@ -91,7 +98,7 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
         accountId: account?._id,
         sellingPartnerId: selling_partner_id,
         marketplaceIds: marketplaces,
-        region: ctx.region,
+        region: stateDoc.region,
         expiresAt,
       });
     } catch (err: any) {

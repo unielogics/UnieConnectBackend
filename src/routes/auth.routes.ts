@@ -1,5 +1,4 @@
 import { FastifyInstance } from 'fastify';
-import fetch from 'node-fetch';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { User } from '../models/user';
@@ -10,32 +9,20 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/auth/login', async (req: any, reply) => {
     const { email, password } = req.body || {};
     const normalizedEmail = email ? String(email).toLowerCase() : '';
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'login-timeout-pre',hypothesisId:'H1',location:'src/routes/auth.routes.ts:13',message:'backend login handler entry',data:{hasEmail:Boolean(email),hasPassword:Boolean(password)},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
     req.log.info({ reqId: req.id, email: normalizedEmail, ip: req.ip }, 'login attempt');
     if (!email || !password) return reply.code(400).send({ error: 'Email and password required' });
     const user = await User.findOne({ email: normalizedEmail }).exec();
     if (!user) {
       req.log.warn({ reqId: req.id, email: normalizedEmail }, 'login failed: user not found');
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'login-timeout-pre',hypothesisId:'H2',location:'src/routes/auth.routes.ts:20',message:'backend login user not found',data:{hasUser:false},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion agent log
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) {
       req.log.warn({ reqId: req.id, email: normalizedEmail, userId: user._id }, 'login failed: bad password');
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'login-timeout-pre',hypothesisId:'H3',location:'src/routes/auth.routes.ts:27',message:'backend login bad password',data:{hasUser:true,passwordOk:false},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion agent log
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
     const token = jwt.sign({ userId: user._id, email: user.email }, config.authSecret, { expiresIn: '7d' });
     req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'login success');
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'login-timeout-pre',hypothesisId:'H4',location:'src/routes/auth.routes.ts:33',message:'backend login success',data:{tokenIssued:Boolean(token)},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
     return { token };
   });
 
