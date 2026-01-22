@@ -34,12 +34,16 @@ async function start() {
   });
   await connectMongo();
   const defaultCorsOrigins = ['https://unieconnect.com', 'https://user.unieconnect.com', 'http://localhost:3000'];
-  const corsOrigins = config.corsOrigins.length > 0 ? config.corsOrigins : defaultCorsOrigins;
+  const corsOrigins = Array.from(new Set([...defaultCorsOrigins, ...config.corsOrigins]));
   // #region agent log
   fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'cors-pre',hypothesisId:'H2',location:'src/server.ts:30',message:'cors configuration',data:{corsOrigins},timestamp:Date.now()})}).catch(()=>{});
   // #endregion agent log
   await app.register(cors, {
-    origin: corsOrigins,
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (corsOrigins.includes(origin)) return cb(null, true);
+      return cb(null, false);
+    },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
