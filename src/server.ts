@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import fetch from 'node-fetch';
 import cors from '@fastify/cors';
 import { registerRoutes } from './routes';
 import { config } from './config/env';
@@ -13,6 +14,12 @@ async function start() {
   app.addHook('onRequest', async (req) => {
     (req as any).startTime = process.hrtime.bigint();
     req.log.info({ reqId: req.id, method: req.method, url: req.url, ip: req.ip }, 'incoming request');
+    const origin = req.headers.origin;
+    if (origin) {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'cors-pre',hypothesisId:'H1',location:'src/server.ts:19',message:'request origin observed',data:{origin,method:req.method,url:req.url},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion agent log
+    }
   });
 
   app.addHook('onResponse', async (req, reply) => {
@@ -26,8 +33,13 @@ async function start() {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
   await connectMongo();
+  const defaultCorsOrigins = ['https://unieconnect.com', 'https://user.unieconnect.com', 'http://localhost:3000'];
+  const corsOrigins = config.corsOrigins.length > 0 ? config.corsOrigins : defaultCorsOrigins;
+  // #region agent log
+  fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'cors-pre',hypothesisId:'H2',location:'src/server.ts:30',message:'cors configuration',data:{corsOrigins},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
   await app.register(cors, {
-    origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
+    origin: corsOrigins,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,

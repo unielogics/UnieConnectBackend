@@ -26,7 +26,8 @@ export async function ebayAuthRoutes(fastify: FastifyInstance) {
     const url = buildEbayAuthUrl(state);
     const wantsJson =
       String(request.headers.accept || '').includes('application/json') ||
-      String((request.query as any)?.format || '').toLowerCase() === 'json';
+      String((request.query as any)?.format || '').toLowerCase() === 'json' ||
+      Boolean(request.headers.authorization);
     // #region agent log
     fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'oauth-start-pre',hypothesisId:'H6',location:'src/routes/ebay-auth.routes.ts:25',message:'ebay start config snapshot',data:{clientIdPresent:Boolean(config.ebay.clientId),ruNamePresent:Boolean(config.ebay.ruName),authBaseUrlPresent:Boolean(config.ebay.authBaseUrl),scopeLength:config.ebay.scope.length},timestamp:Date.now()})}).catch(()=>{});
     // #endregion agent log

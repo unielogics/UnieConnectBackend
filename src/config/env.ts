@@ -4,6 +4,8 @@ import path from 'path';
 // Explicitly load .env from project root to avoid cwd issues.
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
+const normalizeRedirectUri = (value: string) => value.trim().replace(/^=+/, '');
+
 export const config = {
   port: Number(process.env.PORT || 4000),
   rabbitUrl: process.env.RABBITMQ_URL || '',
@@ -34,9 +36,10 @@ export const config = {
     clientId: process.env.AMAZON_LWA_CLIENT_ID || '',
     clientSecret: process.env.AMAZON_LWA_CLIENT_SECRET || '',
     appBaseUrl: process.env.APP_BASE_URL || '',
-    redirectUri:
+    redirectUri: normalizeRedirectUri(
       process.env.AMAZON_LWA_REDIRECT_URI ||
-      `${process.env.APP_BASE_URL || ''}/api/v1/auth/amazon/callback`,
+        `${process.env.APP_BASE_URL || ''}/api/v1/auth/amazon/callback`,
+    ),
     region: process.env.AMAZON_REGION || 'na', // na, eu, fe
     awsAccessKeyId: process.env.AMAZON_SPAPI_AWS_ACCESS_KEY_ID || '',
     awsSecretAccessKey: process.env.AMAZON_SPAPI_AWS_SECRET_ACCESS_KEY || '',

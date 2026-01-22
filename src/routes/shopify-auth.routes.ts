@@ -36,7 +36,8 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
     const url = buildInstallUrl(shop, state);
     const wantsJson =
       String(request.headers.accept || '').includes('application/json') ||
-      String((request.query as any)?.format || '').toLowerCase() === 'json';
+      String((request.query as any)?.format || '').toLowerCase() === 'json' ||
+      Boolean(request.headers.authorization);
     if (wantsJson) {
       return reply.send({ url });
     }
