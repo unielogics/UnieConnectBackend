@@ -7,7 +7,7 @@ import { startShopifyCron } from './services/shopify-cron';
 import { startAmazonCron } from './services/amazon-cron';
 
 async function start() {
-  const app = Fastify({ logger: true, trustProxy: true });
+  const app = Fastify({ logger: true });
 
   // Request/response tracing for observability
   app.addHook('onRequest', async (req) => {
@@ -26,24 +26,12 @@ async function start() {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
   await connectMongo();
-  const allowedOrigins =
-    config.corsOrigins && config.corsOrigins.length > 0
-      ? config.corsOrigins
-      : ['https://unieconnect.com', 'https://user.unieconnect.com', 'https://admin.unieconnect.com'];
-
   await app.register(cors, {
-    origin: allowedOrigins,
+    origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   });
-
-  // Root health check (no prefix)
-  app.get('/health', async () => ({
-    status: 'ok',
-    service: 'UnieConnect',
-    ts: new Date().toISOString(),
-  }));
   // Register all routes under /api/v1 to match redirect/webhook URLs
   app.register(async (instance) => {
     await registerRoutes(instance);

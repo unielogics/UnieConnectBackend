@@ -97,4 +97,3 @@ async function handleWebhook(params: {
       log.info({ topic }, 'Shopify webhook ignored (topic not handled)');
   }
 }
-

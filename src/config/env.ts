@@ -5,7 +5,6 @@ import path from 'path';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 export const config = {
-  // Default back to 4000; override via PORT env if needed
   port: Number(process.env.PORT || 4000),
   rabbitUrl: process.env.RABBITMQ_URL || '',
   shopify: {
