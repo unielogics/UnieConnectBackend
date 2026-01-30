@@ -23,6 +23,19 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
     }));
   });
 
+  fastify.delete('/channel-accounts/:id', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { id } = req.params || {};
+    const existing = await ChannelAccount.findOne({ _id: id, userId }).lean().exec();
+    if (!existing) return reply.code(404).send({ error: 'Not found' });
+
+    // NOTE: This is a hard disconnect (removes the credential record).
+    // TODO: consider revoking tokens at the source (Shopify/Amazon/eBay) and/or cascading deletes.
+    await ChannelAccount.deleteOne({ _id: id, userId }).exec();
+    return { success: true };
+  });
+
   fastify.post('/channel-accounts/:id/refresh', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
