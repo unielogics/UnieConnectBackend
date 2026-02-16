@@ -1,5 +1,4 @@
 import { FastifyInstance } from 'fastify';
-import fetch from 'node-fetch';
 import crypto from 'crypto';
 import { config } from '../config/env';
 import { exchangeCodeForTokens } from '../services/amazon-auth';
@@ -17,7 +16,7 @@ function buildAuthorizeUrl(state: string, redirectUri: string, region: string) {
     baseByRegion[region as keyof typeof baseByRegion] ?? baseByRegion.na;
   const url = new URL(base);
   const cleanRedirectUri = redirectUri.trim().replace(/^=+/, '');
-  url.searchParams.set('application_id', config.amazon.clientId);
+  url.searchParams.set('application_id', config.amazon.appId || config.amazon.clientId);
   url.searchParams.set('state', state);
   url.searchParams.set('redirect_uri', cleanRedirectUri);
   url.searchParams.set('version', 'beta');
@@ -29,8 +28,11 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
 
-    const region = String((req.query as any)?.region || config.amazon.region || 'na').toLowerCase();
+    const q = req.query as any;
+    const region = String(q?.region || config.amazon.region || 'na').toLowerCase();
+    const redirectTo = String(q?.redirectTo || '').trim() || undefined;
     const redirectUri = config.amazon.redirectUri || `${config.amazon.appBaseUrl}/api/v1/auth/amazon/callback`;
+
     if (!config.amazon.clientId || !config.amazon.clientSecret || !redirectUri) {
       return reply.code(500).send({ error: 'Amazon credentials not configured' });
     }
@@ -41,20 +43,15 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
       state,
       userId,
       region,
+      redirectTo,
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     });
 
     const url = buildAuthorizeUrl(state, redirectUri, region);
     const wantsJson =
       String(req.headers.accept || '').includes('application/json') ||
-      String((req.query as any)?.format || '').toLowerCase() === 'json' ||
+      String(q?.format || '').toLowerCase() === 'json' ||
       Boolean(req.headers.authorization);
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'oauth-start-pre',hypothesisId:'H5',location:'src/routes/amazon-auth.routes.ts:40',message:'amazon start config snapshot',data:{region,redirectUri,appBaseUrl:config.amazon.appBaseUrl,clientIdPresent:Boolean(config.amazon.clientId),clientSecretPresent:Boolean(config.amazon.clientSecret)},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'oauth-start-pre',hypothesisId:'H4',location:'src/routes/amazon-auth.routes.ts:44',message:'amazon start wantsJson decision',data:{accept:req.headers.accept,format:(req.query as any)?.format,wantsJson,region},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
     if (wantsJson) {
       return reply.send({ url });
     }
@@ -62,17 +59,46 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/auth/amazon/callback', async (req: any, reply) => {
-    const { state, spapi_oauth_code: code, selling_partner_id, marketplace_ids } = req.query as any;
-    if (!state || !code) return reply.code(400).send({ error: 'state and spapi_oauth_code are required' });
+    const q = req.query as any;
+    const state = String(q?.state || '');
+    const code = String(q?.spapi_oauth_code || q?.code || '');
+    const selling_partner_id = q?.selling_partner_id;
+    const marketplace_ids = q?.marketplace_ids;
+    const errorParam = q?.error;
+    const error_description = q?.error_description;
 
-    const stateDoc = await OAuthState.findOneAndDelete({ provider: 'amazon', state: String(state) }).exec();
-    if (!stateDoc) return reply.code(400).send({ error: 'Invalid or expired state' });
+    if (errorParam) {
+      fastify.log.warn({ error: errorParam, error_description }, 'Amazon OAuth error');
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=amazon&message=${encodeURIComponent(error_description || errorParam)}`,
+      );
+    }
+
+    if (!state || !code) {
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=amazon&message=${encodeURIComponent('state and authorization code are required')}`,
+      );
+    }
+
+    const stateDoc = await OAuthState.findOneAndDelete({ provider: 'amazon', state }).exec();
+    if (!stateDoc) {
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=amazon&message=${encodeURIComponent('Invalid or expired state')}`,
+      );
+    }
 
     const userDoc = await User.findById(stateDoc.userId).exec();
-    if (!userDoc) return reply.code(401).send({ error: 'Unauthorized' });
+    if (!userDoc) {
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=amazon&message=${encodeURIComponent('User not found')}`,
+      );
+    }
+
+    const redirectBase = (stateDoc as any).redirectTo || config.frontendOrigin;
+    const successUrl = `${redirectBase.replace(/\/+$/, '')}/?success=amazon`;
 
     try {
-      const token = await exchangeCodeForTokens(String(code), config.amazon.redirectUri);
+      const token = await exchangeCodeForTokens(code, config.amazon.redirectUri);
       const expiresAt = new Date(Date.now() + (token.expires_in || 0) * 1000);
 
       const marketplaces =
@@ -85,7 +111,7 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
           ? (marketplace_ids as string[]).map((m) => String(m)).filter(Boolean)
           : [];
 
-      const account = await ChannelAccount.findOneAndUpdate(
+      await ChannelAccount.findOneAndUpdate(
         { userId: userDoc._id, channel: 'amazon', sellingPartnerId: selling_partner_id || undefined },
         {
           userId: userDoc._id,
@@ -93,7 +119,7 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
           sellingPartnerId: selling_partner_id || undefined,
           marketplaceIds: marketplaces,
           region: stateDoc.region,
-          accessToken: token.access_token, // satisfy required field; short-lived
+          accessToken: token.access_token,
           refreshToken: token.refresh_token,
           lwaRefreshToken: token.refresh_token,
           lwaAccessToken: token.access_token,
@@ -103,17 +129,12 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
         { upsert: true, new: true, setDefaultsOnInsert: true },
       ).exec();
 
-      return reply.send({
-        success: true,
-        accountId: account?._id,
-        sellingPartnerId: selling_partner_id,
-        marketplaceIds: marketplaces,
-        region: stateDoc.region,
-        expiresAt,
-      });
+      return reply.redirect(successUrl);
     } catch (err: any) {
       fastify.log.error({ err, state }, 'Amazon auth failed');
-      return reply.code(500).send({ error: 'Amazon auth failed', detail: err?.message });
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=amazon&message=${encodeURIComponent(err?.message || 'Amazon auth failed')}`,
+      );
     }
   });
 }

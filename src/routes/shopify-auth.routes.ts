@@ -9,21 +9,45 @@ import { runRefresh } from '../services/shopify-cron';
 import { OAuthState } from '../models/oauth-state';
 
 function buildInstallUrl(shop: string, state: string) {
+  const scope =
+    'read_products,write_products,read_orders,write_orders,read_customers,write_customers,read_inventory,write_inventory,read_fulfillments,write_fulfillments';
   const params = new URLSearchParams({
     client_id: config.shopify.clientId,
-    scope: 'read_orders,write_orders,read_inventory,write_inventory,read_fulfillments,write_fulfillments',
+    scope,
     redirect_uri: `${config.shopify.appBaseUrl}/api/v1/auth/shopify/callback`,
     state,
   });
   return `https://${shop}/admin/oauth/authorize?${params.toString()}`;
 }
 
+/** Verify Shopify HMAC on OAuth callback (req.query must match Shopify's signed params) */
+function verifyShopifyHmac(query: Record<string, string | string[] | undefined>, secret: string): boolean {
+  const hmac = query.hmac;
+  if (!hmac || typeof hmac !== 'string') return false;
+  const sorted = Object.keys(query)
+    .filter((k) => k !== 'hmac')
+    .sort()
+    .map((k) => {
+      const v = query[k];
+      const str = Array.isArray(v) ? (v[0] ?? '') : (v ?? '');
+      return `${k}=${str}`;
+    })
+    .join('&');
+  const computed = crypto.createHmac('sha256', secret).update(sorted).digest('hex');
+  const a = Buffer.from(computed, 'utf8');
+  const b = Buffer.from(String(hmac), 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 export async function shopifyAuthRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/shopify/start', async (request, reply) => {
     const userId = (request as any).user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const shop = String((request.query as any)?.shop || '');
-    const tenantId = String((request.query as any)?.tenantId || '');
+    const q = request.query as any;
+    const shop = String(q?.shop || '');
+    const tenantId = String(q?.tenantId || '');
+    const redirectTo = String(q?.redirectTo || '').trim() || undefined;
     if (!shop || !tenantId) return reply.code(400).send({ error: 'shop and tenantId required' });
     const state = crypto.randomBytes(16).toString('hex');
     await OAuthState.create({
@@ -31,6 +55,7 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
       state,
       userId,
       tenantId,
+      redirectTo,
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     });
     const url = buildInstallUrl(shop, state);
@@ -45,18 +70,41 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/auth/shopify/callback', async (request, reply) => {
-    const { shop, code, state } = request.query as any;
-    if (!shop || !code || !state) return reply.code(400).send({ error: 'shop, code, and state required' });
-    const stateDoc = await OAuthState.findOneAndDelete({ provider: 'shopify', state: String(state) }).exec();
-    if (!stateDoc) return reply.code(400).send({ error: 'Invalid or expired state' });
+    const query = request.query as Record<string, string | string[] | undefined>;
+    const shop = String(query.shop || '');
+    const code = String(query.code || '');
+    const state = String(query.state || '');
+    const hmac = query.hmac;
+
+    if (!shop || !code || !state) {
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=shopify&message=${encodeURIComponent('shop, code, and state required')}`,
+      );
+    }
+
+    // Verify HMAC (Shopify signs the callback)
+    const secret = config.shopify.clientSecret;
+    if (secret && hmac && !verifyShopifyHmac(query, secret)) {
+      fastify.log.warn({ shop }, 'Shopify callback HMAC validation failed');
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=shopify&message=${encodeURIComponent('HMAC validation failed')}`,
+      );
+    }
+
+    const stateDoc = await OAuthState.findOneAndDelete({ provider: 'shopify', state }).exec();
+    if (!stateDoc) {
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=shopify&message=${encodeURIComponent('Invalid or expired state')}`,
+      );
+    }
+
+    const redirectBase = (stateDoc as any).redirectTo || config.frontendOrigin;
+    const successUrl = `${redirectBase.replace(/\/+$/, '')}/?success=shopify&shop=${encodeURIComponent(shop)}`;
 
     try {
       const token = await exchangeCodeForToken(shop, code);
 
-      // Register webhooks for this shop using the new token
       const address = `${config.shopify.appBaseUrl}/api/v1/webhooks/shopify`;
-      // NOTE: orders/* topics are protected customer data; omitted until PCD access is approved.
-      // Use valid fulfillment_orders topics to avoid 422.
       const topics = [
         'fulfillment_orders/fulfillment_request_submitted',
         'fulfillment_orders/fulfillment_request_accepted',
@@ -88,10 +136,12 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
         }
       }
 
-      return reply.send({ success: true, shop });
+      return reply.redirect(successUrl);
     } catch (err: any) {
       fastify.log.error({ err, shop }, 'Shopify auth failed');
-      return reply.code(500).send({ error: 'Shopify auth failed', detail: err?.message });
+      return reply.redirect(
+        `${config.frontendOrigin}/?error=shopify&message=${encodeURIComponent(err?.message || 'Shopify auth failed')}`,
+      );
     }
   });
 }

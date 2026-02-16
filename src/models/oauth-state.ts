@@ -9,6 +9,7 @@ export interface IOAuthState extends Document {
   tenantId?: string;
   sellerId?: string;
   region?: string;
+  redirectTo?: string; // frontend URL to redirect user after OAuth success
   expiresAt: Date;
 }
 
@@ -20,6 +21,7 @@ const OAuthStateSchema = new Schema(
     tenantId: { type: String },
     sellerId: { type: String },
     region: { type: String },
+    redirectTo: { type: String },
     expiresAt: { type: Date, required: true, index: { expires: 0 } },
   },
   { timestamps: true }

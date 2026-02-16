@@ -13,9 +13,11 @@ export const config = {
     clientId: process.env.SHOPIFY_CLIENT_ID || '',
     clientSecret: process.env.SHOPIFY_CLIENT_SECRET || '',
     webhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET || '',
-    appBaseUrl: process.env.APP_BASE_URL || '', // e.g., https://connect.example.com
+    appBaseUrl: process.env.APP_BASE_URL || '', // e.g., https://api.unieconnect.com
     apiVersion: process.env.SHOPIFY_API_VERSION || '2024-01',
   },
+  /** Base URL of the frontend app for post-OAuth redirects (e.g. https://user.unieconnect.com) */
+  frontendOrigin: process.env.FRONTEND_ORIGIN || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
   ebay: {
     clientId: process.env.EBAY_CLIENT_ID || '',
     clientSecret: process.env.EBAY_CLIENT_SECRET || '',
@@ -35,6 +37,8 @@ export const config = {
   amazon: {
     clientId: process.env.AMAZON_LWA_CLIENT_ID || '',
     clientSecret: process.env.AMAZON_LWA_CLIENT_SECRET || '',
+    /** Application ID for Seller Central authorize URL (may differ from LWA client_id) */
+    appId: process.env.AMAZON_APP_ID || process.env.AMAZON_LWA_CLIENT_ID || '',
     appBaseUrl: process.env.APP_BASE_URL || '',
     redirectUri: normalizeRedirectUri(
       process.env.AMAZON_LWA_REDIRECT_URI ||
