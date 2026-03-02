@@ -13,6 +13,7 @@ import { amazonAuthRoutes } from './amazon-auth.routes';
 import { amazonRoutes } from './amazon.routes';
 import { auditRoutes } from './audit.routes';
 import { ebayWebhookRoutes } from './ebay-webhooks.routes';
+import { featureRoutes } from './features.routes';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
 
@@ -56,5 +57,6 @@ export async function registerRoutes(app: FastifyInstance) {
   await shopifyFulfillmentRoutes(app);
   await auditRoutes(app);
   await ebayWebhookRoutes(app);
+  await featureRoutes(app);
 }
 

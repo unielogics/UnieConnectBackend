@@ -6,6 +6,7 @@ export interface IUser extends Document {
   role: string;
   resetToken?: string;
   resetTokenExpires?: Date;
+  enabledFeatures?: string[]; // Quick access cache of enabled feature slugs
 }
 
 const UserSchema = new Schema(
@@ -15,6 +16,7 @@ const UserSchema = new Schema(
     role: { type: String, default: 'admin' },
     resetToken: { type: String },
     resetTokenExpires: { type: Date },
+    enabledFeatures: { type: [String], default: [] }, // Cache of enabled feature slugs
   },
   { timestamps: true }
 );
