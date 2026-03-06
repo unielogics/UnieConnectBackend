@@ -40,9 +40,11 @@ export const config = {
     /** Application ID for Seller Central authorize URL (may differ from LWA client_id) */
     appId: process.env.AMAZON_APP_ID || process.env.AMAZON_LWA_CLIENT_ID || '',
     appBaseUrl: process.env.APP_BASE_URL || '',
+    /** Prefer APP_BASE_URL so one config matches health and SP-API dashboard. Set AMAZON_LWA_REDIRECT_URI only to override. */
     redirectUri: normalizeRedirectUri(
-      process.env.AMAZON_LWA_REDIRECT_URI ||
-        `${process.env.APP_BASE_URL || ''}/api/v1/auth/amazon/callback`,
+      (process.env.APP_BASE_URL && process.env.APP_BASE_URL.trim() !== '')
+        ? `${process.env.APP_BASE_URL.trim().replace(/\/+$/, '')}/api/v1/auth/amazon/callback`
+        : (process.env.AMAZON_LWA_REDIRECT_URI || ''),
     ),
     region: process.env.AMAZON_REGION || 'na', // na, eu, fe
     awsAccessKeyId: process.env.AMAZON_SPAPI_AWS_ACCESS_KEY_ID || '',
