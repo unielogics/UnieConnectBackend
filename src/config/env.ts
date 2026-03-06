@@ -53,6 +53,8 @@ export const config = {
   },
   dbUrl: process.env.DB_URL || '',
   authSecret: process.env.AUTH_SECRET || 'change-me',
+  /** Email of the top-level super_admin account (franco@unielogics.com) */
+  superAdminEmail: process.env.SUPER_ADMIN_EMAIL || 'franco@unielogics.com',
   rateShopping: {
     apiUrl: process.env.RATE_SHOPPING_API_URL || '',
     apiKey: process.env.RATE_SHOPPING_API_KEY || '',

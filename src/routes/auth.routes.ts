@@ -2,10 +2,29 @@ import { FastifyInstance } from 'fastify';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { User } from '../models/user';
+import { InviteToken } from '../models/invite-token';
+import { UserActivityLog } from '../models/user-activity-log';
 import { config } from '../config/env';
+import { normalizeRole } from '../lib/roles';
 import crypto from 'crypto';
 
 export async function authRoutes(fastify: FastifyInstance) {
+  fastify.get('/auth/me', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const user = await User.findById(userId).select('email role firstName lastName phone lastLoginAt').lean().exec();
+    if (!user) return reply.code(401).send({ error: 'User not found' });
+    return {
+      userId: user._id,
+      email: user.email,
+      role: normalizeRole(user.role),
+      firstName: user.firstName,
+      lastName: user.lastName,
+      phone: user.phone,
+      lastLoginAt: user.lastLoginAt,
+    };
+  });
+
   fastify.post('/auth/login', async (req: any, reply) => {
     const { email, password } = req.body || {};
     const normalizedEmail = email ? String(email).toLowerCase() : '';
@@ -21,7 +40,15 @@ export async function authRoutes(fastify: FastifyInstance) {
       req.log.warn({ reqId: req.id, email: normalizedEmail, userId: user._id }, 'login failed: bad password');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
-    const token = jwt.sign({ userId: user._id, email: user.email }, config.authSecret, { expiresIn: '7d' });
+    user.lastLoginAt = new Date();
+    await user.save();
+    await UserActivityLog.create({ userId: user._id, action: 'login' });
+    const role = normalizeRole(user.role);
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role },
+      config.authSecret,
+      { expiresIn: '7d' }
+    );
     const host = String(req.headers.host || '');
     const isProdHost = host.endsWith('unieconnect.com');
     const cookieParts = [
@@ -35,7 +62,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     ].filter(Boolean);
     reply.header('Set-Cookie', cookieParts.join('; '));
     req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'login success');
-    return { token };
+    return { token, user: { userId: user._id, email: user.email, role } };
   });
 
   fastify.post('/auth/change-password', async (req: any, reply) => {
@@ -52,8 +79,67 @@ export async function authRoutes(fastify: FastifyInstance) {
     user.resetToken = null as any;
     user.resetTokenExpires = null as any;
     await user.save();
+    await UserActivityLog.create({ userId, action: 'password_change' });
     req.log.info({ reqId: req.id, userId }, 'password updated');
     return { success: true };
+  });
+
+  fastify.get('/auth/invite/validate', async (req: any, reply) => {
+    const token = (req.query as { token?: string }).token;
+    if (!token) return reply.send({ valid: false });
+    const invite = await InviteToken.findOne({ token }).lean().exec();
+    if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt.getTime() < Date.now())) {
+      return reply.send({ valid: false });
+    }
+    return reply.send({ valid: true, role: invite.role });
+  });
+
+  fastify.post('/auth/invite/signup', async (req: any, reply) => {
+    const { token: inviteTokenValue, firstName, lastName, email, phone, password } = (req.body || {}) as {
+      token?: string;
+      firstName?: string;
+      lastName?: string;
+      email?: string;
+      phone?: string;
+      password?: string;
+    };
+    if (!inviteTokenValue || !email || !password) {
+      return reply.code(400).send({ error: 'token, email and password required' });
+    }
+    const invite = await InviteToken.findOne({ token: inviteTokenValue }).exec();
+    if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt.getTime() < Date.now())) {
+      return reply.code(400).send({ error: 'Invalid or expired invite link' });
+    }
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const existing = await User.findOne({ email: normalizedEmail }).exec();
+    if (existing) return reply.code(409).send({ error: 'User with this email already exists' });
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const user = await User.create({
+      email: normalizedEmail,
+      passwordHash,
+      role: invite.role,
+      firstName: firstName ? String(firstName).trim() : undefined,
+      lastName: lastName ? String(lastName).trim() : undefined,
+      phone: phone ? String(phone).trim() : undefined,
+    });
+    invite.usedAt = new Date();
+    await invite.save();
+    await UserActivityLog.create({
+      userId: user._id,
+      action: 'invite_signup',
+      metadata: { inviteTokenId: invite._id },
+    });
+    const role = normalizeRole(user.role);
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role },
+      config.authSecret,
+      { expiresIn: '7d' }
+    );
+    req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'invite signup success');
+    return {
+      token,
+      user: { userId: user._id, email: user.email, role },
+    };
   });
 
   fastify.post('/auth/request-reset', async (req: any, reply) => {

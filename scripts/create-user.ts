@@ -1,6 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { connectMongo } from '../src/config/mongo';
 import { User } from '../src/models/user';
+import { ALL_ROLES, isValidRole } from '../src/lib/roles';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -11,11 +12,12 @@ async function main() {
   const password = positional[1] || process.env.NEW_USER_PASSWORD;
   const updateExisting = flags.has('--update') || String(process.env.UPDATE_EXISTING_USER || '').toLowerCase() === 'true';
   const roleFlag = args.find((a) => a.startsWith('--role='));
-  const role = (roleFlag ? roleFlag.split('=')[1] : undefined) || process.env.NEW_USER_ROLE || 'admin';
+  const rawRole = (roleFlag ? roleFlag.split('=')[1] : undefined) || process.env.NEW_USER_ROLE || 'ecommerce_client';
+  const role = isValidRole(rawRole) ? rawRole : 'ecommerce_client';
 
   if (!email || !password) {
     // eslint-disable-next-line no-console
-    console.error('Usage: ts-node scripts/create-user.ts <email> <password> [--update] [--role=admin]');
+    console.error(`Usage: ts-node scripts/create-user.ts <email> <password> [--update] [--role=${ALL_ROLES.join('|')}]`);
     process.exit(1);
   }
 
@@ -30,7 +32,7 @@ async function main() {
     }
 
     existing.passwordHash = await bcrypt.hash(String(password), 10);
-    existing.role = role;
+    existing.role = role as any;
     await existing.save();
     // eslint-disable-next-line no-console
     console.log('Updated user:', normalizedEmail);

@@ -1,17 +1,23 @@
+import bcrypt from 'bcryptjs';
 import { connectMongo } from '../src/config/mongo';
 import { User } from '../src/models/user';
+import { config } from '../src/config/env';
 
 async function main() {
   await connectMongo();
-  const email = 'franco@unielogics.com';
-  const passwordHash = '$2b$10$W8d7aVpJv.VpQfifPNdvG.iXa2z8tj8/BFvBr7UWg.VB.STsBoNBy';
-  const existing = await User.findOne({ email });
+  const email = config.superAdminEmail;
+  const password = process.env.SEED_SUPER_ADMIN_PASSWORD || 'changeme';
+  const passwordHash = await bcrypt.hash(password, 10);
+  const existing = await User.findOne({ email }).exec();
   if (existing) {
-    console.log('User already exists:', email);
+    existing.passwordHash = passwordHash;
+    existing.role = 'super_admin';
+    await existing.save();
+    console.log('Updated super_admin:', email);
     process.exit(0);
   }
-  await User.create({ email, passwordHash, role: 'admin' });
-  console.log('Seeded user:', email);
+  await User.create({ email, passwordHash, role: 'super_admin' });
+  console.log('Seeded super_admin:', email);
   process.exit(0);
 }
 

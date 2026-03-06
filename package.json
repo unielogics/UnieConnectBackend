@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "ts-node src/server.ts",
     "create-user": "ts-node scripts/create-user.ts",
+    "promote-user": "ts-node scripts/promote-user.ts",
+    "seed:user": "ts-node scripts/seed-user.ts",
     "audit:auth": "ts-node scripts/audit-auth.ts",
     "build": "tsc",
     "start": "node dist/server.js",
