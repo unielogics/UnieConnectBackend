@@ -9,17 +9,26 @@ import { itemRoutes } from './items.routes';
 import { customerRoutes } from './customers.routes';
 import { orderRoutes } from './orders.routes';
 import { shopifyFulfillmentRoutes } from './shopify-fulfillment.routes';
+import { shopifyRoutes } from './shopify.routes';
 import { amazonAuthRoutes } from './amazon-auth.routes';
 import { amazonRoutes } from './amazon.routes';
 import { auditRoutes } from './audit.routes';
 import { ebayWebhookRoutes } from './ebay-webhooks.routes';
 import { featureRoutes } from './features.routes';
+import { shipFromLocationRoutes } from './ship-from-locations.routes';
+import { shipmentPlanRoutes } from './shipment-plan.routes';
+import { transportationTemplateRoutes } from './transportation-template.routes';
+import { facilitiesRoutes } from './facilities.routes';
+import { supplierRoutes } from './suppliers.routes';
 import { usersRoutes } from './users.routes';
+import { addressRoutes } from './address.routes';
+import { omsRoutes } from './oms.routes';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
+import { apiKeyAuthHook } from '../middleware/api-key-auth';
 
 export async function registerRoutes(app: FastifyInstance) {
-  // Attach user if Authorization bearer token is provided
+  // Attach user if Authorization bearer token is provided (JWT)
   app.addHook('preHandler', async (req: any, _reply) => {
     const auth = req.headers.authorization;
     const parseCookies = (cookieHeader: string | undefined) => {
@@ -39,10 +48,13 @@ export async function registerRoutes(app: FastifyInstance) {
       try {
         req.user = jwt.verify(token, config.authSecret);
       } catch {
-        // ignore invalid tokens
+        // ignore invalid tokens (may be API key, tried next)
       }
     }
   });
+
+  // API key auth: if req.user not set, try ApiKey (OMS: X-Warehouse-ID required; WMS: intermediaryId)
+  app.addHook('preHandler', apiKeyAuthHook);
 
   await authRoutes(app);
   await healthRoutes(app);
@@ -56,9 +68,17 @@ export async function registerRoutes(app: FastifyInstance) {
   await customerRoutes(app);
   await orderRoutes(app);
   await shopifyFulfillmentRoutes(app);
+  await shopifyRoutes(app);
   await auditRoutes(app);
   await ebayWebhookRoutes(app);
   await featureRoutes(app);
+  await supplierRoutes(app);
+  await shipFromLocationRoutes(app);
+  await shipmentPlanRoutes(app);
+  await transportationTemplateRoutes(app);
+  await facilitiesRoutes(app);
   await usersRoutes(app);
+  await addressRoutes(app);
+  await omsRoutes(app);
 }
 

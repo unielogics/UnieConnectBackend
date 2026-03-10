@@ -33,7 +33,7 @@ export function startShopifyCron(log: FastifyBaseLogger) {
   }, CRON_INTERVAL_MS);
 }
 
-export async function runRefresh(channelAccountId: string, log: FastifyBaseLogger) {
+export async function runRefresh(channelAccountId: string, log: FastifyBaseLogger, opts?: { initialSync?: boolean }) {
   const account = await ChannelAccount.findById(channelAccountId).exec();
   if (!account) {
     log.warn({ channelAccountId }, 'refresh skipped: account not found');
@@ -47,9 +47,10 @@ export async function runRefresh(channelAccountId: string, log: FastifyBaseLogge
       channelAccountId: account._id.toString(),
       userId: account.userId.toString(),
       log,
+      ...(opts?.initialSync === true && { initialSync: true }),
     });
     log.info({ channelAccountId, res }, 'shopify refresh completed');
-    return;
+    return res;
   }
 
   if (account.channel === 'ebay') {

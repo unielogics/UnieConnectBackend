@@ -9,6 +9,17 @@ export interface IItem extends Document {
   defaultUom?: string;
   tags?: string[];
   archived: boolean;
+  supplierId?: Types.ObjectId;
+  image?: string;
+  images?: string[];
+  upc?: string;
+  ean?: string;
+  asin?: string;
+  category?: string;
+  subCategory?: string;
+  lob?: string;
+  weight?: number;
+  dimensions?: { length: number; width: number; height: number };
 }
 
 const ItemSchema = new Schema<IItem>(
@@ -21,11 +32,27 @@ const ItemSchema = new Schema<IItem>(
     defaultUom: { type: String },
     tags: [{ type: String }],
     archived: { type: Boolean, default: false },
+    supplierId: { type: Schema.Types.ObjectId, ref: 'Supplier', index: true },
+    image: { type: String },
+    images: [{ type: String }],
+    upc: { type: String },
+    ean: { type: String },
+    asin: { type: String },
+    category: { type: String },
+    subCategory: { type: String },
+    lob: { type: String },
+    weight: { type: Number },
+    dimensions: {
+      length: { type: Number },
+      width: { type: Number },
+      height: { type: Number },
+    },
   },
   { timestamps: true },
 );
 
 ItemSchema.index({ userId: 1, sku: 1 }, { unique: true });
+ItemSchema.index({ userId: 1, supplierId: 1 });
 
 export const Item: Model<IItem> = (models.Item as Model<IItem>) || model<IItem>('Item', ItemSchema);
 

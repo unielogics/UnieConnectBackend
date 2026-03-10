@@ -15,15 +15,84 @@ jobs:
 
       - name: Setup SSH
         run: |
+          # region agent log helper
+          debug_log() {
+            python3 - "$1" "$2" "$3" <<'PY' | curl -sS -X POST 'http://127.0.0.1:7244/ingest/1c6029e9-7d46-49b9-a14e-a0b53851f08d' -H 'Content-Type: application/json' --data-binary @- >/dev/null 2>&1 || true
+import json
+import sys
+import time
+
+hypothesis_id = sys.argv[1]
+message = sys.argv[2]
+data_literal = sys.argv[3]
+
+payload = {
+    "runId": "deploy-audit",
+    "hypothesisId": hypothesis_id,
+    "location": "UnieConnectBackend/.github/workflows/deploy.yml",
+    "message": message,
+    "data": json.loads(data_literal),
+    "timestamp": int(time.time() * 1000),
+}
+
+print(json.dumps(payload))
+PY
+          }
+          # endregion
+
+          # region agent log H1
+          debug_log "H1" "setup_ssh_shell_context" "{\"shell\":\"${SHELL:-}\",\"proc\":\"$0\",\"home\":\"${HOME:-}\",\"pwd\":\"$(pwd)\",\"runner_os\":\"${RUNNER_OS:-}\",\"mkdir_resolves_to\":\"$(command -V mkdir 2>/dev/null | tr '\n' ' ' | sed 's/\"/\\\"/g')\"}"
+          # endregion
+
+          # region agent log H2
+          debug_log "H2" "setup_ssh_path_state_before_mkdir" "{\"home_exists\":$(test -d \"${HOME:-}\" && echo true || echo false),\"ssh_exists\":$(test -e \"${HOME:-}/.ssh\" && echo true || echo false),\"ssh_is_dir\":$(test -d \"${HOME:-}/.ssh\" && echo true || echo false)}"
+          # endregion
+
           mkdir -p ~/.ssh
+
+          # region agent log H2
+          debug_log "H2" "setup_ssh_path_state_after_mkdir" "{\"ssh_exists\":$(test -e \"${HOME:-}/.ssh\" && echo true || echo false),\"ssh_is_dir\":$(test -d \"${HOME:-}/.ssh\" && echo true || echo false),\"ssh_listing\":\"$(ls -ld \"${HOME:-}/.ssh\" 2>/dev/null | tr '\n' ' ' | sed 's/\"/\\\"/g')\"}"
+          # endregion
+
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+          # region agent log H4
+          debug_log "H4" "setup_ssh_secret_and_files_state" "{\"host_present\":$(test -n \"${{ secrets.EC2_HOST }}\" && echo true || echo false),\"user_present\":$(test -n \"${{ secrets.EC2_USER }}\" && echo true || echo false),\"key_chars\":$(printf '%s' "${{ secrets.EC2_SSH_KEY }}" | wc -c | tr -d ' '),\"key_file_exists\":$(test -f \"${HOME:-}/.ssh/id_ed25519\" && echo true || echo false),\"known_hosts_exists\":$(test -f \"${HOME:-}/.ssh/known_hosts\" && echo true || echo false)}"
+          # endregion
 
       - name: Deploy to EC2
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             set -e
+
+            # region agent log H5
+            python3 - <<'PY' | curl -sS -X POST 'http://127.0.0.1:7244/ingest/1c6029e9-7d46-49b9-a14e-a0b53851f08d' -H 'Content-Type: application/json' --data-binary @- >/dev/null 2>&1 || true
+import json
+import time
+import subprocess
+
+def cmd(command):
+    try:
+        return subprocess.check_output(command, shell=True, text=True, stderr=subprocess.STDOUT).strip()
+    except subprocess.CalledProcessError as exc:
+        return exc.output.strip()
+
+print(json.dumps({
+    "runId": "deploy-audit",
+    "hypothesisId": "H5",
+    "location": "UnieConnectBackend/.github/workflows/deploy.yml",
+    "message": "remote_runtime_precheck",
+    "data": {
+        "node_version": cmd("node -v"),
+        "pm2_version": cmd("pm2 -v"),
+        "app_dir_exists": cmd("test -d /var/www/unie-backend && echo true || echo false"),
+    },
+    "timestamp": int(time.time() * 1000),
+}))
+PY
+            # endregion
 
             # --- 1. Hardcoded deployment path & repo ---
             APP_DIR="/var/www/unie-backend"

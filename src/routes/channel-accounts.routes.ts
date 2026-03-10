@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { ChannelAccount } from '../models/channel-account';
 import { runRefresh } from '../services/shopify-cron';
 import { runAmazonRefresh } from '../services/amazon-cron';
+import { getSyncStatus } from '../services/channel-sync-status';
 
 export async function channelAccountRoutes(fastify: FastifyInstance) {
   fastify.get('/channel-accounts', async (req: any, reply) => {
@@ -36,19 +37,34 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
     return { success: true };
   });
 
+  fastify.get('/channel-accounts/:id/sync-status', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { id } = req.params || {};
+    const account = await ChannelAccount.findOne({ _id: id, userId }).exec();
+    if (!account) return reply.code(404).send({ error: 'Not found' });
+    if (account.channel !== 'shopify') {
+      return reply.code(400).send({ error: 'Sync status only supported for Shopify' });
+    }
+    const status = await getSyncStatus(String(account._id));
+    return status;
+  });
+
   fastify.post('/channel-accounts/:id/refresh', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const { id } = req.params || {};
     const account = await ChannelAccount.findOne({ _id: id, userId }).exec();
     if (!account) return reply.code(404).send({ error: 'Not found' });
+    let syncResult: Record<string, number> | undefined;
     if (account.channel === 'shopify') {
-      await runRefresh(String(account._id), fastify.log);
+      const res = await runRefresh(String(account._id), fastify.log);
+      syncResult = res as Record<string, number>;
     } else if (account.channel === 'amazon') {
       await runAmazonRefresh(String(account._id), fastify.log);
     }
     await ChannelAccount.updateOne({ _id: account._id }, { lastCronAt: new Date() }).exec();
-    return { success: true };
+    return { success: true, syncResult };
   });
 }
 

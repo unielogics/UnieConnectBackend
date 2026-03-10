@@ -2,8 +2,8 @@ import { FastifyBaseLogger } from 'fastify';
 import { ChannelAccount } from '../models/channel-account';
 import { pullAmazonAll } from './amazon-pull';
 
-const CRON_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
-const REFRESH_EVERY_MS = 60 * 60 * 1000; // 1 hour cadence
+const CRON_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
+const REFRESH_EVERY_MS = 30 * 60 * 1000; // 30 minutes cadence (aligned with Shopify)
 
 export function startAmazonCron(log: FastifyBaseLogger) {
   setInterval(async () => {
@@ -23,8 +23,8 @@ export function startAmazonCron(log: FastifyBaseLogger) {
   }, CRON_INTERVAL_MS);
 }
 
-export async function runAmazonRefresh(channelAccountId: string, log: FastifyBaseLogger) {
-  const res = await pullAmazonAll(channelAccountId, log);
+export async function runAmazonRefresh(channelAccountId: string, log: FastifyBaseLogger, opts?: { initialSync?: boolean }) {
+  const res = await pullAmazonAll(channelAccountId, log, { initialSync: opts?.initialSync === true });
   log.info({ channelAccountId, res }, 'amazon refresh completed');
 }
 

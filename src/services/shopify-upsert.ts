@@ -213,6 +213,11 @@ async function ensureCustomer(rawCustomer: any, ctx: UpsertContext) {
   return customer._id;
 }
 
+/** Upsert a customer from the Shopify customers API (or order.customer payload). */
+export async function upsertCustomerFromApi(body: any, ctx: UpsertContext) {
+  return ensureCustomer(body, ctx);
+}
+
 function num(v: any): number | undefined {
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;

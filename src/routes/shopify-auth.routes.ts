@@ -5,6 +5,8 @@ import { URLSearchParams } from 'url';
 import { exchangeCodeForToken, registerWebhooks } from '../services/shopify';
 import { User } from '../models/user';
 import { ChannelAccount } from '../models/channel-account';
+import { ChannelSyncStatus } from '../models/channel-sync-status';
+import { Types } from 'mongoose';
 import { runRefresh } from '../services/shopify-cron';
 import { OAuthState } from '../models/oauth-state';
 
@@ -132,7 +134,12 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
           { upsert: true, new: true },
         ).exec();
         if (account?._id) {
-          void runRefresh(String(account._id), fastify.log);
+          const hadSync = await ChannelSyncStatus.findOne({
+            channelAccountId: new Types.ObjectId(account._id),
+            entityType: 'orders',
+            lastSyncedAt: { $exists: true, $ne: null },
+          }).exec();
+          void runRefresh(String(account._id), fastify.log, { initialSync: !hadSync });
         }
       }
 

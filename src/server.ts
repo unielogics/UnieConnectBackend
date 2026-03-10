@@ -45,7 +45,7 @@ async function start() {
       return cb(null, false);
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Warehouse-ID'],
     credentials: true,
   });
   // Register all routes under /api/v1 to match redirect/webhook URLs

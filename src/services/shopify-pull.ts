@@ -1,11 +1,31 @@
 import fetch from 'node-fetch';
 import { config } from '../config/env';
-import { upsertOrder, upsertProduct, upsertInventory, UpsertContext } from './shopify-upsert';
+import { upsertOrder, upsertProduct, upsertInventory, upsertCustomerFromApi, UpsertContext } from './shopify-upsert';
+import { setSyncStatus } from './channel-sync-status';
 
-type PullResult = { products?: number; orders?: number; inventory?: number };
+type PullResult = { products?: number; orders?: number; customers?: number; inventory?: number };
 
-export async function pullShopifyAll(ctx: { shopDomain: string; accessToken: string; channelAccountId: string; userId: string; log: any }): Promise<PullResult> {
-  const { shopDomain, accessToken, channelAccountId, userId, log } = ctx;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const DAYS_3 = 90;
+
+/** Extract page_info from Shopify Link header for rel=next. */
+function parseNextPageInfo(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  const match = linkHeader.match(/<[^>]+[?&]page_info=([^>&]+)[^>]*>\s*;\s*rel="next"/i);
+  const info = match?.[1];
+  return info ? decodeURIComponent(info) : null;
+}
+
+export async function pullShopifyAll(ctx: {
+  shopDomain: string;
+  accessToken: string;
+  channelAccountId: string;
+  userId: string;
+  log: any;
+  /** When true (first connection), pull last 3 months of orders and customers with pagination. */
+  initialSync?: boolean;
+}): Promise<PullResult> {
+  const { shopDomain, accessToken, channelAccountId, userId, log, initialSync } = ctx;
   const upsertCtx: UpsertContext = {
     channelAccountId,
     userId,
@@ -17,48 +37,94 @@ export async function pullShopifyAll(ctx: { shopDomain: string; accessToken: str
   const base = `https://${shopDomain}/admin/api/${version}`;
   const result: PullResult = {};
 
-  // Products
-  const productsRes = await fetch(`${base}/products.json?limit=250`, {
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': accessToken,
-    },
-  });
-  if (productsRes.ok) {
+  // Products - fully paginated (no limit for large catalogs)
+  await setSyncStatus(channelAccountId, 'products', 'syncing');
+  const headers = { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken };
+  let totalProducts = 0;
+  let prodPageInfo: string | null = null;
+  do {
+    const productsUrl = prodPageInfo
+      ? `${base}/products.json?limit=250&page_info=${encodeURIComponent(prodPageInfo)}`
+      : `${base}/products.json?limit=250`;
+    const productsRes = await fetch(productsUrl, { headers });
+    if (!productsRes.ok) {
+      log.warn({ status: productsRes.status }, 'Shopify products pull failed');
+      await setSyncStatus(channelAccountId, 'products', 'error', { error: `HTTP ${productsRes.status}` });
+      break;
+    }
     const json = await productsRes.json();
     const products = Array.isArray(json?.products) ? json.products : [];
     for (const p of products) {
       await upsertProduct(p, upsertCtx);
     }
-    result.products = products.length;
-  } else {
-    log.warn({ status: productsRes.status }, 'Shopify products pull failed');
-  }
+    totalProducts += products.length;
+    prodPageInfo = parseNextPageInfo(productsRes.headers.get('link'));
+  } while (prodPageInfo);
+  result.products = totalProducts;
+  await setSyncStatus(channelAccountId, 'products', 'synced', result.products !== undefined ? { count: result.products } : undefined);
 
-  // Orders - last 2 days
-  const since = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
-  const ordersRes = await fetch(
-    `${base}/orders.json?status=any&limit=50&order=updated_at%20desc&updated_at_min=${encodeURIComponent(since)}`,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': accessToken,
-      },
-    },
-  );
-  if (ordersRes.ok) {
+  // Orders - 3 months on initial sync (paginated), 2 days on subsequent syncs
+  await setSyncStatus(channelAccountId, 'orders', 'syncing');
+  const orderDays = initialSync ? DAYS_3 : 2;
+  const orderSince = new Date(Date.now() - orderDays * MS_PER_DAY).toISOString();
+  const orderLimit = initialSync ? 250 : 50;
+  let totalOrders = 0;
+  let pageInfo: string | null = null;
+
+  do {
+    const ordersUrl = pageInfo
+      ? `${base}/orders.json?status=any&limit=${orderLimit}&page_info=${encodeURIComponent(pageInfo)}`
+      : `${base}/orders.json?status=any&limit=${orderLimit}&order=created_at%20desc&created_at_min=${encodeURIComponent(orderSince)}`;
+    const ordersRes = await fetch(ordersUrl, { headers });
+    if (!ordersRes.ok) {
+      log.warn({ status: ordersRes.status }, 'Shopify orders pull failed');
+      await setSyncStatus(channelAccountId, 'orders', 'error', { error: `HTTP ${ordersRes.status}` });
+      break;
+    }
     const json = await ordersRes.json();
     const orders = Array.isArray(json?.orders) ? json.orders : [];
     for (const o of orders) {
       await upsertOrder(o, upsertCtx);
     }
-    result.orders = orders.length;
+    totalOrders += orders.length;
+    pageInfo = parseNextPageInfo(ordersRes.headers.get('link'));
+  } while (pageInfo);
+
+  result.orders = totalOrders;
+  await setSyncStatus(channelAccountId, 'orders', 'synced', result.orders !== undefined ? { count: result.orders } : undefined);
+
+  // Customers - explicit pull on initial sync (3 months), otherwise derived from orders
+  if (initialSync) {
+    await setSyncStatus(channelAccountId, 'customers', 'syncing');
+    const customerSince = new Date(Date.now() - DAYS_3 * MS_PER_DAY).toISOString();
+    let totalCustomers = 0;
+    let custPageInfo: string | null = null;
+    do {
+      const customersUrl = custPageInfo
+        ? `${base}/customers.json?limit=250&page_info=${encodeURIComponent(custPageInfo)}`
+        : `${base}/customers.json?limit=250&created_at_min=${encodeURIComponent(customerSince)}`;
+      const custRes = await fetch(customersUrl, { headers });
+      if (!custRes.ok) {
+        log.warn({ status: custRes.status }, 'Shopify customers pull failed');
+        await setSyncStatus(channelAccountId, 'customers', 'error', { error: `HTTP ${custRes.status}` });
+        break;
+      }
+      const custJson = await custRes.json();
+      const customers = Array.isArray(custJson?.customers) ? custJson.customers : [];
+      for (const c of customers) {
+        await upsertCustomerFromApi(c, upsertCtx);
+      }
+      totalCustomers += customers.length;
+      custPageInfo = parseNextPageInfo(custRes.headers.get('link'));
+    } while (custPageInfo);
+    result.customers = totalCustomers;
+    await setSyncStatus(channelAccountId, 'customers', 'synced', result.customers !== undefined ? { count: result.customers } : undefined);
   } else {
-    log.warn({ status: ordersRes.status }, 'Shopify orders pull failed');
+    await setSyncStatus(channelAccountId, 'customers', 'synced'); // customers derived from orders
   }
 
   // Inventory levels - limited attempt via inventory_items/inventory_levels
-  // Fetch inventory levels for the first location (best-effort)
+  await setSyncStatus(channelAccountId, 'inventory', 'syncing');
   const locationsRes = await fetch(`${base}/locations.json`, {
     headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' },
   });
@@ -77,10 +143,16 @@ export async function pullShopifyAll(ctx: { shopDomain: string; accessToken: str
           await upsertInventory(lvl, upsertCtx);
         }
         result.inventory = levels.length;
+        await setSyncStatus(channelAccountId, 'inventory', 'synced', result.inventory !== undefined ? { count: result.inventory } : undefined);
       } else {
         log.warn({ status: invRes.status }, 'Shopify inventory pull failed');
+        await setSyncStatus(channelAccountId, 'inventory', 'error', { error: `HTTP ${invRes.status}` });
       }
+    } else {
+      await setSyncStatus(channelAccountId, 'inventory', 'synced', { count: 0 });
     }
+  } else {
+    await setSyncStatus(channelAccountId, 'inventory', 'error', { error: 'Locations fetch failed' });
   }
 
   return result;

@@ -1,15 +1,26 @@
 import { FastifyBaseLogger } from 'fastify';
 import { ChannelAccount } from '../models/channel-account';
-import { spApiFetch } from './amazon-spapi';
+import { Item } from '../models/item';
+import { ItemExternal } from '../models/item-external';
+import { InventoryLevel } from '../models/inventory-level';
 import { Order } from '../models/order';
 import { OrderLine } from '../models/order-line';
 import { Customer } from '../models/customer';
 import { CustomerExternal } from '../models/customer-external';
+import { spApiFetch } from './amazon-spapi';
+import { setSyncStatus } from './channel-sync-status';
 import { upsertAuditFromAmazon } from './audit-ingest';
 
-type PullResult = { orders?: number };
+type PullResult = { products?: number; orders?: number; inventory?: number };
 
-export async function pullAmazonAll(channelAccountId: string, log: FastifyBaseLogger): Promise<PullResult> {
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const DAYS_3 = 90;
+
+export async function pullAmazonAll(
+  channelAccountId: string,
+  log: FastifyBaseLogger,
+  opts?: { initialSync?: boolean },
+): Promise<PullResult> {
   const account = await ChannelAccount.findById(channelAccountId).exec();
   if (!account) {
     log.warn({ channelAccountId }, 'amazon pull skipped: account not found');

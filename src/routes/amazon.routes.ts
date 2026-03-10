@@ -2,10 +2,142 @@ import { FastifyInstance } from 'fastify';
 import { ChannelAccount } from '../models/channel-account';
 import { pushAmazonInventory } from '../services/amazon-inventory';
 import { createFulfillmentOrder } from '../services/amazon-fulfillment';
-import { createInboundPlan, createInboundShipment, getInboundLabels } from '../services/amazon-inbound';
+import {
+  createInboundPlan,
+  createInboundShipment,
+  fetchInboundSkuLabels,
+  getInboundLabels,
+  getInboundShipmentDetail,
+  listInboundShipmentHistory,
+  saveInboundWorkflowDraft,
+} from '../services/amazon-inbound';
 import { fetchShippingLabel, getShippingRates, createShippingShipment } from '../services/amazon-shipping';
+import { searchAmazonCatalogItems } from '../services/amazon-catalog';
+import {
+  confirmSendToAmazonPlacement,
+  fetchSendToAmazonShipmentLabels,
+  generateSendToAmazonPlacementPreview,
+  getSendToAmazonWorkflow,
+  listSendToAmazonWorkflows,
+  saveSendToAmazonWorkflowDraft,
+} from '../services/amazon-send-to-amazon';
+
+async function getAmazonAccountForUser(accountId: string, userId: string) {
+  return ChannelAccount.findOne({ _id: accountId, userId, channel: 'amazon' }).exec();
+}
 
 export async function amazonRoutes(fastify: FastifyInstance) {
+  fastify.get('/amazon/send-to-amazon/workflows', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, limit } = req.query as any;
+    if (!accountId) return reply.code(400).send({ error: 'accountId is required' });
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    return listSendToAmazonWorkflows({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      ...(limit !== undefined ? { limit: Number(limit) } : {}),
+    });
+  });
+
+  fastify.post('/amazon/send-to-amazon/workflows', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, workflowId, workflowName, marketplaceId, shipFromLocationId, shipFromAddress, items } = req.body || {};
+    if (!accountId || !Array.isArray(items)) {
+      return reply.code(400).send({ error: 'accountId and items are required' });
+    }
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    return saveSendToAmazonWorkflowDraft({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId,
+      workflowName,
+      marketplaceId,
+      shipFromLocationId,
+      shipFromAddress,
+      items,
+      log: fastify.log,
+    });
+  });
+
+  fastify.get('/amazon/send-to-amazon/workflows/:workflowId', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId } = req.query as any;
+    const { workflowId } = req.params || {};
+    if (!accountId || !workflowId) return reply.code(400).send({ error: 'accountId and workflowId are required' });
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    const workflow = await getSendToAmazonWorkflow({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId: String(workflowId),
+    });
+    if (!workflow) return reply.code(404).send({ error: 'Workflow not found' });
+    return workflow;
+  });
+
+  fastify.post('/amazon/send-to-amazon/workflows/:workflowId/placement-preview', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId } = req.body || {};
+    const { workflowId } = req.params || {};
+    if (!accountId || !workflowId) return reply.code(400).send({ error: 'accountId and workflowId are required' });
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    return generateSendToAmazonPlacementPreview({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId: String(workflowId),
+      log: fastify.log,
+    });
+  });
+
+  fastify.post('/amazon/send-to-amazon/workflows/:workflowId/confirm-placement', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, placementOptionId } = req.body || {};
+    const { workflowId } = req.params || {};
+    if (!accountId || !workflowId) return reply.code(400).send({ error: 'accountId and workflowId are required' });
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    return confirmSendToAmazonPlacement({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId: String(workflowId),
+      placementOptionId,
+      log: fastify.log,
+    });
+  });
+
+  fastify.post('/amazon/send-to-amazon/workflows/:workflowId/shipments/:shipmentId/labels', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId } = req.body || {};
+    const { workflowId, shipmentId } = req.params || {};
+    if (!accountId || !workflowId || !shipmentId) {
+      return reply.code(400).send({ error: 'accountId, workflowId, and shipmentId are required' });
+    }
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    return fetchSendToAmazonShipmentLabels({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId: String(workflowId),
+      shipmentId: String(shipmentId),
+      log: fastify.log,
+    });
+  });
+
   fastify.post('/amazon/inventory', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
@@ -48,15 +180,20 @@ export async function amazonRoutes(fastify: FastifyInstance) {
   fastify.post('/amazon/inbound/plan', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const { accountId, shipFromAddress, labelPrepPreference, items } = req.body || {};
-    if (!accountId || !shipFromAddress || !Array.isArray(items)) {
-      return reply.code(400).send({ error: 'accountId, shipFromAddress, and items are required' });
+    const { accountId, workflowId, packingMode, supplierId, shipFromLocationId, shipFromAddress, labelPrepPreference, items } = req.body || {};
+    if (!accountId || (!shipFromLocationId && !shipFromAddress) || !Array.isArray(items)) {
+      return reply.code(400).send({ error: 'accountId, shipFromLocationId or shipFromAddress, and items are required' });
     }
-    const account = await ChannelAccount.findOne({ _id: accountId, userId }).exec();
+    const account = await getAmazonAccountForUser(accountId, userId);
     if (!account) return reply.code(404).send({ error: 'Account not found' });
 
     const res = await createInboundPlan({
       channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId,
+      packingMode,
+      supplierId,
+      shipFromLocationId,
       shipFromAddress,
       labelPrepPreference,
       items,
@@ -71,27 +208,35 @@ export async function amazonRoutes(fastify: FastifyInstance) {
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const {
       accountId,
+      workflowId,
       shipmentId,
       destinationFulfillmentCenterId,
+      supplierId,
+      shipFromLocationId,
       shipFromAddress,
+      packingMode,
       labelPrepPreference,
       shipmentName,
       items,
     } = req.body || {};
-    if (!accountId || !shipmentId || !destinationFulfillmentCenterId || !shipFromAddress || !Array.isArray(items)) {
+    if (!accountId || !shipmentId || !destinationFulfillmentCenterId || (!shipFromLocationId && !shipFromAddress) || !Array.isArray(items)) {
       return reply
         .code(400)
-        .send({ error: 'accountId, shipmentId, destinationFulfillmentCenterId, shipFromAddress, and items are required' });
+        .send({ error: 'accountId, shipmentId, destinationFulfillmentCenterId, shipFromLocationId or shipFromAddress, and items are required' });
     }
-    const account = await ChannelAccount.findOne({ _id: accountId, userId }).exec();
+    const account = await getAmazonAccountForUser(accountId, userId);
     if (!account) return reply.code(404).send({ error: 'Account not found' });
 
     const res = await createInboundShipment({
       channelAccountId: String(account._id),
       userId: String(userId),
+      workflowId,
       shipmentId,
       destinationFulfillmentCenterId,
+      supplierId,
+      shipFromLocationId,
       shipFromAddress,
+      packingMode,
       labelPrepPreference,
       shipmentName,
       items,
@@ -107,7 +252,7 @@ export async function amazonRoutes(fastify: FastifyInstance) {
     const { accountId, pageType, labelType, numberOfPackages } = req.query as any;
     const { shipmentId } = req.params || {};
     if (!accountId || !shipmentId) return reply.code(400).send({ error: 'accountId and shipmentId are required' });
-    const account = await ChannelAccount.findOne({ _id: accountId, userId }).exec();
+    const account = await getAmazonAccountForUser(accountId, userId);
     if (!account) return reply.code(404).send({ error: 'Account not found' });
 
     const labelParams: {
@@ -131,13 +276,137 @@ export async function amazonRoutes(fastify: FastifyInstance) {
     return res;
   });
 
+  fastify.post('/amazon/inbound/workflows/draft', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, workflowId, supplierId, shipFromLocationId, shipFromAddress, labelPrepPreference, packingMode, items } = req.body || {};
+    if (!accountId) return reply.code(400).send({ error: 'accountId is required' });
+    const account = await getAmazonAccountForUser(accountId, userId);
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    const draft = await saveInboundWorkflowDraft({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId,
+      supplierId,
+      shipFromLocationId,
+      shipFromAddress,
+      labelPrepPreference,
+      packingMode,
+      items,
+      log: fastify.log,
+    });
+
+    return draft;
+  });
+
+  fastify.post('/amazon/inbound/workflows/sku-labels', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, workflowId, supplierId, shipFromLocationId, shipFromAddress, labelPrepPreference, packingMode, items } = req.body || {};
+    if (!accountId || !Array.isArray(items) || items.length === 0) {
+      return reply.code(400).send({ error: 'accountId and items are required' });
+    }
+    const account = await getAmazonAccountForUser(accountId, userId);
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    return fetchInboundSkuLabels({
+      channelAccountId: String(account._id),
+      userId: String(userId),
+      workflowId,
+      supplierId,
+      shipFromLocationId,
+      shipFromAddress,
+      labelPrepPreference,
+      packingMode,
+      items,
+      log: fastify.log,
+    });
+  });
+
+  fastify.get('/amazon/inbound/history', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, workflowStatus, limit } = req.query as any;
+    if (!accountId) return reply.code(400).send({ error: 'accountId is required' });
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    const historyParams: {
+      channelAccountId: string;
+      userId: string;
+      workflowStatus?: string;
+      limit?: number;
+    } = {
+      channelAccountId: String(account._id),
+      userId: String(userId),
+    };
+    if (workflowStatus) historyParams.workflowStatus = String(workflowStatus);
+    if (limit !== undefined) historyParams.limit = Number(limit);
+    return listInboundShipmentHistory(historyParams);
+  });
+
+  fastify.get('/amazon/inbound/history/:workflowOrShipmentId', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, mode } = req.query as any;
+    const { workflowOrShipmentId } = req.params || {};
+    if (!accountId || !workflowOrShipmentId) {
+      return reply.code(400).send({ error: 'accountId and workflowOrShipmentId are required' });
+    }
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    const detailParams: {
+      channelAccountId: string;
+      userId: string;
+      shipmentId?: string;
+      workflowId?: string;
+    } = {
+      channelAccountId: String(account._id),
+      userId: String(userId),
+    };
+    if (mode === 'workflow') detailParams.workflowId = String(workflowOrShipmentId);
+    else detailParams.shipmentId = String(workflowOrShipmentId);
+
+    const detail = await getInboundShipmentDetail(detailParams);
+    if (!detail) return reply.code(404).send({ error: 'Not found' });
+    return detail;
+  });
+
+  fastify.get('/amazon/catalog/items', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { accountId, marketplaceId, q, nextToken, pageSize } = req.query as any;
+    if (!accountId) return reply.code(400).send({ error: 'accountId is required' });
+    const account = await getAmazonAccountForUser(String(accountId), String(userId));
+    if (!account) return reply.code(404).send({ error: 'Account not found' });
+
+    const catalogParams: {
+      channelAccountId: string;
+      marketplaceId?: string;
+      query?: string;
+      nextToken?: string;
+      pageSize?: number;
+      log: typeof fastify.log;
+    } = {
+      channelAccountId: String(account._id),
+      log: fastify.log,
+    };
+    if (marketplaceId) catalogParams.marketplaceId = String(marketplaceId);
+    if (q) catalogParams.query = String(q);
+    if (nextToken) catalogParams.nextToken = String(nextToken);
+    if (pageSize !== undefined) catalogParams.pageSize = Number(pageSize);
+    return searchAmazonCatalogItems(catalogParams);
+  });
+
   fastify.get('/amazon/shipping/labels/:shipmentId', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const { shipmentId } = req.params || {};
     const { accountId, orderId, format } = req.query as any;
     if (!accountId || !shipmentId) return reply.code(400).send({ error: 'accountId and shipmentId are required' });
-    const account = await ChannelAccount.findOne({ _id: accountId, userId }).exec();
+    const account = await getAmazonAccountForUser(accountId, userId);
     if (!account) return reply.code(404).send({ error: 'Account not found' });
 
     const labelReq: {
@@ -168,7 +437,7 @@ export async function amazonRoutes(fastify: FastifyInstance) {
     if (!accountId || !shipFrom || !shipTo || !Array.isArray(packages) || packages.length === 0) {
       return reply.code(400).send({ error: 'accountId, shipFrom, shipTo, and packages are required' });
     }
-    const account = await ChannelAccount.findOne({ _id: accountId, userId }).exec();
+    const account = await getAmazonAccountForUser(accountId, userId);
     if (!account) return reply.code(404).send({ error: 'Account not found' });
 
     let chosenRateId = rateId as string | undefined;
