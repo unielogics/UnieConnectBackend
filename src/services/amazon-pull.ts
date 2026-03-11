@@ -37,8 +37,65 @@ export async function pullAmazonAll(
     return {};
   }
 
-  const createdAfter = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  const result: PullResult = {};
+  const userId = account.userId.toString();
+  const marketplaceId = marketplaceIds[0];
+  const initialSync = opts?.initialSync === true;
 
+  // Products + Inventory from FBA Inventory Summaries (paginated)
+  await setSyncStatus(channelAccountId, 'products', 'syncing');
+  let totalProducts = 0;
+  let invNextToken: string | undefined;
+  const startDateTime = new Date(Date.now() - 180 * MS_PER_DAY).toISOString(); // 180 days for FBA
+  do {
+    const invQuery: Record<string, string | number | boolean | string[] | undefined> = {
+      granularityType: 'Marketplace',
+      granularityId: marketplaceId,
+      marketplaceIds: marketplaceId,
+      details: true,
+      startDateTime,
+    };
+    if (invNextToken) invQuery.nextToken = invNextToken;
+    const invRes = await spApiFetch(account, {
+      method: 'GET',
+      path: '/fba/inventory/v1/summaries',
+      query: invQuery,
+    });
+    const summaries = invRes?.payload?.inventorySummaries ?? invRes?.inventorySummaries ?? [];
+    for (const s of Array.isArray(summaries) ? summaries : []) {
+      const sku = String(s?.sellerSku ?? s?.sku ?? '').trim();
+      if (!sku) continue;
+      const asin = s?.asin ? String(s.asin) : sku;
+      const qty = Number(s?.totalQuantity ?? s?.inventoryDetails?.fulfillableQuantity ?? s?.inventoryDetails?.availableQuantity ?? 0) || 0;
+      const item = await Item.findOneAndUpdate(
+        { userId: account.userId, sku },
+        { userId: account.userId, sku, title: sku, asin: asin !== sku ? asin : undefined },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      ).exec();
+      await ItemExternal.findOneAndUpdate(
+        { channelAccountId, channel: 'amazon', channelItemId: asin, channelVariantId: sku },
+        { itemId: item._id, channel: 'amazon', sku, status: 'active', raw: s, syncedAt: new Date() },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      ).exec();
+      await InventoryLevel.findOneAndUpdate(
+        { itemId: item._id, channelAccountId, locationId: marketplaceId },
+        { itemId: item._id, channelAccountId, locationId: marketplaceId, available: qty },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      ).exec();
+      totalProducts += 1;
+    }
+    invNextToken = invRes?.pagination?.nextToken ?? invRes?.nextToken;
+  } while (invNextToken);
+  result.products = totalProducts;
+  await setSyncStatus(channelAccountId, 'products', 'synced', { count: totalProducts });
+  result.inventory = totalProducts;
+  await setSyncStatus(channelAccountId, 'inventory', 'synced', { count: totalProducts });
+
+  // Orders - 3 months on initial sync, 2 days on subsequent
+  const orderDays = initialSync ? DAYS_3 : 2;
+  const createdAfter = new Date(Date.now() - orderDays * MS_PER_DAY).toISOString();
+
+  await setSyncStatus(channelAccountId, 'orders', 'syncing');
   const orders: any[] = [];
   let nextToken: string | undefined;
   do {
