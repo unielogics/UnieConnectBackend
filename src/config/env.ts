@@ -77,5 +77,9 @@ export const config = {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0),
+  /** Internal API key for WMS-to-UnieConnect calls (channel-accounts resolution, Amazon shipping). */
+  internalApiKey: process.env.UNIECONNECT_INTERNAL_API_KEY || '',
+  /** WMS/UnieBackend API base URL for OMS connect proxy (e.g. http://localhost:8000). */
+  wmsApiUrl: (process.env.WMS_API_URL || 'http://localhost:8000').replace(/\/+$/, ''),
 };
 

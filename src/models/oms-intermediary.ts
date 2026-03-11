@@ -17,8 +17,6 @@ const OmsIntermediarySchema = new Schema<IOmsIntermediary>(
   { timestamps: true },
 );
 
-OmsIntermediarySchema.index({ email: 1 });
-
 export const OmsIntermediary: Model<IOmsIntermediary> =
   (models.OmsIntermediary as Model<IOmsIntermediary>) ||
   model<IOmsIntermediary>('OmsIntermediary', OmsIntermediarySchema);

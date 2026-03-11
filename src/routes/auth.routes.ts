@@ -1,5 +1,10 @@
 import { FastifyInstance } from 'fastify';
+import fs from 'fs';
+import path from 'path';
 import jwt from 'jsonwebtoken';
+
+const DBG = path.join(process.cwd(), '..', '..', '.cursor', 'debug.log');
+const dbg = (o: object) => { try { fs.appendFileSync(DBG, JSON.stringify({ ...o, ts: Date.now() }) + '\n'); } catch {} };
 import bcrypt from 'bcryptjs';
 import { User } from '../models/user';
 import { InviteToken } from '../models/invite-token';
@@ -28,15 +33,20 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/auth/login', async (req: any, reply) => {
     const { email, password } = req.body || {};
     const normalizedEmail = email ? String(email).toLowerCase() : '';
+    dbg({ src: 'UCB', step: 'entry', email: normalizedEmail, hasPw: !!password });
     req.log.info({ reqId: req.id, email: normalizedEmail, ip: req.ip }, 'login attempt');
     if (!email || !password) return reply.code(400).send({ error: 'Email and password required' });
     const user = await User.findOne({ email: normalizedEmail }).exec();
+    dbg({ src: 'UCB', step: 'userFind', found: !!user, email: normalizedEmail });
     if (!user) {
+      dbg({ src: 'UCB', step: '401', reason: 'user_not_found' });
       req.log.warn({ reqId: req.id, email: normalizedEmail }, 'login failed: user not found');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
     const ok = await bcrypt.compare(password, user.passwordHash);
+    dbg({ src: 'UCB', step: 'bcrypt', ok, email: normalizedEmail });
     if (!ok) {
+      dbg({ src: 'UCB', step: '401', reason: 'bad_password' });
       req.log.warn({ reqId: req.id, email: normalizedEmail, userId: user._id }, 'login failed: bad password');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }

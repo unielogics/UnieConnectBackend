@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "predev": "npx --yes kill-port 4001 2>nul || true",
     "dev": "ts-node src/server.ts",
     "create-user": "ts-node scripts/create-user.ts",
     "promote-user": "ts-node scripts/promote-user.ts",

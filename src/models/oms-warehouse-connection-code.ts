@@ -14,7 +14,7 @@ export interface IOmsWarehouseConnectionCode extends Document {
 
 const OmsWarehouseConnectionCodeSchema = new Schema<IOmsWarehouseConnectionCode>(
   {
-    code: { type: String, required: true, unique: true, index: true },
+    code: { type: String, required: true, unique: true },
     warehouseCode: { type: String, required: true, trim: true, index: true },
     wmsIntermediaryId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     omsIntermediaryId: { type: Schema.Types.ObjectId, ref: 'OmsIntermediary', index: true },

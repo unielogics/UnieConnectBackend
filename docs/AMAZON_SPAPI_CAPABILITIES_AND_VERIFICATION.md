@@ -22,7 +22,8 @@ Without these, any SP-API call (orders pull, inventory, etc.) will fail with an 
 
 | Capability | Backend route / trigger | SP-API used | Notes |
 |------------|-------------------------|-------------|--------|
-| **Orders pull** | `POST /api/v1/channel-accounts/:id/refresh` or cron every ~1h | `GET /orders/v0/orders`, `GET /orders/v0/orders/:id/orderItems` | Last 2 days; Unshipped, PartiallyShipped, Shipped, Unfulfillable; MFN + AFN |
+| **Orders pull** | `POST /api/v1/channel-accounts/:id/refresh` or cron every 30 min | `GET /orders/v0/orders`, `GET /orders/v0/orders/:id/orderItems` | Last 3 months on first connection, 2 days on subsequent; paginated |
+| **Products/catalog pull** | Same as above | `GET /fba/inventory/v1/summaries` | FBA catalog + inventory; paginated (180-day window) |
 | **Inventory push** | `POST /api/v1/amazon/inventory` | `PATCH /listings/2021-08-01/items/{sellerId}/{sku}` | Updates fulfillment availability (quantity) per SKU |
 | **Create fulfillment order** | `POST /api/v1/amazon/fulfillment` | Fulfillment Outbound API | Create MFO for an order |
 | **Inbound – create plan** | `POST /api/v1/amazon/inbound/plan` | Inbound Shipments API | Create inbound plan |

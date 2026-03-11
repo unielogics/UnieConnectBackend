@@ -1,10 +1,13 @@
 import { FastifyInstance } from 'fastify';
 import crypto from 'crypto';
+import { Types } from 'mongoose';
 import { config } from '../config/env';
 import { exchangeCodeForTokens } from '../services/amazon-auth';
 import { ChannelAccount } from '../models/channel-account';
+import { ChannelSyncStatus } from '../models/channel-sync-status';
 import { User } from '../models/user';
 import { OAuthState } from '../models/oauth-state';
+import { runAmazonRefresh } from '../services/amazon-cron';
 
 function buildAuthorizeUrl(state: string, redirectUri: string, region: string) {
   const baseByRegion = {
@@ -111,7 +114,7 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
           ? (marketplace_ids as string[]).map((m) => String(m)).filter(Boolean)
           : [];
 
-      await ChannelAccount.findOneAndUpdate(
+      const account = await ChannelAccount.findOneAndUpdate(
         { userId: userDoc._id, channel: 'amazon', sellingPartnerId: selling_partner_id || undefined },
         {
           userId: userDoc._id,
@@ -128,6 +131,15 @@ export async function amazonAuthRoutes(fastify: FastifyInstance) {
         },
         { upsert: true, new: true, setDefaultsOnInsert: true },
       ).exec();
+
+      if (account?._id) {
+        const hadSync = await ChannelSyncStatus.findOne({
+          channelAccountId: new Types.ObjectId(account._id),
+          entityType: 'orders',
+          lastSyncedAt: { $exists: true, $ne: null },
+        }).exec();
+        void runAmazonRefresh(String(account._id), fastify.log, { initialSync: !hadSync });
+      }
 
       return reply.redirect(successUrl);
     } catch (err: any) {

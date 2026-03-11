@@ -4,7 +4,6 @@ import { shopifyAuthRoutes } from './shopify-auth.routes';
 import { ebayAuthRoutes } from './ebay-auth.routes';
 import { shopifyWebhookRoutes } from './shopify-webhooks.routes';
 import { channelAccountRoutes } from './channel-accounts.routes';
-import { authRoutes } from './auth.routes';
 import { itemRoutes } from './items.routes';
 import { customerRoutes } from './customers.routes';
 import { orderRoutes } from './orders.routes';
@@ -23,40 +22,14 @@ import { supplierRoutes } from './suppliers.routes';
 import { usersRoutes } from './users.routes';
 import { addressRoutes } from './address.routes';
 import { omsRoutes } from './oms.routes';
-import jwt from 'jsonwebtoken';
-import { config } from '../config/env';
+import { internalRoutes } from './internal.routes';
 import { apiKeyAuthHook } from '../middleware/api-key-auth';
 
 export async function registerRoutes(app: FastifyInstance) {
-  // Attach user if Authorization bearer token is provided (JWT)
-  app.addHook('preHandler', async (req: any, _reply) => {
-    const auth = req.headers.authorization;
-    const parseCookies = (cookieHeader: string | undefined) => {
-      if (!cookieHeader) return {};
-      return cookieHeader.split(';').reduce<Record<string, string>>((acc, part) => {
-        const [rawKey, ...rest] = part.trim().split('=');
-        if (!rawKey) return acc;
-        acc[rawKey] = decodeURIComponent(rest.join('='));
-        return acc;
-      }, {});
-    };
-    const token =
-      auth?.startsWith('Bearer ')
-        ? auth.slice(7)
-        : parseCookies(req.headers.cookie || '')['unie-token'];
-    if (token) {
-      try {
-        req.user = jwt.verify(token, config.authSecret);
-      } catch {
-        // ignore invalid tokens (may be API key, tried next)
-      }
-    }
-  });
-
+  // JWT is set by server.ts preHandler (shared for auth + main routes)
   // API key auth: if req.user not set, try ApiKey (OMS: X-Warehouse-ID required; WMS: intermediaryId)
   app.addHook('preHandler', apiKeyAuthHook);
 
-  await authRoutes(app);
   await healthRoutes(app);
   await shopifyAuthRoutes(app);
   await ebayAuthRoutes(app);
@@ -80,5 +53,6 @@ export async function registerRoutes(app: FastifyInstance) {
   await usersRoutes(app);
   await addressRoutes(app);
   await omsRoutes(app);
+  await internalRoutes(app);
 }
 

@@ -38,8 +38,11 @@ export async function pullAmazonAll(
   }
 
   const result: PullResult = {};
-  const userId = account.userId.toString();
-  const marketplaceId = marketplaceIds[0];
+  const marketplaceId = marketplaceIds[0] || '';
+  if (!marketplaceId) {
+    log.warn({ channelAccountId }, 'amazon pull skipped: no valid marketplaceId');
+    return {};
+  }
   const initialSync = opts?.initialSync === true;
 
   // Products + Inventory from FBA Inventory Summaries (paginated)
@@ -51,7 +54,7 @@ export async function pullAmazonAll(
     const invQuery: Record<string, string | number | boolean | string[] | undefined> = {
       granularityType: 'Marketplace',
       granularityId: marketplaceId,
-      marketplaceIds: marketplaceId,
+      marketplaceIds: [marketplaceId],
       details: true,
       startDateTime,
     };
@@ -158,7 +161,11 @@ export async function pullAmazonAll(
     await upsertOrderWithItems(order, items, upsertCtx);
   }
 
-  return { orders: orders.length };
+  result.orders = orders.length;
+  await setSyncStatus(channelAccountId, 'orders', 'synced', { count: result.orders });
+  await setSyncStatus(channelAccountId, 'customers', 'synced'); // derived from orders
+
+  return result;
 }
 
 async function upsertOrderWithItems(

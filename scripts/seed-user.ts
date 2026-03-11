@@ -6,7 +6,7 @@ import { config } from '../src/config/env';
 async function main() {
   await connectMongo();
   const email = config.superAdminEmail;
-  const password = process.env.SEED_SUPER_ADMIN_PASSWORD || 'changeme';
+  const password = process.argv[2] || process.env.SEED_SUPER_ADMIN_PASSWORD || 'changeme';
   const passwordHash = await bcrypt.hash(password, 10);
   const existing = await User.findOne({ email }).exec();
   if (existing) {

@@ -1,7 +1,13 @@
 import Fastify from 'fastify';
-import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
 import cors from '@fastify/cors';
+
+const DBG = path.join(process.cwd(), '..', '..', '.cursor', 'debug.log');
+const dbg = (o: object) => { try { fs.appendFileSync(DBG, JSON.stringify({ ...o, ts: Date.now() }) + '\n'); } catch {} };
+import jwt from 'jsonwebtoken';
 import { registerRoutes } from './routes';
+import { authRoutes } from './routes/auth.routes';
 import { config } from './config/env';
 import { connectMongo } from './config/mongo';
 import { startShopifyCron } from './services/shopify-cron';
@@ -13,13 +19,9 @@ async function start() {
   // Request/response tracing for observability
   app.addHook('onRequest', async (req) => {
     (req as any).startTime = process.hrtime.bigint();
+    if (req.method === 'POST' && req.url.includes('auth/login')) dbg({ src: 'UCB-server', step: 'onRequest', method: req.method, url: req.url });
     req.log.info({ reqId: req.id, method: req.method, url: req.url, ip: req.ip }, 'incoming request');
     const origin = req.headers.origin;
-    if (origin) {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'cors-pre',hypothesisId:'H1',location:'src/server.ts:19',message:'request origin observed',data:{origin,method:req.method,url:req.url},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion agent log
-    }
   });
 
   app.addHook('onResponse', async (req, reply) => {
@@ -35,9 +37,6 @@ async function start() {
   await connectMongo();
   const defaultCorsOrigins = ['https://unieconnect.com', 'https://user.unieconnect.com', 'http://localhost:3000'];
   const corsOrigins = Array.from(new Set([...defaultCorsOrigins, ...config.corsOrigins]));
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'cors-pre',hypothesisId:'H2',location:'src/server.ts:30',message:'cors configuration',data:{corsOrigins},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
   await app.register(cors, {
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
@@ -48,8 +47,25 @@ async function start() {
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Warehouse-ID'],
     credentials: true,
   });
-  // Register all routes under /api/v1 to match redirect/webhook URLs
+  // Single /api/v1 plugin: JWT preHandler for ALL routes (auth + main). apiKeyAuthHook only affects routes that need it.
   app.register(async (instance) => {
+    instance.addHook('preHandler', async (req: any) => {
+      const auth = req.headers.authorization;
+      const parseCookies = (h: string | undefined) => !h ? {} : h.split(';').reduce<Record<string, string>>((acc, p) => {
+        const [k, ...v] = p.trim().split('=');
+        if (k) acc[k] = decodeURIComponent((v.join('=') || '').trim());
+        return acc;
+      }, {});
+      const token = auth?.startsWith('Bearer ') ? auth.slice(7).trim() : (parseCookies(req.headers.cookie)['unie-token'] || '').trim();
+      if (token) {
+        try {
+          req.user = jwt.verify(token, config.authSecret);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+    await authRoutes(instance);
     await registerRoutes(instance);
   }, { prefix: '/api/v1' });
   startShopifyCron(app.log);
