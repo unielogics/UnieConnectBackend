@@ -14,7 +14,8 @@ export const config = {
     clientSecret: process.env.SHOPIFY_CLIENT_SECRET || '',
     webhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET || '',
     appBaseUrl: process.env.APP_BASE_URL || '', // e.g., https://api.unieconnect.com
-    apiVersion: process.env.SHOPIFY_API_VERSION || '2024-01',
+    // 2026-01 may not be released; webhook registration fails. Use 2024-01 for compatibility.
+    apiVersion: (process.env.SHOPIFY_API_VERSION || '2024-01').replace(/^2026-/, '2024-'),
   },
   /** Base URL of the frontend app for post-OAuth redirects (e.g. https://user.unieconnect.com) */
   frontendOrigin: process.env.FRONTEND_ORIGIN || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
