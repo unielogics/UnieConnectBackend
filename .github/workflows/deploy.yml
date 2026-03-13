@@ -14,7 +14,58 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup SSH
-        run: mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" && echo "${{ secrets.EC2_SSH_KEY }}" > "$HOME/.ssh/id_ed25519" && chmod 600 "$HOME/.ssh/id_ed25519" && ssh-keyscan -H ${{ secrets.EC2_HOST }} >> "$HOME/.ssh/known_hosts"
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
       - name: Deploy to EC2
-        run: ssh -o StrictHostKeyChecking=no -i "$HOME/.ssh/id_ed25519" ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} 'bash -s' < .github/deploy-remote.sh
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+
+            # --- 1. Hardcoded deployment path & repo ---
+            APP_DIR="/var/www/unie-backend"
+            REPO="https://github.com/unielogics/UnieConnectBackend.git"
+            BRANCH="main"
+
+            echo "Deploying repository $REPO (branch $BRANCH) to $APP_DIR"
+
+            # Ensure Node 20+
+            NODE_MAJOR=$(node -v 2>/dev/null | sed 's/v//;s/\..*//')
+            if [ -z "$NODE_MAJOR" ] || [ "$NODE_MAJOR" -lt 20 ]; then
+              echo "Node 20+ required on EC2. Current: $(node -v 2>/dev/null || echo missing)"
+              exit 1
+            fi
+
+            # Ensure the directory exists
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
+
+            # --- 2. Pull or clone ---
+            if [ -d ".git" ]; then
+              git remote set-url origin "$REPO" || git remote add origin "$REPO"
+              git fetch --all
+              git reset --hard origin/$BRANCH
+            else
+              rm -rf ./*
+              git init
+              git remote add origin "$REPO"
+              git fetch
+              git reset --hard origin/$BRANCH
+            fi
+
+            # Install dependencies (include dev deps for build), then prune
+            npm ci || npm install
+
+            # Build step (required to produce dist/server.js)
+            npm run build
+
+            # Prune dev deps for runtime
+            npm prune --production || true
+
+            # --- 3. PM2 zero-downtime reload ---
+            pm2 reload ecosystem.config.js || pm2 start ecosystem.config.js
+            pm2 save
+          EOF
