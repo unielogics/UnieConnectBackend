@@ -98,12 +98,17 @@ export async function shipmentPlanRoutes(fastify: FastifyInstance) {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
 
-    const { limit, offset, status } = req.query as any;
+    const { limit, offset, status, supplierId, facilityId, search, sortBy, sortOrder } = req.query as any;
     const result = await listShipmentPlans({
       userId: String(userId),
       limit: limit != null ? Math.min(Number(limit), 100) : 50,
       offset: offset != null ? Math.max(0, Number(offset)) : 0,
       status,
+      supplierId: supplierId || undefined,
+      facilityId: facilityId || undefined,
+      search: search || undefined,
+      sortBy: sortBy === 'createdAt' ? 'createdAt' : 'updatedAt',
+      sortOrder: sortOrder === 'asc' ? 'asc' : 'desc',
     });
     return result;
   });

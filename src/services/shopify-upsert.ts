@@ -6,6 +6,7 @@ import { CustomerExternal } from '../models/customer-external';
 import { Order } from '../models/order';
 import { OrderLine } from '../models/order-line';
 import { upsertAuditFromShopify } from './audit-ingest';
+import { createOrderInWms } from './wms-order-creation.service';
 
 export type UpsertContext = {
   channelAccountId: string;
@@ -182,6 +183,35 @@ export async function upsertOrder(body: any, ctx: UpsertContext) {
     orderDoc: order,
     rawOrder: body,
   });
+
+  const lineItemsWithSku = lines.filter((l: any) => (l.sku || '').trim()).map((l: any) => ({
+    sku: String(l.sku).trim(),
+    quantity: Math.max(1, Math.floor(Number(l.quantity) || 0)),
+    itemName: l.title || l.name,
+    unitPrice: num(l.price),
+  }));
+  if (lineItemsWithSku.length > 0) {
+    const addr = body.shipping_address || body.billing_address || {};
+    const cust = body.customer || {};
+    createOrderInWms({
+      userId,
+      shippingAddress: {
+        firstName: addr.first_name || cust.first_name || 'Customer',
+        lastName: addr.last_name || cust.last_name || '',
+        email: cust.email,
+        phone: cust.phone || addr.phone,
+        addressLine1: addr.address1 || addr.address,
+        addressLine2: addr.address2,
+        city: addr.city,
+        state: addr.province_code || addr.province,
+        zipCode: addr.zip,
+        country: addr.country,
+      },
+      lineItems: lineItemsWithSku,
+      alternativeOrderNumber: externalOrderId,
+      log,
+    }).catch((err) => log?.warn?.(err, 'WMS order creation failed (non-fatal)'));
+  }
 
   log?.info?.({ externalOrderId, lines: lines.length }, 'Shopify order upserted');
   return order;

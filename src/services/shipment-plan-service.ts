@@ -591,14 +591,37 @@ export async function listShipmentPlans(params: {
   limit?: number;
   offset?: number;
   status?: ShipmentPlanStatus;
+  supplierId?: string;
+  facilityId?: string;
+  search?: string;
+  sortBy?: 'createdAt' | 'updatedAt';
+  sortOrder?: 'asc' | 'desc';
 }): Promise<{ plans: any[]; total: number }> {
-  const { userId, limit = 50, offset = 0, status } = params;
+  const { userId, limit = 50, offset = 0, status, supplierId, facilityId, search, sortBy = 'updatedAt', sortOrder = 'desc' } = params;
   const query: Record<string, unknown> = { userId };
   if (status) query.status = status;
+  if (supplierId) query.supplierId = supplierId;
+  if (facilityId) query.facilityId = facilityId;
+  if (search && search.trim()) {
+    const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(escaped, 'i');
+    query.$or = [
+      { internalShipmentId: re },
+      { orderNo: re },
+      { receiptNo: re },
+      { shipmentTitle: re },
+    ];
+  }
+
+  const sortDir = sortOrder === 'asc' ? 1 : -1;
+  const sortField = sortBy === 'createdAt' ? 'createdAt' : 'updatedAt';
+  const sortObj: Record<string, 1 | -1> = { [sortField]: sortDir };
+  if (sortField === 'updatedAt') sortObj.createdAt = sortDir;
+  else sortObj.updatedAt = sortDir;
 
   const total = await ShipmentPlan.countDocuments(query);
   const docs = await ShipmentPlan.find(query)
-    .sort({ updatedAt: -1, createdAt: -1 })
+    .sort(sortObj)
     .skip(offset)
     .limit(limit)
     .populate('supplierId', 'name')

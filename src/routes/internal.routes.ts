@@ -4,6 +4,7 @@ import { OmsIntermediary } from '../models/oms-intermediary';
 import { User } from '../models/user';
 import { config } from '../config/env';
 import { getShippingRates, createShippingShipment } from '../services/amazon-shipping';
+import { processWmsOrderStatus } from '../services/wms-order-status.service';
 
 /**
  * Internal API for WMS/UnieBackend to resolve channel accounts and call Amazon shipping.
@@ -143,5 +144,40 @@ export async function internalRoutes(app: FastifyInstance) {
       return reply.code(500).send({ error: err?.message || 'Failed to create Amazon shipping shipment' });
     }
   });
+
+    /**
+     * POST /wms/order-status
+     * Receive WMS order status updates (shipped, completed, cancelled).
+     * Updates OMS order and optionally pushes fulfillment to Shopify/Amazon.
+     */
+    internalApp.post('/wms/order-status', async (req: any, reply) => {
+      const body = req.body || {};
+      const {
+        wmsOrderId,
+        wmsOrderNumber,
+        omsIntermediaryId,
+        status,
+        alternativeOrderNumber,
+        trackingNumber,
+        shippedAt,
+      } = body;
+      if (!omsIntermediaryId || !status) {
+        return reply.code(400).send({ error: 'omsIntermediaryId and status are required' });
+      }
+      const payload: Parameters<typeof processWmsOrderStatus>[0] = {
+        wmsOrderId: String(wmsOrderId || ''),
+        wmsOrderNumber: String(wmsOrderNumber || ''),
+        omsIntermediaryId: String(omsIntermediaryId),
+        status: String(status),
+      };
+      if (alternativeOrderNumber) payload.alternativeOrderNumber = String(alternativeOrderNumber);
+      if (trackingNumber) payload.trackingNumber = String(trackingNumber);
+      if (shippedAt) payload.shippedAt = new Date(shippedAt);
+      const result = await processWmsOrderStatus(payload, internalApp.log);
+      if (!result.updated && result.error) {
+        return reply.code(404).send({ error: result.error });
+      }
+      return { success: true };
+    });
   }, { prefix: '/internal' });
 }

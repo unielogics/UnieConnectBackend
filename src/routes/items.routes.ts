@@ -5,6 +5,11 @@ import { ItemActivityLog } from '../models/item-activity-log';
 import { ItemExternal } from '../models/item-external';
 import { ChannelAccount } from '../models/channel-account';
 import { channelDisplayLabel } from '../lib/channel-display';
+import { OmsIntermediary } from '../models/oms-intermediary';
+import { OmsIntermediaryWarehouse } from '../models/oms-intermediary-warehouse';
+import { User } from '../models/user';
+import { fetchWmsInventoryBySkus } from '../services/wms-inventory.service';
+import { fetchWmsItemActivities } from '../services/wms-activities.service';
 
 export async function itemRoutes(fastify: FastifyInstance) {
   // List items for current user
@@ -28,6 +33,31 @@ export async function itemRoutes(fastify: FastifyInstance) {
       }
     }
     const items = await Item.find(match).sort({ updatedAt: -1 }).limit(200).lean().exec();
+
+    // Resolve WMS inventory when user has warehouse connection
+    let wmsInventory: Record<string, { inbound: number; received: number; available: number; orders: number; shippedToday: number }> = {};
+    const user = await User.findById(userId).select('email').lean().exec();
+    if (user?.email) {
+      const oms = await OmsIntermediary.findOne({
+        email: (user.email as string).toLowerCase(),
+        status: 'active',
+      })
+        .select('_id')
+        .lean()
+        .exec();
+      if (oms?._id) {
+        const link = await OmsIntermediaryWarehouse.findOne({ omsIntermediaryId: oms._id }).lean().exec();
+        if (link?.warehouseCode && items.length > 0) {
+          const skus = items.map((i) => (i as any).sku).filter(Boolean);
+          wmsInventory = await fetchWmsInventoryBySkus({
+            warehouseCode: link.warehouseCode,
+            skus,
+            log: req.log,
+          });
+        }
+      }
+    }
+
     if (!includeMappings || includeMappings === '1' || includeMappings === 'true') {
       const ids = items.map((i) => i._id);
       const links = await ItemExternal.find({ itemId: { $in: ids } })
@@ -57,11 +87,18 @@ export async function itemRoutes(fastify: FastifyInstance) {
       const result = items.map((item) => {
         const itemId = String(item._id);
         const { channels = [], mappings = [] } = channelsByItem[itemId] || {};
-        return { ...item, channels, mappings };
+        const sku = (item as any).sku;
+        const inventory = sku && wmsInventory[sku] ? wmsInventory[sku] : undefined;
+        return { ...item, channels, mappings, ...(inventory && { wmsInventory: inventory }) };
       });
       return result;
     }
-    return items;
+    const result = items.map((item) => {
+      const sku = (item as any).sku;
+      const inventory = sku && wmsInventory[sku] ? wmsInventory[sku] : undefined;
+      return inventory ? { ...item, wmsInventory: inventory } : item;
+    });
+    return result;
   });
 
   // Create item
@@ -121,6 +158,21 @@ export async function itemRoutes(fastify: FastifyInstance) {
       req.log.error({ err }, 'failed to create item');
       return reply.code(400).send({ error: 'Could not create item', detail: err?.message });
     }
+  });
+
+  // Get WMS warehouse activities for item (when user has warehouse connection)
+  fastify.get('/items/:id/wms-activities', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { id } = req.params as { id: string };
+    const item = await Item.findOne({ _id: id, userId }).select('sku').lean().exec();
+    if (!item?.sku) return reply.code(404).send({ error: 'Item not found' });
+    const activities = await fetchWmsItemActivities({
+      userId,
+      sku: (item as any).sku,
+      log: req.log,
+    });
+    return activities;
   });
 
   // Get item shipment activity (product logs)
