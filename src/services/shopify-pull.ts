@@ -179,7 +179,11 @@ export async function pullShopifyAll(ctx: {
       await setSyncStatus(channelAccountId, 'inventory', 'synced', { count: 0 });
     }
   } else {
-    await setSyncStatus(channelAccountId, 'inventory', 'error', { error: 'Locations fetch failed' });
+    const errText = await locationsRes.text().catch(() => '');
+    const errMsg = locationsRes.status === 403 || locationsRes.status === 401
+      ? 'Locations access denied (add read_locations scope and reconnect)'
+      : `Locations fetch failed (HTTP ${locationsRes.status})`;
+    await setSyncStatus(channelAccountId, 'inventory', 'error', { error: errMsg });
   }
   } catch (err: any) {
     log.error({ err }, 'Shopify inventory sync failed');

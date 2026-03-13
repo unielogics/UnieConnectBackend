@@ -167,12 +167,57 @@ export async function itemRoutes(fastify: FastifyInstance) {
     const { id } = req.params as { id: string };
     const item = await Item.findOne({ _id: id, userId }).select('sku').lean().exec();
     if (!item?.sku) return reply.code(404).send({ error: 'Item not found' });
-    const activities = await fetchWmsItemActivities({
-      userId,
-      sku: (item as any).sku,
-      log: req.log,
-    });
-    return activities;
+    const sku = (item as any).sku;
+    const user = await User.findById(userId).select('email').lean().exec();
+    let activities: Record<string, unknown> | null = null;
+    const inventoryByWarehouse: Array<{ warehouseCode: string; warehouseName?: string; inventory: Record<string, unknown> }> = [];
+    let links: Array<{ warehouseCode: string }> = [];
+    if (user?.email) {
+      const oms = await OmsIntermediary.findOne({
+        email: (user.email as string).toLowerCase(),
+        status: 'active',
+      })
+        .select('_id')
+        .lean()
+        .exec();
+      if (oms?._id) {
+        links = await OmsIntermediaryWarehouse.find({ omsIntermediaryId: oms._id })
+          .select('warehouseCode')
+          .lean()
+          .exec();
+      }
+    }
+    const firstWarehouseCode = links[0]?.warehouseCode;
+    if (firstWarehouseCode) {
+      activities = (await fetchWmsItemActivities({
+        userId,
+        sku,
+        log: req.log,
+      })) as Record<string, unknown> | null;
+      for (const link of links) {
+        const wc = (link as any).warehouseCode;
+        if (!wc) continue;
+        const inv = await fetchWmsInventoryBySkus({
+          warehouseCode: wc,
+          skus: [sku],
+          log: req.log,
+        });
+        const invData = inv[sku] as Record<string, unknown> | undefined;
+        if (invData) {
+          inventoryByWarehouse.push({
+            warehouseCode: wc,
+            warehouseName: wc,
+            inventory: invData,
+          });
+        }
+      }
+    }
+    const wmsInventory = inventoryByWarehouse[0]?.inventory as Record<string, unknown> | undefined;
+    return {
+      ...(activities || {}),
+      wmsInventory,
+      inventoryByWarehouse: inventoryByWarehouse.length > 0 ? inventoryByWarehouse : undefined,
+    };
   });
 
   // Get item shipment activity (product logs)

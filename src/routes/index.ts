@@ -25,6 +25,7 @@ import { usersRoutes } from './users.routes';
 import { addressRoutes } from './address.routes';
 import { omsRoutes } from './oms.routes';
 import { internalRoutes } from './internal.routes';
+import { notesRoutes } from './notes.routes';
 import { apiKeyAuthHook } from '../middleware/api-key-auth';
 
 export async function registerRoutes(app: FastifyInstance) {
@@ -58,5 +59,6 @@ export async function registerRoutes(app: FastifyInstance) {
   await addressRoutes(app);
   await omsRoutes(app);
   await internalRoutes(app);
+  await notesRoutes(app);
 }
 

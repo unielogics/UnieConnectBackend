@@ -349,9 +349,6 @@ export async function createInboundPlan(params: {
       Quantity: i.quantity,
     })),
   };
-  // #region agent log
-  fetch('http://127.0.0.1:7244/ingest/1c6029e9-7d46-49b9-a14e-a0b53851f08d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'B',location:'amazon-inbound.ts:353',message:'creating inbound plan',data:{channelAccountId,workflowId,itemCount:items.length,packingMode:packingMode||null,labelPrepPreference:labelPrepPreference||'SELLER_LABEL',shipFromCountry:resolvedShipFrom.shipFromAddress.countryCode,shipFromPostalCode:resolvedShipFrom.shipFromAddress.postalCode,marketplaceId:(account.marketplaceIds||[])[0]||null,skus:items.map((item)=>item.sellerSku).slice(0,10)},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
 
   const res = await spApiFetch(account, {
     method: 'POST',
@@ -504,18 +501,12 @@ export async function createInboundShipment(params: {
       PrepDetailsList: i.prepDetailsList,
     })),
   };
-  // #region agent log
-  fetch('http://127.0.0.1:7244/ingest/1c6029e9-7d46-49b9-a14e-a0b53851f08d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'C',location:'amazon-inbound.ts:505',message:'creating inbound shipment',data:{channelAccountId,workflowId:workflowId||shipmentId,shipmentId,destinationFulfillmentCenterId,itemCount:items.length,labelPrepPreference:labelPrepPreference||'SELLER_LABEL',packingMode:packingMode||null,items:items.slice(0,10).map((item)=>({sellerSku:item.sellerSku,quantityShipped:item.quantityShipped,quantityInCase:item.quantityInCase,hasPrepDetails:Boolean(item.prepDetailsList&&item.prepDetailsList.length)}))},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
 
   const res = await spApiFetch(account, {
     method: 'POST',
     path: '/fba/inbound/v0/shipments',
     body,
   });
-  // #region agent log
-  fetch('http://127.0.0.1:7244/ingest/1c6029e9-7d46-49b9-a14e-a0b53851f08d',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'D',location:'amazon-inbound.ts:510',message:'inbound shipment created response',data:{channelAccountId,workflowId:workflowId||shipmentId,shipmentId,responseKeys:Object.keys(res||{}).slice(0,20),payloadKeys:Object.keys((res as any)?.payload||{}).slice(0,20),shipmentStatus:firstString((res as any)?.payload?.ShipmentStatus,(res as any)?.ShipmentStatus)||null},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
 
   await InboundShipment.findOneAndUpdate(
     { channelAccountId, shipmentId },

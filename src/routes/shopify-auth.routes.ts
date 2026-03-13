@@ -12,7 +12,7 @@ import { OAuthState } from '../models/oauth-state';
 
 function buildInstallUrl(shop: string, state: string) {
   const scope =
-    'read_products,write_products,read_orders,write_orders,read_customers,write_customers,read_inventory,write_inventory,read_fulfillments,write_fulfillments';
+    'read_products,write_products,read_orders,write_orders,read_customers,write_customers,read_inventory,write_inventory,read_locations,read_fulfillments,write_fulfillments';
   const params = new URLSearchParams({
     client_id: config.shopify.clientId,
     scope,

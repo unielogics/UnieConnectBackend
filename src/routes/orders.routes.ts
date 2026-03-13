@@ -31,9 +31,13 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const enriched = (orders as any[]).map((o) => {
       const acc = o.channelAccountId;
       const channelDisplay = acc ? channelDisplayLabel(acc) : undefined;
-      const { channelAccountId, customerId, ...rest } = o;
+      const { channelAccountId, customerId, wmsStatus, wmsTrackingNumber, wmsShippedAt, ...rest } = o;
+      const effectiveStatus = wmsStatus ?? rest.status;
       return {
         ...rest,
+        status: effectiveStatus,
+        trackingNumber: wmsTrackingNumber ?? null,
+        shippedAt: wmsShippedAt ?? null,
         channelAccountId: channelAccountId?._id ?? channelAccountId,
         channelDisplay,
         channel: acc?.channel,
@@ -57,9 +61,13 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const lines = await OrderLine.find({ orderId: order._id }).populate('itemId', 'title image sku').lean().exec();
     const acc = (order as any).channelAccountId;
     const channelDisplay = acc ? channelDisplayLabel(acc) : undefined;
-    const { channelAccountId, customerId, ...rest } = order as any;
+    const { channelAccountId, customerId, wmsStatus, wmsTrackingNumber, wmsShippedAt, ...rest } = order as any;
+    const effectiveStatus = wmsStatus ?? rest.status;
     return {
       ...rest,
+      status: effectiveStatus,
+      trackingNumber: wmsTrackingNumber ?? null,
+      shippedAt: wmsShippedAt ?? null,
       channelAccountId: channelAccountId?._id ?? channelAccountId,
       channelDisplay,
       channel: acc?.channel,

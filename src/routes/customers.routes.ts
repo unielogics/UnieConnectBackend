@@ -3,13 +3,16 @@ import { Types } from 'mongoose';
 import { Customer } from '../models/customer';
 import { CustomerExternal } from '../models/customer-external';
 import { ChannelAccount } from '../models/channel-account';
+import { Order } from '../models/order';
 import { channelDisplayLabel } from '../lib/channel-display';
 
 export async function customerRoutes(fastify: FastifyInstance) {
   fastify.get('/customers', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const { includeMappings, channel } = (req.query as { includeMappings?: string; channel?: string }) || {};
+    const { includeMappings, channel, search, sortBy = 'updatedAt', sortOrder = 'desc' } = (req.query as {
+      includeMappings?: string; channel?: string; search?: string; sortBy?: string; sortOrder?: string;
+    }) || {};
     let customerIdsForFilter: Types.ObjectId[] | null = null;
     if (channel && ['shopify', 'amazon', 'ebay', 'unmapped'].includes(channel)) {
       const accounts = await ChannelAccount.find({ userId: new Types.ObjectId(userId) }).select('_id channel').lean().exec();
@@ -31,7 +34,70 @@ export async function customerRoutes(fastify: FastifyInstance) {
         match._id = { $in: customerIdsForFilter };
       }
     }
-    const customers = await Customer.find(match).sort({ updatedAt: -1 }).limit(200).lean().exec();
+    if (search && String(search).trim()) {
+      const q = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(q, 'i');
+      match.$or = [
+        { email: re },
+        { phone: re },
+        { 'name.first': re },
+        { 'name.last': re },
+      ];
+    }
+    const sortField = ['name', 'email', 'updatedAt', 'orderCount', 'lastOrderDate', 'totalItems'].includes(sortBy)
+      ? sortBy
+      : 'updatedAt';
+    const sortDir = sortOrder === 'asc' ? 1 : -1;
+
+    const pipeline: any[] = [
+      { $match: match },
+      {
+        $lookup: {
+          from: 'orders',
+          let: { custId: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$customerId', '$$custId'] }, userId: new Types.ObjectId(userId) } },
+            { $project: { placedAt: 1, status: 1, wmsStatus: 1 } },
+          ],
+          as: '_orders',
+        },
+      },
+      {
+        $addFields: {
+          orderCount: { $size: '$_orders' },
+          lastOrderDate: { $max: '$_orders.placedAt' },
+          orderStatuses: {
+            $map: {
+              input: '$_orders',
+              as: 'o',
+              in: { $ifNull: ['$$o.wmsStatus', '$$o.status'] },
+            },
+          },
+        },
+      },
+      {
+        $lookup: {
+          from: 'orderlines',
+          let: { orderIds: '$_orders._id' },
+          pipeline: [
+            { $match: { $expr: { $in: ['$orderId', '$$orderIds'] } } },
+            { $group: { _id: null, total: { $sum: '$quantity' } } },
+          ],
+          as: '_itemsAgg',
+        },
+      },
+      {
+        $addFields: {
+          totalItems: { $ifNull: [{ $arrayElemAt: ['$_itemsAgg.total', 0] }, 0] },
+        },
+      },
+      { $project: { _orders: 0, _itemsAgg: 0 } },
+      { $sort: sortField === 'name' ? { 'name.first': sortDir, 'name.last': sortDir } : { [sortField]: sortDir } },
+      { $limit: 200 },
+    ];
+
+    const customers = await Customer.aggregate(pipeline).exec();
+
     if (!includeMappings || includeMappings === '1' || includeMappings === 'true') {
       const ids = customers.map((c) => c._id);
       const links = await CustomerExternal.find({ customerId: { $in: ids } })
@@ -46,7 +112,6 @@ export async function customerRoutes(fastify: FastifyInstance) {
       }, {});
       const channelsByCustomer = Object.fromEntries(
         Object.entries(byCustomer).map(([custId, lst]) => {
-          const channels = [...new Set(lst.map((l) => (l as any).channel))];
           const mappings = lst.map((l) => {
             const acc = (l as any).channelAccountId;
             return {
@@ -55,7 +120,7 @@ export async function customerRoutes(fastify: FastifyInstance) {
               channelAccountId: (l as any).channelAccountId?._id ?? (l as any).channelAccountId,
             };
           });
-          return [custId, { channels, mappings }];
+          return [custId, { channels: [...new Set(lst.map((l) => (l as any).channel))], mappings }];
         })
       );
       return customers.map((c) => {
@@ -85,6 +150,50 @@ export async function customerRoutes(fastify: FastifyInstance) {
       req.log.error({ err }, 'failed to create customer');
       return reply.code(400).send({ error: 'Could not create customer', detail: err?.message });
     }
+  });
+
+  fastify.get('/customers/:id/orders', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { id } = req.params || {};
+    const customer = await Customer.findOne({ _id: id, userId }).lean().exec();
+    if (!customer) return reply.code(404).send({ error: 'Customer not found' });
+    const orders = await Order.find({ userId: new Types.ObjectId(userId), customerId: new Types.ObjectId(id) })
+      .populate('channelAccountId', 'channel shopDomain sellingPartnerId')
+      .sort({ placedAt: -1, createdAt: -1 })
+      .limit(50)
+      .lean()
+      .exec();
+    const channelDisplayLabelFn = channelDisplayLabel;
+    const enriched = (orders as any[]).map((o) => {
+      const acc = o.channelAccountId;
+      const channelDisplay = acc ? channelDisplayLabelFn(acc) : undefined;
+      const effectiveStatus = o.wmsStatus ?? o.status;
+      return {
+        _id: o._id,
+        externalOrderId: o.externalOrderId,
+        status: effectiveStatus,
+        channel: acc?.channel,
+        channelDisplay,
+        placedAt: o.placedAt,
+        totals: o.totals,
+        currency: o.currency,
+      };
+    });
+    const totalValue = enriched.reduce((sum, o) => sum + (o.totals?.total ?? 0), 0);
+    const ordersByStatus = enriched.reduce<Record<string, number>>((acc, o) => {
+      const s = (o.status || 'unknown').toLowerCase();
+      acc[s] = (acc[s] || 0) + 1;
+      return acc;
+    }, {});
+    return {
+      orders: enriched,
+      summary: {
+        totalOrders: enriched.length,
+        totalValue,
+        ordersByStatus: Object.entries(ordersByStatus).map(([_id, count]) => ({ _id, count })),
+      },
+    };
   });
 
   fastify.get('/customers/:id', async (req: any, reply) => {

@@ -124,25 +124,33 @@ export async function upsertOrder(body: any, ctx: UpsertContext) {
 
   const customerId = await ensureCustomer(body.customer, ctx);
 
+  const existing = await Order.findOne({ channelAccountId, externalOrderId }).lean().exec();
+  const marketplaceStatus = body.financial_status || 'open';
+
+  const baseUpdate: Record<string, unknown> = {
+    userId,
+    channelAccountId,
+    channel: channel || 'shopify',
+    marketplaceId,
+    fulfillmentChannel: 'shopify',
+    source: source || 'poll',
+    externalOrderId,
+    marketplaceStatus,
+    currency,
+    totals,
+    customerId: customerId || undefined,
+    placedAt: body.created_at ? new Date(body.created_at) : undefined,
+    closedAt: body.closed_at ? new Date(body.closed_at) : undefined,
+    raw: body,
+    syncedAt: new Date(),
+  };
+  if (!existing?.wmsStatus) {
+    baseUpdate.status = marketplaceStatus;
+  }
+
   const order = await Order.findOneAndUpdate(
     { channelAccountId, externalOrderId },
-    {
-      userId,
-      channelAccountId,
-      channel: channel || 'shopify',
-      marketplaceId,
-      fulfillmentChannel: 'shopify',
-      source: source || 'poll',
-      externalOrderId,
-      status: body.financial_status || 'open',
-      currency,
-      totals,
-      customerId: customerId || undefined,
-      placedAt: body.created_at ? new Date(body.created_at) : undefined,
-      closedAt: body.closed_at ? new Date(body.closed_at) : undefined,
-      raw: body,
-      syncedAt: new Date(),
-    },
+    baseUpdate,
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).exec();
 

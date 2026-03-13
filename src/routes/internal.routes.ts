@@ -159,6 +159,8 @@ export async function internalRoutes(app: FastifyInstance) {
         status,
         alternativeOrderNumber,
         trackingNumber,
+        trackingCompany,
+        trackingUrl,
         shippedAt,
       } = body;
       if (!omsIntermediaryId || !status) {
@@ -172,6 +174,8 @@ export async function internalRoutes(app: FastifyInstance) {
       };
       if (alternativeOrderNumber) payload.alternativeOrderNumber = String(alternativeOrderNumber);
       if (trackingNumber) payload.trackingNumber = String(trackingNumber);
+      if (trackingCompany) payload.trackingCompany = String(trackingCompany);
+      if (trackingUrl) payload.trackingUrl = String(trackingUrl);
       if (shippedAt) payload.shippedAt = new Date(shippedAt);
       const result = await processWmsOrderStatus(payload, internalApp.log);
       if (!result.updated && result.error) {

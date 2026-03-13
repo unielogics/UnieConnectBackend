@@ -7,11 +7,13 @@ export interface WmsInventoryBySku {
   available: number;
   orders: number;
   shippedToday: number;
+  openAsnsCount?: number;
+  receiving?: number;
 }
 
 /**
  * Fetch WMS inventory stats for given SKUs from UnieBackend internal API.
- * Returns a map of sku -> { inbound, received, available, orders, shippedToday }.
+ * Returns a map of sku -> { inbound, received, available, orders, shippedToday, openAsnsCount, receiving }.
  */
 export async function fetchWmsInventoryBySkus(params: {
   warehouseCode: string;

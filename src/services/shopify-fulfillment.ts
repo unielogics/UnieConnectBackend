@@ -51,7 +51,11 @@ export async function createShopifyFulfillment(params: ShopifyFulfillmentInput) 
   const openFo = fulfillmentOrders.find((fo) => fo.status === 'open' || fo.status === 'scheduled');
   if (!openFo) {
     const statuses = fulfillmentOrders.map((fo) => fo.status).join(', ');
-    throw new Error(`No open or scheduled fulfillment order for order ${externalOrderId}. Statuses: ${statuses || 'none'}`);
+    log.info(
+      { externalOrderId, statuses },
+      'Shopify order already fulfilled - skipping (idempotent)'
+    );
+    return { fulfillment: null, skipped: true };
   }
 
   const lineItemsByFo: { fulfillment_order_id: number; fulfillment_order_line_items?: { id: number; quantity: number }[] }[] = [

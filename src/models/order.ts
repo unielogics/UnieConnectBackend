@@ -24,6 +24,14 @@ export interface IOrder extends Document {
   closedAt?: Date;
   raw?: any;
   syncedAt?: Date;
+  /** WMS fulfillment status - source of truth when present */
+  wmsStatus?: string;
+  /** Tracking number from WMS */
+  wmsTrackingNumber?: string;
+  /** Actual ship date from WMS */
+  wmsShippedAt?: Date;
+  /** Original marketplace status (for reference) */
+  marketplaceStatus?: string;
 }
 
 const OrderSchema = new Schema<IOrder>(
@@ -49,11 +57,16 @@ const OrderSchema = new Schema<IOrder>(
     closedAt: { type: Date },
     raw: { type: Schema.Types.Mixed },
     syncedAt: { type: Date },
+    wmsStatus: { type: String },
+    wmsTrackingNumber: { type: String },
+    wmsShippedAt: { type: Date },
+    marketplaceStatus: { type: String },
   },
   { timestamps: true },
 );
 
 OrderSchema.index({ channelAccountId: 1, externalOrderId: 1 }, { unique: true });
+OrderSchema.index({ userId: 1, customerId: 1 });
 
 export const Order: Model<IOrder> = (models.Order as Model<IOrder>) || model<IOrder>('Order', OrderSchema);
 

@@ -122,9 +122,16 @@ Orders are also pulled by the cron (every ~30 minutes). Use **Refresh** on the S
 
 ---
 
+## Locations / Inventory Error
+
+If you see **"Locations fetch failed"** or **"Locations access denied"** in the Monitor:
+
+- Add `read_locations` to OAuth scope (already in code) and **reconnect** the store to get the new permissions.
+- From the Shopify panel, click **Reconnect** → confirm → enter shop domain → **Connect Shopify** → complete OAuth in the browser.
+
 ## Quick Actions
 
-1. Set `SHOPIFY_API_VERSION=2024-01` in production env.
+1. Set `SHOPIFY_API_VERSION=2024-01` in production env (or use the 2026→2024 fallback in config).
 2. Redeploy.
 3. Disconnect and reconnect the store.
 4. Watch logs during reconnect.
