@@ -54,11 +54,12 @@ export async function itemRoutes(fastify: FastifyInstance) {
           return [itemId, { channels, mappings }];
         })
       );
-      return items.map((item) => {
+      const result = items.map((item) => {
         const itemId = String(item._id);
         const { channels = [], mappings = [] } = channelsByItem[itemId] || {};
         return { ...item, channels, mappings };
       });
+      return result;
     }
     return items;
   });

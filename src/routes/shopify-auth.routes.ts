@@ -117,6 +117,8 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
         'fulfillment_orders/moved',
         'fulfillment_orders/hold_released',
         'fulfillment_orders/order_routing_complete',
+        'orders/create',
+        'orders/updated',
         'inventory_levels/update',
         'products/update',
       ];

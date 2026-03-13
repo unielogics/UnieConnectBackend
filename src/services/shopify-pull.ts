@@ -1,5 +1,6 @@
 import fetch from 'node-fetch';
 import { config } from '../config/env';
+import { debugLog } from '../lib/debug-log';
 import { upsertOrder, upsertProduct, upsertInventory, upsertCustomerFromApi, UpsertContext } from './shopify-upsert';
 import { setSyncStatus } from './channel-sync-status';
 
@@ -26,6 +27,9 @@ export async function pullShopifyAll(ctx: {
   initialSync?: boolean;
 }): Promise<PullResult> {
   const { shopDomain, accessToken, channelAccountId, userId, log, initialSync } = ctx;
+  // #region agent log
+  debugLog('pullShopifyAll entry', { channelAccountId, userId, initialSync, shopDomain }, 'A');
+  // #endregion
   const upsertCtx: UpsertContext = {
     channelAccountId,
     userId,
@@ -37,9 +41,11 @@ export async function pullShopifyAll(ctx: {
   const base = `https://${shopDomain}/admin/api/${version}`;
   const result: PullResult = {};
 
-  // Products - fully paginated (no limit for large catalogs)
-  await setSyncStatus(channelAccountId, 'products', 'syncing');
   const headers = { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken };
+
+  // Products - fully paginated (no limit for large catalogs)
+  try {
+  await setSyncStatus(channelAccountId, 'products', 'syncing');
   let totalProducts = 0;
   let prodPageInfo: string | null = null;
   do {
@@ -61,11 +67,19 @@ export async function pullShopifyAll(ctx: {
     prodPageInfo = parseNextPageInfo(productsRes.headers.get('link'));
   } while (prodPageInfo);
   result.products = totalProducts;
+  // #region agent log
+  debugLog('products done', { totalProducts }, 'A');
+  // #endregion
   await setSyncStatus(channelAccountId, 'products', 'synced', result.products !== undefined ? { count: result.products } : undefined);
+  } catch (err: any) {
+    log.error({ err }, 'Shopify products sync failed');
+    await setSyncStatus(channelAccountId, 'products', 'error', { error: err?.message || 'Products sync failed' });
+  }
 
-  // Orders - 3 months on initial sync (paginated), 2 days on subsequent syncs
+  // Orders - 3 months on initial sync (paginated), 7 days on subsequent syncs
+  try {
   await setSyncStatus(channelAccountId, 'orders', 'syncing');
-  const orderDays = initialSync ? DAYS_3 : 2;
+  const orderDays = initialSync ? DAYS_3 : 7;
   const orderSince = new Date(Date.now() - orderDays * MS_PER_DAY).toISOString();
   const orderLimit = initialSync ? 250 : 50;
   let totalOrders = 0;
@@ -91,10 +105,18 @@ export async function pullShopifyAll(ctx: {
   } while (pageInfo);
 
   result.orders = totalOrders;
+  // #region agent log
+  debugLog('orders done', { totalOrders }, 'A');
+  // #endregion
   await setSyncStatus(channelAccountId, 'orders', 'synced', result.orders !== undefined ? { count: result.orders } : undefined);
+  } catch (err: any) {
+    log.error({ err }, 'Shopify orders sync failed');
+    await setSyncStatus(channelAccountId, 'orders', 'error', { error: err?.message || 'Orders sync failed' });
+  }
 
   // Customers - explicit pull on initial sync (3 months), otherwise derived from orders
   if (initialSync) {
+  try {
     await setSyncStatus(channelAccountId, 'customers', 'syncing');
     const customerSince = new Date(Date.now() - DAYS_3 * MS_PER_DAY).toISOString();
     let totalCustomers = 0;
@@ -119,11 +141,16 @@ export async function pullShopifyAll(ctx: {
     } while (custPageInfo);
     result.customers = totalCustomers;
     await setSyncStatus(channelAccountId, 'customers', 'synced', result.customers !== undefined ? { count: result.customers } : undefined);
+  } catch (err: any) {
+    log.error({ err }, 'Shopify customers sync failed');
+    await setSyncStatus(channelAccountId, 'customers', 'error', { error: err?.message || 'Customers sync failed' });
+  }
   } else {
     await setSyncStatus(channelAccountId, 'customers', 'synced'); // customers derived from orders
   }
 
   // Inventory levels - limited attempt via inventory_items/inventory_levels
+  try {
   await setSyncStatus(channelAccountId, 'inventory', 'syncing');
   const locationsRes = await fetch(`${base}/locations.json`, {
     headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' },
@@ -144,8 +171,8 @@ export async function pullShopifyAll(ctx: {
         }
         result.inventory = levels.length;
         await setSyncStatus(channelAccountId, 'inventory', 'synced', result.inventory !== undefined ? { count: result.inventory } : undefined);
-      } else {
-        log.warn({ status: invRes.status }, 'Shopify inventory pull failed');
+  } else {
+    log.warn({ status: invRes.status }, 'Shopify inventory pull failed');
         await setSyncStatus(channelAccountId, 'inventory', 'error', { error: `HTTP ${invRes.status}` });
       }
     } else {
@@ -154,7 +181,14 @@ export async function pullShopifyAll(ctx: {
   } else {
     await setSyncStatus(channelAccountId, 'inventory', 'error', { error: 'Locations fetch failed' });
   }
+  } catch (err: any) {
+    log.error({ err }, 'Shopify inventory sync failed');
+    await setSyncStatus(channelAccountId, 'inventory', 'error', { error: err?.message || 'Inventory sync failed' });
+  }
 
+  // #region agent log
+  debugLog('pullShopifyAll result', result, 'A');
+  // #endregion
   return result;
 }
 

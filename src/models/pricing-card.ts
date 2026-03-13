@@ -27,8 +27,8 @@ const PrepServiceRateSchema = new Schema<IPrepServiceRate>(
 
 const PricingCardSchema = new Schema<IPricingCard>(
   {
-    facilityId: { type: Schema.Types.ObjectId, ref: 'Facility', required: true, index: true },
-    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    facilityId: { type: Schema.Types.ObjectId, ref: 'Facility', required: true },
+    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     costPerBox: { type: Number, default: 0 },
     costPerUnit: { type: Number, default: 0 },
     labeling: { type: Number, default: 0 },

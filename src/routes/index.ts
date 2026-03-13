@@ -16,6 +16,8 @@ import { ebayWebhookRoutes } from './ebay-webhooks.routes';
 import { featureRoutes } from './features.routes';
 import { shipFromLocationRoutes } from './ship-from-locations.routes';
 import { shipmentPlanRoutes } from './shipment-plan.routes';
+import { asnRoutes } from './asn.routes';
+import { invoicesRoutes } from './invoices.routes';
 import { transportationTemplateRoutes } from './transportation-template.routes';
 import { facilitiesRoutes } from './facilities.routes';
 import { supplierRoutes } from './suppliers.routes';
@@ -48,6 +50,8 @@ export async function registerRoutes(app: FastifyInstance) {
   await supplierRoutes(app);
   await shipFromLocationRoutes(app);
   await shipmentPlanRoutes(app);
+  await asnRoutes(app);
+  await invoicesRoutes(app);
   await transportationTemplateRoutes(app);
   await facilitiesRoutes(app);
   await usersRoutes(app);

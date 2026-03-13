@@ -23,7 +23,7 @@ The OAuth scope includes: `read_products,write_products,read_orders,write_orders
 
 | Capability | Backend route / trigger | Shopify API used | Notes |
 |------------|-------------------------|------------------|-------|
-| **Orders pull** | `POST /api/v1/channel-accounts/:id/refresh` or cron every 30 min | `GET /orders.json` | Last 2 days, limit 50 |
+| **Orders pull** | `POST /api/v1/channel-accounts/:id/refresh` or cron every 30 min | `GET /orders.json` | Last 7 days (90 days on first sync), limit 50 |
 | **Products pull** | Same as above | `GET /products.json` | Limit 250 |
 | **Inventory pull** | Same as above | `GET /locations.json`, `GET /inventory_levels.json` | First location, limit 250 |
 | **Sync status** | `GET /api/v1/channel-accounts/:id/sync-status` | N/A | Per-entity status (products, orders, inventory, customers) |
@@ -32,6 +32,8 @@ The OAuth scope includes: `read_products,write_products,read_orders,write_orders
 | **Webhooks** | Incoming from Shopify | `products/update`, `inventory_levels/update`, `orders/create`, `orders/updated` | Real-time updates |
 
 Label quote/purchase endpoints exist but return 501 (Shopify Shipping labels not available via Admin API for custom apps).
+
+**Note:** Existing connected shops will not receive `orders/create` and `orders/updated` webhooks until they disconnect and re-authorize the Shopify app (or until webhooks are re-registered via a migration). New connections will have order webhooks registered automatically.
 
 ---
 

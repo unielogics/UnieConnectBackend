@@ -24,6 +24,9 @@ export interface IShipmentPlanItem {
   fnsku?: string;
   upc?: string;
   itemId?: Types.ObjectId; // ref Item when catalog item exists
+  wmsItemId?: string;
+  wmsSku?: string;
+  wmsWarehouseCode?: string;
 }
 
 export interface IShipFromAddress {
@@ -67,6 +70,10 @@ export interface IShipmentPlan extends Document {
   labelIds?: Types.ObjectId[];
   workflowStep?: number;
   wmsAsnId?: string;
+  invoicingTerms?: {
+    acknowledgedAt: Date;
+    termsVersion?: string;
+  };
 }
 
 const ShipmentPlanItemSchema = new Schema<IShipmentPlanItem>(
@@ -88,6 +95,9 @@ const ShipmentPlanItemSchema = new Schema<IShipmentPlanItem>(
     fnsku: { type: String, trim: true },
     upc: { type: String, trim: true },
     itemId: { type: Schema.Types.ObjectId, ref: 'Item' },
+    wmsItemId: { type: String },
+    wmsSku: { type: String },
+    wmsWarehouseCode: { type: String },
   },
   { _id: false },
 );
@@ -142,6 +152,10 @@ const ShipmentPlanSchema = new Schema<IShipmentPlan>(
     labelIds: [{ type: Schema.Types.ObjectId }],
     workflowStep: { type: Number },
     wmsAsnId: { type: String },
+    invoicingTerms: {
+      acknowledgedAt: { type: Date },
+      termsVersion: { type: String },
+    },
   },
   { timestamps: true },
 );

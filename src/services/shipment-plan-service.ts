@@ -15,8 +15,10 @@ import { ShipmentActivityLog } from '../models/shipment-activity-log';
 import { ShipFromLocation } from '../models/ship-from-location';
 import { Supplier } from '../models/supplier';
 import { Facility } from '../models/facility';
-import { getClosestFacility, AddressWithCoords } from './facility-routing';
+import { getClosestFacility, geocodeAddressIfNeeded, AddressWithCoords } from './facility-routing';
 import { shippoRateQuoteFromTo } from './shippo-rate-shopping';
+import fetch from 'node-fetch';
+import { config } from '../config/env';
 
 export interface ValidationError {
   field: string;
@@ -203,6 +205,15 @@ export async function createShipmentPlan(input: CreateShipmentPlanInput): Promis
 
   const internalShipmentId = `SP-${randomUUID().slice(0, 8).toUpperCase()}`;
 
+  const facilityId = closest?.facilityId;
+  const validFacilityId =
+    facilityId &&
+    typeof facilityId === 'string' &&
+    facilityId.length === 24 &&
+    /^[a-f0-9]{24}$/i.test(facilityId)
+      ? facilityId
+      : undefined;
+
   const doc = await ShipmentPlan.create({
     internalShipmentId,
     userId,
@@ -211,7 +222,7 @@ export async function createShipmentPlan(input: CreateShipmentPlanInput): Promis
     prepServicesOnly: input.prepServicesOnly,
     marketplaceId: input.marketplaceId,
     marketplaceType: input.marketplaceType,
-    facilityId: closest?.facilityId,
+    facilityId: validFacilityId,
     status: 'draft',
     items: input.items,
     shipFromAddress: {
@@ -392,7 +403,78 @@ export async function createASNForShipmentPlan(params: {
   if (!plan.facilityId) throw new Error('No facility assigned; cannot create ASN');
   if (plan.asnId) throw new Error('ASN already exists for this plan');
 
+  plan.invoicingTerms = { acknowledgedAt: new Date(), termsVersion: '1.0' };
+  await plan.save();
+
   const poNo = plan.orderNo || `PO-${plan.internalShipmentId}`;
+
+  let wmsAsnId: string | undefined;
+  let wmsLineItems: Array<{ sku: string; wmsItemId: string; wmsSku: string }> = [];
+  const facility = await Facility.findById(plan.facilityId).lean().exec();
+  const warehouseCode = (facility as any)?.code;
+  if (config.wmsApiUrl && config.internalApiKey && warehouseCode) {
+    const facilityCode = warehouseCode;
+    const { OmsIntermediary } = await import('../models/oms-intermediary');
+    const { OmsIntermediaryWarehouse } = await import('../models/oms-intermediary-warehouse');
+    const { User } = await import('../models/user');
+    const user = await User.findById(userId).select('email').lean().exec();
+    const oms = user?.email
+      ? await OmsIntermediary.findOne({ email: (user.email as string).toLowerCase(), status: 'active' }).select('_id').lean().exec()
+      : null;
+    const omsId = oms?._id;
+    const link = omsId
+      ? await OmsIntermediaryWarehouse.findOne({ omsIntermediaryId: omsId, warehouseCode: facilityCode }).lean().exec()
+      : null;
+    const wmsIntermediaryId = link ? String((link as any).wmsIntermediaryId) : null;
+
+    if (wmsIntermediaryId) {
+      const shipFromAddr = await resolveShipFromAddress(userId, String(plan.shipFromLocationId));
+      const url = `${config.wmsApiUrl}/api/v1/internal/oms/asn/create`;
+      const body = {
+        warehouseCode: facilityCode,
+        omsIntermediaryId: omsId ? String(omsId) : undefined,
+        wmsIntermediaryId,
+        poNumber: poNo,
+        shipFromAddress: {
+          name: shipFromAddr.name,
+          addressLine1: shipFromAddr.addressLine1,
+          city: shipFromAddr.city,
+          stateOrProvinceCode: shipFromAddr.stateOrProvinceCode,
+          postalCode: shipFromAddr.postalCode,
+          countryCode: shipFromAddr.countryCode,
+        },
+        lineItems: plan.items.map((i) => ({
+          sku: i.sku,
+          wmsSku: (i as any).wmsSku,
+          itemName: (i as any).title || i.sku,
+          quantity: i.quantity,
+          unitsPerContainer: i.unitsPerBox,
+          containersCount: i.boxCount,
+          fnsku: i.fnsku,
+          expDate: i.expDate,
+        })),
+        eta: plan.orderDate || new Date(),
+      };
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Internal-Api-Key': config.internalApiKey,
+        },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        wmsAsnId = data.wmsAsnId;
+        wmsLineItems = data.lineItems || [];
+      } else {
+        const errText = await res.text();
+        log?.warn({ status: res.status, body: errText }, 'WMS ASN create failed');
+        throw new Error(`WMS ASN create failed: ${res.status} ${errText.slice(0, 200)}`);
+      }
+    }
+  }
+
   const asn = await ASN.create({
     shipmentPlanId: plan._id,
     facilityId: plan.facilityId,
@@ -406,10 +488,29 @@ export async function createASNForShipmentPlan(params: {
       expDate: i.expDate,
     })),
     status: 'new',
+    wmsAsnId: wmsAsnId || undefined,
   });
 
   plan.asnId = asn._id as Types.ObjectId;
   plan.status = 'asn_created';
+  if (wmsAsnId) plan.wmsAsnId = wmsAsnId;
+  if (wmsLineItems.length > 0) {
+    const skuToWms = new Map(wmsLineItems.map((li) => [li.sku, li]));
+    plan.items = plan.items.map((i) => {
+      const w = skuToWms.get(i.sku);
+      if (w) {
+        const plain = typeof (i as unknown as { toObject?: () => object }).toObject === 'function'
+          ? (i as unknown as { toObject: () => object }).toObject()
+          : i;
+        return {
+          ...plain,
+          wmsItemId: w.wmsItemId,
+          wmsSku: w.wmsSku,
+        } as unknown as IShipmentPlanItem;
+      }
+      return i;
+    });
+  }
   await plan.save();
 
   await logShipmentActivity({
@@ -526,13 +627,32 @@ export async function getClosestFacilityByShipFromLocation(params: {
   userId: string;
   shipFromLocationId: string;
   log?: FastifyBaseLogger;
-}): Promise<{ facilityId: string; facility: any; distanceMiles: number } | null> {
+}): Promise<{
+  facilityId: string | null;
+  facility: any;
+  distanceMiles: number | null;
+  shipFromAddress?: { lat: number; long: number };
+} | null> {
   const addr = await resolveShipFromAddress(params.userId, params.shipFromLocationId);
-  return getClosestFacility({
-    userId: params.userId,
+  const addrWithCoords = await geocodeAddressIfNeeded({
     address: addr,
     ...(params.log != null && { log: params.log }),
   });
+  const closest = await getClosestFacility({
+    userId: params.userId,
+    address: addrWithCoords,
+    ...(params.log != null && { log: params.log }),
+  });
+  const lat = addrWithCoords.lat;
+  const long = addrWithCoords.long;
+  const shipFromAddress =
+    lat != null && long != null && Number.isFinite(lat) && Number.isFinite(long)
+      ? { lat, long }
+      : undefined;
+  if (!closest) return shipFromAddress ? { facilityId: null as string | null, facility: null, distanceMiles: null as number | null, shipFromAddress } : null;
+  const result: { facilityId: string; facility: any; distanceMiles: number; shipFromAddress?: { lat: number; long: number } } = { ...closest };
+  if (shipFromAddress) result.shipFromAddress = shipFromAddress;
+  return result;
 }
 
 export async function getClosestFacilityForPlan(params: {

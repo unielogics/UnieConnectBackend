@@ -1,6 +1,15 @@
 import { Schema, model, models, Model, Document } from 'mongoose';
 import { ALL_ROLES, type UserRole } from '../lib/roles';
 
+export interface IBillingAddress {
+  addressLine1?: string;
+  addressLine2?: string;
+  city?: string;
+  state?: string;
+  zipCode?: string;
+  country?: string;
+}
+
 export interface IUser extends Document {
   email: string;
   passwordHash: string;
@@ -8,6 +17,8 @@ export interface IUser extends Document {
   firstName?: string;
   lastName?: string;
   phone?: string;
+  llcName?: string;
+  billingAddress?: IBillingAddress;
   lastLoginAt?: Date;
   resetToken?: string;
   resetTokenExpires?: Date;
@@ -15,6 +26,18 @@ export interface IUser extends Document {
   createdAt?: Date;
   updatedAt?: Date;
 }
+
+const BillingAddressSchema = new Schema(
+  {
+    addressLine1: { type: String, trim: true },
+    addressLine2: { type: String, trim: true },
+    city: { type: String, trim: true },
+    state: { type: String, trim: true },
+    zipCode: { type: String, trim: true },
+    country: { type: String, trim: true },
+  },
+  { _id: false }
+);
 
 const UserSchema = new Schema(
   {
@@ -24,6 +47,8 @@ const UserSchema = new Schema(
     firstName: { type: String, trim: true },
     lastName: { type: String, trim: true },
     phone: { type: String, trim: true },
+    llcName: { type: String, trim: true },
+    billingAddress: { type: BillingAddressSchema },
     lastLoginAt: { type: Date },
     resetToken: { type: String },
     resetTokenExpires: { type: Date },

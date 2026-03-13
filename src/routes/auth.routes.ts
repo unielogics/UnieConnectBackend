@@ -6,6 +6,7 @@ import jwt from 'jsonwebtoken';
 const DBG = path.join(process.cwd(), '..', '..', '.cursor', 'debug.log');
 const dbg = (o: object) => { try { fs.appendFileSync(DBG, JSON.stringify({ ...o, ts: Date.now() }) + '\n'); } catch {} };
 import bcrypt from 'bcryptjs';
+import fetch from 'node-fetch';
 import { User } from '../models/user';
 import { InviteToken } from '../models/invite-token';
 import { UserActivityLog } from '../models/user-activity-log';
@@ -17,7 +18,10 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const user = await User.findById(userId).select('email role firstName lastName phone lastLoginAt').lean().exec();
+    const user = await User.findById(userId)
+      .select('email role firstName lastName phone llcName billingAddress lastLoginAt')
+      .lean()
+      .exec();
     if (!user) return reply.code(401).send({ error: 'User not found' });
     return {
       userId: user._id,
@@ -26,7 +30,105 @@ export async function authRoutes(fastify: FastifyInstance) {
       firstName: user.firstName,
       lastName: user.lastName,
       phone: user.phone,
+      llcName: user.llcName,
+      billingAddress: user.billingAddress,
       lastLoginAt: user.lastLoginAt,
+    };
+  });
+
+  fastify.patch('/auth/me', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const body = (req.body || {}) as {
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+      llcName?: string;
+      billingAddress?: {
+        addressLine1?: string;
+        addressLine2?: string;
+        city?: string;
+        state?: string;
+        zipCode?: string;
+        country?: string;
+      };
+    };
+    const user = await User.findById(userId).exec();
+    if (!user) return reply.code(401).send({ error: 'User not found' });
+    if (body.firstName !== undefined) {
+      const v = body.firstName ? String(body.firstName).trim() : undefined;
+      user.set('firstName', v);
+    }
+    if (body.lastName !== undefined) {
+      const v = body.lastName ? String(body.lastName).trim() : undefined;
+      user.set('lastName', v);
+    }
+    if (body.phone !== undefined) {
+      const v = body.phone ? String(body.phone).trim() : undefined;
+      user.set('phone', v);
+    }
+    if (body.llcName !== undefined) {
+      const v = body.llcName ? String(body.llcName).trim() : undefined;
+      user.set('llcName', v);
+    }
+    if (body.billingAddress !== undefined) {
+      if (body.billingAddress == null) {
+        user.set('billingAddress', undefined);
+      } else {
+        const ba = body.billingAddress;
+        user.set('billingAddress', {
+          addressLine1: ba.addressLine1?.trim() ?? '',
+          addressLine2: ba.addressLine2?.trim() ?? '',
+          city: ba.city?.trim() ?? '',
+          state: ba.state?.trim() ?? '',
+          zipCode: ba.zipCode?.trim() ?? '',
+          country: ba.country?.trim() ?? '',
+        });
+      }
+    }
+    await user.save();
+
+    if (config.wmsApiUrl && config.internalApiKey) {
+      const { OmsIntermediary } = await import('../models/oms-intermediary');
+      const oms = await OmsIntermediary.findOne({
+        email: user.email.toLowerCase(),
+        status: 'active',
+      })
+        .select('_id')
+        .lean()
+        .exec();
+      if (oms) {
+        const body = {
+          externalOmsIntermediaryId: String(oms._id),
+          firstName: user.firstName,
+          lastName: user.lastName,
+          phone: user.phone,
+          email: user.email,
+          llcName: user.llcName,
+          billingAddress: user.billingAddress,
+        };
+        fetch(`${config.wmsApiUrl}/api/v1/internal/oms/intermediary/sync-profile`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Api-Key': config.internalApiKey,
+          },
+          body: JSON.stringify(body),
+        }).catch((err) => {
+          req.log?.warn?.(err, 'Failed to sync profile to WMS intermediaries');
+        });
+      }
+    }
+
+    return {
+      userId: user._id,
+      email: user.email,
+      role: normalizeRole(user.role),
+      firstName: user.firstName,
+      lastName: user.lastName,
+      phone: user.phone,
+      llcName: user.llcName,
+      billingAddress: user.billingAddress,
     };
   });
 

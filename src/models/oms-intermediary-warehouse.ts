@@ -15,7 +15,7 @@ const OmsIntermediaryWarehouseSchema = new Schema<IOmsIntermediaryWarehouse>(
   {
     omsIntermediaryId: { type: Schema.Types.ObjectId, ref: 'OmsIntermediary', required: true, index: true },
     warehouseCode: { type: String, required: true, trim: true, index: true },
-    wmsIntermediaryId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    wmsIntermediaryId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   },
   { timestamps: true },
 );

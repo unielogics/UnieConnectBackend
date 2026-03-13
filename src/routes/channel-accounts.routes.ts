@@ -1,5 +1,10 @@
 import { FastifyInstance } from 'fastify';
+import { Types } from 'mongoose';
 import { ChannelAccount } from '../models/channel-account';
+import { ChannelSyncStatus } from '../models/channel-sync-status';
+import { Order } from '../models/order';
+import { Item } from '../models/item';
+import { Customer } from '../models/customer';
 import { runRefresh } from '../services/shopify-cron';
 import { runAmazonRefresh } from '../services/amazon-cron';
 import { getSyncStatus } from '../services/channel-sync-status';
@@ -8,7 +13,8 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
   fastify.get('/channel-accounts', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const accounts = await ChannelAccount.find({ userId }).lean().exec();
+    const userIdObj = typeof userId === 'string' ? new Types.ObjectId(userId) : userId;
+    const accounts = await ChannelAccount.find({ userId: userIdObj }).lean().exec();
     return accounts.map((a: any) => ({
       id: String(a._id),
       channel: a.channel,
@@ -28,7 +34,8 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const { id } = req.params || {};
-    const existing = await ChannelAccount.findOne({ _id: id, userId }).lean().exec();
+    const userIdObj = typeof userId === 'string' ? new Types.ObjectId(userId) : userId;
+    const existing = await ChannelAccount.findOne({ _id: id, userId: userIdObj }).lean().exec();
     if (!existing) return reply.code(404).send({ error: 'Not found' });
 
     // NOTE: This is a hard disconnect (removes the credential record).
@@ -37,11 +44,41 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
     return { success: true };
   });
 
+  fastify.get('/channel-accounts/:id/debug', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const { id } = req.params || {};
+    const userIdObj = typeof userId === 'string' ? new Types.ObjectId(userId) : userId;
+    const account = await ChannelAccount.findOne({ _id: id, userId: userIdObj }).lean().exec();
+    if (!account) return reply.code(404).send({ error: 'Not found' });
+    if (account.channel !== 'shopify') {
+      return reply.code(400).send({ error: 'Debug only for Shopify' });
+    }
+    const accountIdObj = new Types.ObjectId(id);
+    const [orderCountByUser, orderCountByAccount, itemCount, customerCount, syncStatus] = await Promise.all([
+      Order.countDocuments({ userId: userIdObj }),
+      Order.countDocuments({ channelAccountId: accountIdObj }),
+      Item.countDocuments({ userId: userIdObj }),
+      Customer.countDocuments({ userId: userIdObj }),
+      getSyncStatus(String(account._id)),
+    ]);
+    return {
+      userIdType: typeof userId,
+      accountId: id,
+      orderCountByUserId: orderCountByUser,
+      orderCountByChannelAccountId: orderCountByAccount,
+      itemCount,
+      customerCount,
+      syncStatus,
+    };
+  });
+
   fastify.get('/channel-accounts/:id/sync-status', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const { id } = req.params || {};
-    const account = await ChannelAccount.findOne({ _id: id, userId }).exec();
+    const userIdObj = typeof userId === 'string' ? new Types.ObjectId(userId) : userId;
+    const account = await ChannelAccount.findOne({ _id: id, userId: userIdObj }).exec();
     if (!account) return reply.code(404).send({ error: 'Not found' });
     if (account.channel !== 'shopify') {
       return reply.code(400).send({ error: 'Sync status only supported for Shopify' });
@@ -54,11 +91,19 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const { id } = req.params || {};
-    const account = await ChannelAccount.findOne({ _id: id, userId }).exec();
+    const userIdObj = typeof userId === 'string' ? new Types.ObjectId(userId) : userId;
+    const account = await ChannelAccount.findOne({ _id: id, userId: userIdObj }).exec();
     if (!account) return reply.code(404).send({ error: 'Not found' });
     let syncResult: Record<string, number> | undefined;
     if (account.channel === 'shopify') {
-      const res = await runRefresh(String(account._id), fastify.log);
+      const hadOrdersSync = await ChannelSyncStatus.findOne({
+        channelAccountId: new Types.ObjectId(account._id),
+        entityType: 'orders',
+        lastSyncedAt: { $exists: true, $ne: null },
+      }).exec();
+      const res = await runRefresh(String(account._id), fastify.log, {
+        initialSync: !hadOrdersSync,
+      });
       syncResult = res as Record<string, number>;
     } else if (account.channel === 'amazon') {
       await runAmazonRefresh(String(account._id), fastify.log);

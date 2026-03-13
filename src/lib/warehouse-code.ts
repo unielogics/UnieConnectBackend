@@ -12,17 +12,33 @@ export const WAREHOUSE_CODE_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
 
 /**
  * Resolve (userId, warehouseCode) to Facility.
- * warehouseCode must equal Facility.code for the given User.
+ * Tries exact match first, then case-insensitive and trimmed.
  */
 export async function getFacilityByWarehouseCode(
   userId: string | Types.ObjectId,
   warehouseCode: string,
 ) {
-  return Facility.findOne({
-    userId: new Types.ObjectId(userId),
-    code: warehouseCode,
+  const wc = warehouseCode?.trim?.() ?? '';
+  if (!wc) return null;
+  const userIdObj = new Types.ObjectId(userId);
+
+  let fac = await Facility.findOne({
+    userId: userIdObj,
+    code: wc,
     isActive: true,
   })
     .lean()
     .exec();
+
+  if (!fac) {
+    fac = await Facility.findOne({
+      userId: userIdObj,
+      code: new RegExp(`^\\s*${wc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i'),
+      isActive: true,
+    })
+      .lean()
+      .exec();
+  }
+
+  return fac;
 }

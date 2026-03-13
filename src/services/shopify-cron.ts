@@ -1,4 +1,5 @@
 import { FastifyBaseLogger } from 'fastify';
+import { debugLog } from '../lib/debug-log';
 import { ChannelAccount } from '../models/channel-account';
 import { pullShopifyAll } from './shopify-pull';
 import { pullEbayAll } from './ebay-pull';
@@ -34,11 +35,17 @@ export function startShopifyCron(log: FastifyBaseLogger) {
 }
 
 export async function runRefresh(channelAccountId: string, log: FastifyBaseLogger, opts?: { initialSync?: boolean }) {
+  // #region agent log
+  debugLog('runRefresh entry', { channelAccountId, initialSync: opts?.initialSync }, 'D');
+  // #endregion
   const account = await ChannelAccount.findById(channelAccountId).exec();
   if (!account) {
     log.warn({ channelAccountId }, 'refresh skipped: account not found');
     return;
   }
+  // #region agent log
+  debugLog('account found', { accountUserId: String(account.userId), channel: account.channel, shopDomain: account.shopDomain }, 'B');
+  // #endregion
 
   if (account.channel === 'shopify') {
     const res = await pullShopifyAll({
@@ -49,6 +56,9 @@ export async function runRefresh(channelAccountId: string, log: FastifyBaseLogge
       log,
       ...(opts?.initialSync === true && { initialSync: true }),
     });
+    // #region agent log
+    debugLog('sync completed', { channelAccountId, userId: account.userId.toString(), res }, 'A');
+    // #endregion
     log.info({ channelAccountId, res }, 'shopify refresh completed');
     return res;
   }

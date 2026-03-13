@@ -13,6 +13,7 @@ import {
   computeEstimatedCost,
   rateShopToWarehouse,
 } from '../services/shipment-plan-service';
+import { estimateServiceFees } from '../services/estimate-service-fees.service';
 
 export async function shipmentPlanRoutes(fastify: FastifyInstance) {
   // Shipment activity (must be before :id to avoid matching "activity" as id)
@@ -41,6 +42,36 @@ export async function shipmentPlanRoutes(fastify: FastifyInstance) {
     return { events, total };
   });
 
+  // Estimate service fees (pre-plan, dynamic) - must be before :id
+  fastify.post('/shipment-plans/estimate-service-fees', async (req: any, reply) => {
+    const userId = req.user?.userId;
+    if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+
+    const body = req.body || {};
+    const shipFromLocationId = body.shipFromLocationId;
+    if (!shipFromLocationId) return reply.code(400).send({ error: 'shipFromLocationId required' });
+
+    const items = Array.isArray(body.items) ? body.items : [];
+    const prepServicesOnly = Boolean(body.prepServicesOnly);
+    const marketplaceType = body.marketplaceType === 'FBW' ? 'FBW' : 'FBA';
+
+    try {
+      const params: Parameters<typeof estimateServiceFees>[0] = {
+        userId: String(userId),
+        shipFromLocationId,
+        items,
+        prepServicesOnly,
+        log: req.log,
+      };
+      if (prepServicesOnly) params.marketplaceType = marketplaceType;
+      const result = await estimateServiceFees(params);
+      return result;
+    } catch (err: any) {
+      req.log?.warn?.({ err }, 'estimate service fees failed');
+      return reply.code(400).send({ error: err?.message || 'Failed to estimate fees' });
+    }
+  });
+
   // Closest facility preview (before plan exists) - must be before :id
   fastify.get('/shipment-plans/closest-facility-preview', async (req: any, reply) => {
     const userId = req.user?.userId;
@@ -55,7 +86,7 @@ export async function shipmentPlanRoutes(fastify: FastifyInstance) {
         shipFromLocationId,
         log: req.log,
       });
-      return closest || { facilityId: null, facility: null, distanceMiles: null };
+      return closest ?? { facilityId: null, facility: null, distanceMiles: null, shipFromAddress: undefined };
     } catch (err: any) {
       req.log?.warn({ err }, 'closest facility preview failed');
       return reply.code(400).send({ error: err?.message || 'Failed to get closest facility' });

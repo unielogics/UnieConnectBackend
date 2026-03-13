@@ -22,14 +22,24 @@ export async function upsertProduct(body: any, ctx: UpsertContext) {
   const variants = Array.isArray(body.variants) ? body.variants : [];
   const productId = String(body.id || '');
   const title = String(body.title || '');
+  let withSku = 0;
+  let withoutSku = 0;
 
   for (const variant of variants) {
     const variantId = String(variant.id || '');
     const sku = (variant.sku || '').trim();
     if (!sku) {
+      withoutSku++;
       log?.warn?.({ variantId, productId }, 'Shopify product variant missing SKU, skipping');
       continue;
     }
+    withSku++;
+    const prodImages = Array.isArray(body?.images) ? body.images : [];
+    const matchImg = variant.image_id ? prodImages.find((im: any) => String(im?.id) === String(variant.image_id)) : null;
+    const srcOf = (im: any) => im?.src ?? im?.url;
+    const imageUrl = srcOf(matchImg) || srcOf(body?.image) || srcOf(prodImages[0]);
+    const images = body.images && Array.isArray(body.images) ? body.images.map((im: any) => srcOf(im)).filter(Boolean) : undefined;
+    const description = typeof body.body_html === 'string' ? body.body_html.replace(/<[^>]+>/g, ' ').trim().slice(0, 2000) : undefined;
 
     const item = await Item.findOneAndUpdate(
       { userId, sku },
@@ -37,6 +47,9 @@ export async function upsertProduct(body: any, ctx: UpsertContext) {
         userId,
         sku,
         title: variant.title ? `${title} - ${variant.title}` : title || sku,
+        ...(imageUrl && { image: imageUrl }),
+        ...(images?.length && { images }),
+        ...(description && { description }),
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).exec();
@@ -58,7 +71,6 @@ export async function upsertProduct(body: any, ctx: UpsertContext) {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).exec();
   }
-
   log?.info?.({ productId, variants: variants.length }, 'Shopify product upserted');
 }
 

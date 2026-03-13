@@ -54,7 +54,7 @@ export async function orderRoutes(fastify: FastifyInstance) {
       .lean()
       .exec();
     if (!order) return reply.code(404).send({ error: 'Not found' });
-    const lines = await OrderLine.find({ orderId: order._id }).lean().exec();
+    const lines = await OrderLine.find({ orderId: order._id }).populate('itemId', 'title image sku').lean().exec();
     const acc = (order as any).channelAccountId;
     const channelDisplay = acc ? channelDisplayLabel(acc) : undefined;
     const { channelAccountId, customerId, ...rest } = order as any;
