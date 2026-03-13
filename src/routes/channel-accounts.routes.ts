@@ -8,6 +8,7 @@ import { Customer } from '../models/customer';
 import { runRefresh } from '../services/shopify-cron';
 import { runAmazonRefresh } from '../services/amazon-cron';
 import { getSyncStatus } from '../services/channel-sync-status';
+import { config } from '../config/env';
 
 export async function channelAccountRoutes(fastify: FastifyInstance) {
   fastify.get('/channel-accounts', async (req: any, reply) => {
@@ -62,14 +63,25 @@ export async function channelAccountRoutes(fastify: FastifyInstance) {
       Customer.countDocuments({ userId: userIdObj }),
       getSyncStatus(String(account._id)),
     ]);
+    const webhookAddress = config.shopify.appBaseUrl
+      ? `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/shopify`
+      : null;
     return {
       userIdType: typeof userId,
       accountId: id,
+      shopDomain: account.shopDomain,
       orderCountByUserId: orderCountByUser,
       orderCountByChannelAccountId: orderCountByAccount,
       itemCount,
       customerCount,
       syncStatus,
+      shopifyConfig: {
+        appBaseUrl: config.shopify.appBaseUrl || '(not set)',
+        webhookAddress,
+        apiVersion: config.shopify.apiVersion,
+        hasWebhookSecret: !!config.shopify.webhookSecret,
+        redirectUri: `${config.shopify.appBaseUrl || ''}/api/v1/auth/shopify/callback`,
+      },
     };
   });
 

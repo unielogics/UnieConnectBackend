@@ -104,9 +104,12 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
     const successUrl = `${redirectBase.replace(/\/+$/, '')}/?success=shopify&shop=${encodeURIComponent(shop)}`;
 
     try {
+      fastify.log.info({ shop }, '[Shopify OAuth] token exchange start');
       const token = await exchangeCodeForToken(shop, code);
+      fastify.log.info({ shop }, '[Shopify OAuth] token exchange ok');
 
       const address = `${config.shopify.appBaseUrl}/api/v1/webhooks/shopify`;
+      fastify.log.info({ shop, address, appBaseUrl: config.shopify.appBaseUrl, apiVersion: config.shopify.apiVersion }, '[Shopify OAuth] webhook registration config');
       const topics = [
         'fulfillment_orders/fulfillment_request_submitted',
         'fulfillment_orders/fulfillment_request_accepted',
@@ -122,7 +125,9 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
         'inventory_levels/update',
         'products/update',
       ];
-      await registerWebhooks({ shop, accessToken: token, address, topics });
+      await registerWebhooks({ shop, accessToken: token, address, topics, log: fastify.log });
+
+      fastify.log.info({ shop }, '[Shopify OAuth] webhooks registered, saving account');
 
       const userDoc = await User.findById(stateDoc.userId).exec();
       if (userDoc) {
@@ -145,9 +150,10 @@ export async function shopifyAuthRoutes(fastify: FastifyInstance) {
         }
       }
 
+      fastify.log.info({ shop }, '[Shopify OAuth] callback success');
       return reply.redirect(successUrl);
     } catch (err: any) {
-      fastify.log.error({ err, shop }, 'Shopify auth failed');
+      fastify.log.error({ err: err?.message, stack: err?.stack, shop }, '[Shopify OAuth] callback failed');
       return reply.redirect(
         `${config.frontendOrigin}/?error=shopify&message=${encodeURIComponent(err?.message || 'Shopify auth failed')}`,
       );

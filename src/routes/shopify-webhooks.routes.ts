@@ -33,8 +33,13 @@ export async function shopifyWebhookRoutes(fastify: FastifyInstance) {
     const topic = headers['x-shopify-topic'] || 'unknown';
     const shopDomain = headers['x-shopify-shop-domain'] || 'unknown';
 
+    fastify.log.info({ topic, shopDomain }, '[Shopify Webhook] received');
+
     const secret = config.shopify.webhookSecret;
-    if (!secret) return reply.code(500).send({ error: 'SHOPIFY_WEBHOOK_SECRET not set' });
+    if (!secret) {
+      fastify.log.error('[Shopify Webhook] SHOPIFY_WEBHOOK_SECRET not set');
+      return reply.code(500).send({ error: 'SHOPIFY_WEBHOOK_SECRET not set' });
+    }
 
     const rawBody = (request as any).rawBody || JSON.stringify(request.body || {});
     const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
@@ -44,13 +49,14 @@ export async function shopifyWebhookRoutes(fastify: FastifyInstance) {
       crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(receivedHmac));
 
     if (!valid) {
-      fastify.log.warn({ topic, shopDomain }, 'Invalid Shopify webhook signature');
+      fastify.log.warn({ topic, shopDomain, hasHmac: !!receivedHmac }, '[Shopify Webhook] invalid signature');
       return reply.code(401).send({ error: 'Invalid signature' });
     }
 
     const account = await ChannelAccount.findOne({ shopDomain }).exec();
     if (!account) {
-      fastify.log.warn({ topic, shopDomain }, 'Shopify webhook skipped: account not found');
+      const allShops = await ChannelAccount.find({ channel: 'shopify' }).select('shopDomain').lean().exec();
+      fastify.log.warn({ topic, shopDomain, knownShops: allShops.map((s: any) => s.shopDomain) }, '[Shopify Webhook] account not found');
       return reply.code(200).send({ success: true, skipped: true });
     }
 
@@ -64,10 +70,11 @@ export async function shopifyWebhookRoutes(fastify: FastifyInstance) {
         log: fastify.log,
       });
     } catch (err: any) {
-      fastify.log.error({ err, topic, shopDomain }, 'Shopify webhook handling failed');
+      fastify.log.error({ err: err?.message, topic, shopDomain }, '[Shopify Webhook] handling failed');
       return reply.code(500).send({ error: 'processing failed' });
     }
 
+    fastify.log.info({ topic, shopDomain }, '[Shopify Webhook] ok');
     return reply.code(200).send({ success: true });
   });
 }
