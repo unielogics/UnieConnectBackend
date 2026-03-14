@@ -19,25 +19,51 @@ async function resolveOmsIntermediaryForUser(userId: string): Promise<Types.Obje
   return oms?._id ? (oms._id as Types.ObjectId) : null;
 }
 
+// #region agent log
+const _log = (loc: string, msg: string, data: Record<string, unknown>) => { fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location: loc, message: msg, data, timestamp: Date.now(), runId: 'warehouses' }) }).catch(() => {}); };
+// #endregion
+
 /**
  * List connected warehouses for JWT user. Resolves OmsIntermediary by email,
  * fetches OmsIntermediaryWarehouse links, enriches with warehouse metadata from UnieBackend.
  */
 export async function listWarehouses(req: any, reply: FastifyReply) {
   const userId = req.user?.userId;
+  // #region agent log
+  _log('oms-warehouses.controller.ts:listWarehouses:entry', 'GET oms/warehouses entry', { userId: userId ?? null, hypothesisId: 'H1' });
+  // #endregion
   if (!userId) {
     return reply.code(401).send({ error: 'Unauthorized', message: 'Please log in.' });
   }
 
-  const omsId = await resolveOmsIntermediaryForUser(userId);
+  let omsId: Types.ObjectId | null = null;
+  try {
+    omsId = await resolveOmsIntermediaryForUser(userId);
+  } catch (e) {
+    // #region agent log
+    _log('oms-warehouses.controller.ts:listWarehouses:resolveOmsErr', 'resolveOmsIntermediaryForUser threw', { err: (e as Error)?.message, hypothesisId: 'H1' });
+    // #endregion
+    throw e;
+  }
+  // #region agent log
+  _log('oms-warehouses.controller.ts:listWarehouses:afterResolve', 'After resolveOmsIntermediaryForUser', { omsId: omsId ? String(omsId) : null, hypothesisId: 'H2' });
+  // #endregion
   if (!omsId) {
     return reply.send({ warehouses: [] });
   }
 
-  const links = await OmsIntermediaryWarehouse.find({ omsIntermediaryId: omsId })
-    .sort({ createdAt: -1 })
-    .lean()
-    .exec();
+  let links: any[];
+  try {
+    links = await OmsIntermediaryWarehouse.find({ omsIntermediaryId: omsId })
+      .sort({ createdAt: -1 })
+      .lean()
+      .exec();
+  } catch (e) {
+    // #region agent log
+    _log('oms-warehouses.controller.ts:listWarehouses:findErr', 'OmsIntermediaryWarehouse.find threw', { err: (e as Error)?.message, hypothesisId: 'H2' });
+    // #endregion
+    throw e;
+  }
 
   if (links.length === 0) {
     return reply.send({ warehouses: [] });
@@ -60,12 +86,28 @@ export async function listWarehouses(req: any, reply: FastifyReply) {
   }
 
   const url = `${config.wmsApiUrl}/api/v1/internal/oms/warehouses?codes=${codes.map(encodeURIComponent).join(',')}`;
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: { 'X-Internal-Api-Key': config.internalApiKey },
-  });
+  // #region agent log
+  _log('oms-warehouses.controller.ts:listWarehouses:beforeFetch', 'Before fetch to UnieBackend', { url, wmsApiUrl: config.wmsApiUrl, hasApiKey: !!config.internalApiKey, hypothesisId: 'H3' });
+  // #endregion
+  let res: any;
+  try {
+    res = await fetch(url, { method: 'GET', headers: { 'X-Internal-Api-Key': config.internalApiKey } });
+  } catch (e) {
+    // #region agent log
+    _log('oms-warehouses.controller.ts:listWarehouses:fetchErr', 'Fetch to UnieBackend failed', { err: (e as Error)?.message, hypothesisId: 'H3' });
+    // #endregion
+    throw e;
+  }
+  // #region agent log
+  _log('oms-warehouses.controller.ts:listWarehouses:afterFetch', 'After fetch', { status: res?.status, ok: res?.ok, hypothesisId: 'H4' });
+  // #endregion
 
-  const data = (await res.json().catch(() => ({}))) as {
+  const data = (await res.json().catch((e: unknown) => {
+    // #region agent log
+    _log('oms-warehouses.controller.ts:listWarehouses:jsonErr', 'res.json() threw', { err: (e as Error)?.message, hypothesisId: 'H5' });
+    // #endregion
+    return {};
+  })) as {
     warehouses?: Array<{ code: string; name?: string; state?: string; city?: string; address?: string }>;
   };
   const meta = new Map((data.warehouses || []).map((w) => [w.code, w]));

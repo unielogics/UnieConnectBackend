@@ -2,6 +2,9 @@ import { FastifyReply } from 'fastify';
 import { Types } from 'mongoose';
 import fetch from 'node-fetch';
 import { config } from '../config/env';
+// #region agent log
+const _dlog = (loc: string, msg: string, data: Record<string, unknown>) => { fetch('http://127.0.0.1:7242/ingest/868bcac9-47ee-4f49-9fa2-f82e87e09392', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location: loc, message: msg, data, timestamp: Date.now(), runId: 'connect' }) }).catch(() => {}); };
+// #endregion
 import { resolveOmsApiKeyForConnect } from '../lib/api-key-auth';
 import type { IBillingAddress } from '../models/user';
 
@@ -40,6 +43,9 @@ function getMissingProfileFields(user: {
  */
 export async function redeemConnectionCode(req: any, reply: FastifyReply) {
   const { connectionCode } = req.body || {};
+  // #region agent log
+  _dlog('oms-connect.controller.ts:redeemConnectionCode:entry', 'POST oms/connect entry', { hasConnectionCode: !!connectionCode?.trim(), hasAuth: !!req.headers?.authorization, hypothesisId: 'C1' });
+  // #endregion
   if (!connectionCode?.trim()) {
     return reply.code(400).send({ error: 'connectionCode required' });
   }
@@ -153,6 +159,9 @@ export async function redeemConnectionCode(req: any, reply: FastifyReply) {
   }
 
   const url = `${config.wmsApiUrl}/api/v1/internal/oms/connect`;
+  // #region agent log
+  _dlog('oms-connect.controller.ts:redeemConnectionCode:beforeFetch', 'Before fetch to UnieBackend', { url, wmsApiUrl: config.wmsApiUrl, hasApiKey: !!config.internalApiKey, hypothesisId: 'C2' });
+  // #endregion
   const body: Record<string, unknown> = {
     connectionCode: connectionCode.trim(),
     omsIntermediaryId: String(omsIntermediaryId),
@@ -174,6 +183,9 @@ export async function redeemConnectionCode(req: any, reply: FastifyReply) {
     body: JSON.stringify(body),
   });
 
+  // #region agent log
+  _dlog('oms-connect.controller.ts:redeemConnectionCode:afterFetch', 'After fetch to UnieBackend', { status: res.status, ok: res.ok, hypothesisId: 'C3' });
+  // #endregion
   const data = (await res.json().catch(() => ({}))) as {
     message?: string;
     error?: string;
