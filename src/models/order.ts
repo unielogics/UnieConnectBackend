@@ -32,6 +32,8 @@ export interface IOrder extends Document {
   wmsShippedAt?: Date;
   /** Original marketplace status (for reference) */
   marketplaceStatus?: string;
+  /** Payment status: paid, pending, not_paid, refunded, partially_refunded, voided, authorized, partially_paid, unknown */
+  paid?: string;
 }
 
 const OrderSchema = new Schema<IOrder>(
@@ -61,6 +63,7 @@ const OrderSchema = new Schema<IOrder>(
     wmsTrackingNumber: { type: String },
     wmsShippedAt: { type: Date },
     marketplaceStatus: { type: String },
+    paid: { type: String },
   },
   { timestamps: true },
 );

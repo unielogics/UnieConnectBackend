@@ -11,7 +11,9 @@
     "audit:auth": "ts-node scripts/audit-auth.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "debug:order-status": "ts-node scripts/debug-order-status.ts",
+    "migrate:order-status-fix": "ts-node scripts/migrate-order-status-fix.ts"
   },
   "keywords": [],
   "author": "",

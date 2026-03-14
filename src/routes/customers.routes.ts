@@ -5,6 +5,7 @@ import { CustomerExternal } from '../models/customer-external';
 import { ChannelAccount } from '../models/channel-account';
 import { Order } from '../models/order';
 import { channelDisplayLabel } from '../lib/channel-display';
+import { shipmentStatusForDisplay } from '../lib/shipment-status-display';
 
 export async function customerRoutes(fastify: FastifyInstance) {
   fastify.get('/customers', async (req: any, reply) => {
@@ -112,21 +113,29 @@ export async function customerRoutes(fastify: FastifyInstance) {
       }, {});
       const channelsByCustomer = Object.fromEntries(
         Object.entries(byCustomer).map(([custId, lst]) => {
-          const mappings = lst.map((l) => {
+          // Dedupe by channelAccountId so we show one "Shopify (store.myshopify.com)" per store, not per external ID
+          const byAccount = new Map<string, { channel: string; channelDisplay: string; channelAccountId: any }>();
+          for (const l of lst) {
             const acc = (l as any).channelAccountId;
-            return {
-              channel: (l as any).channel,
-              channelDisplay: acc ? channelDisplayLabel(acc) : (l as any).channel,
-              channelAccountId: (l as any).channelAccountId?._id ?? (l as any).channelAccountId,
-            };
-          });
-          return [custId, { channels: [...new Set(lst.map((l) => (l as any).channel))], mappings }];
+            const accountId = (acc?._id ?? (l as any).channelAccountId)?.toString?.() ?? String((l as any).channelAccountId);
+            if (!byAccount.has(accountId)) {
+              byAccount.set(accountId, {
+                channel: (l as any).channel,
+                channelDisplay: acc ? channelDisplayLabel(acc) : (l as any).channel,
+                channelAccountId: acc?._id ?? (l as any).channelAccountId,
+              });
+            }
+          }
+          const mappings = Array.from(byAccount.values());
+          const channels = [...new Set(mappings.map((m) => m.channel))];
+          return [custId, { channels, mappings }];
         })
       );
       return customers.map((c) => {
         const custId = String(c._id);
         const { channels = [], mappings = [] } = channelsByCustomer[custId] || {};
-        return { ...c, channels, mappings };
+        const orderStatuses = Array.isArray(c.orderStatuses) ? c.orderStatuses.map((s: string) => shipmentStatusForDisplay(s)) : [];
+        return { ...c, channels, mappings, orderStatuses };
       });
     }
     return customers;
@@ -172,7 +181,7 @@ export async function customerRoutes(fastify: FastifyInstance) {
       return {
         _id: o._id,
         externalOrderId: o.externalOrderId,
-        status: effectiveStatus,
+        status: shipmentStatusForDisplay(effectiveStatus),
         channel: acc?.channel,
         channelDisplay,
         placedAt: o.placedAt,
@@ -206,14 +215,21 @@ export async function customerRoutes(fastify: FastifyInstance) {
       .populate('channelAccountId', 'channel shopDomain sellingPartnerId')
       .lean()
       .exec();
-    const mappings = links.map((l) => {
+    // Dedupe by channelAccountId: one "Shopify (store.myshopify.com)" per store
+    const byAccount = new Map<string, { channel: string; channelDisplay: string; channelAccountId: any }>();
+    for (const l of links) {
       const acc = (l as any).channelAccountId;
-      return {
-        ...l,
-        channelDisplay: acc ? channelDisplayLabel(acc) : (l as any).channel,
-      };
-    });
-    const channels = [...new Set(links.map((l) => (l as any).channel))];
+      const accountId = (acc?._id ?? (l as any).channelAccountId)?.toString?.() ?? String((l as any).channelAccountId);
+      if (!byAccount.has(accountId)) {
+        byAccount.set(accountId, {
+          channel: (l as any).channel,
+          channelDisplay: acc ? channelDisplayLabel(acc) : (l as any).channel,
+          channelAccountId: acc?._id ?? (l as any).channelAccountId,
+        });
+      }
+    }
+    const mappings = Array.from(byAccount.values());
+    const channels = [...new Set(mappings.map((m) => m.channel))];
     return { ...customer, mappings, channels };
   });
 

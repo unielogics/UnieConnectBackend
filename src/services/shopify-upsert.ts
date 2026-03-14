@@ -5,6 +5,8 @@ import { Customer } from '../models/customer';
 import { CustomerExternal } from '../models/customer-external';
 import { Order } from '../models/order';
 import { OrderLine } from '../models/order-line';
+import { shopifyFulfillmentToWmsStatus } from '../lib/order-status-converter';
+import { shopifyFinancialStatusToPaid } from '../lib/financial-status-to-paid';
 import { upsertAuditFromShopify } from './audit-ingest';
 import { createOrderInWms } from './wms-order-creation.service';
 
@@ -126,6 +128,8 @@ export async function upsertOrder(body: any, ctx: UpsertContext) {
 
   const existing = await Order.findOne({ channelAccountId, externalOrderId }).lean().exec();
   const marketplaceStatus = body.financial_status || 'open';
+  const statusFromShopify = shopifyFulfillmentToWmsStatus(body.fulfillment_status);
+  const paid = shopifyFinancialStatusToPaid(body.financial_status);
 
   const baseUpdate: Record<string, unknown> = {
     userId,
@@ -136,6 +140,7 @@ export async function upsertOrder(body: any, ctx: UpsertContext) {
     source: source || 'poll',
     externalOrderId,
     marketplaceStatus,
+    paid,
     currency,
     totals,
     customerId: customerId || undefined,
@@ -145,7 +150,7 @@ export async function upsertOrder(body: any, ctx: UpsertContext) {
     syncedAt: new Date(),
   };
   if (!existing?.wmsStatus) {
-    baseUpdate.status = marketplaceStatus;
+    baseUpdate.status = statusFromShopify;
   }
 
   const order = await Order.findOneAndUpdate(

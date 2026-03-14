@@ -7,6 +7,8 @@ import { Order } from '../models/order';
 import { OrderLine } from '../models/order-line';
 import { Customer } from '../models/customer';
 import { CustomerExternal } from '../models/customer-external';
+import { amazonOrderStatusToWmsStatus } from '../lib/order-status-converter';
+import { amazonOrderStatusToPaid } from '../lib/financial-status-to-paid';
 import { spApiFetch } from './amazon-spapi';
 import { setSyncStatus } from './channel-sync-status';
 import { upsertAuditFromAmazon } from './audit-ingest';
@@ -187,25 +189,35 @@ async function upsertOrderWithItems(
     subtotal: undefined as number | undefined,
   };
 
+  const amazonOrderStatus = order?.OrderStatus || 'Pending';
+  const statusFromAmazon = amazonOrderStatusToWmsStatus(amazonOrderStatus);
+  const paid = amazonOrderStatusToPaid(amazonOrderStatus);
+
+  const existing = await Order.findOne({ channelAccountId, externalOrderId }).select('wmsStatus').lean().exec();
+  const baseUpdate: Record<string, unknown> = {
+    userId,
+    channelAccountId,
+    channel: 'amazon',
+    marketplaceId,
+    fulfillmentChannel: order?.FulfillmentChannel,
+    source: 'poll',
+    externalOrderId,
+    currency,
+    totals,
+    paid,
+    placedAt: order?.PurchaseDate ? new Date(order.PurchaseDate) : undefined,
+    closedAt: order?.LatestDeliveryDate ? new Date(order.LatestDeliveryDate) : undefined,
+    raw: order,
+    syncedAt: new Date(),
+    customerId: customerId || undefined,
+  };
+  if (!existing?.wmsStatus) {
+    baseUpdate.status = statusFromAmazon;
+  }
+
   const orderDoc = await Order.findOneAndUpdate(
     { channelAccountId, externalOrderId },
-    {
-      userId,
-      channelAccountId,
-      channel: 'amazon',
-      marketplaceId,
-      fulfillmentChannel: order?.FulfillmentChannel,
-      source: 'poll',
-      externalOrderId,
-      status: order?.OrderStatus || 'Pending',
-      currency,
-      totals,
-      placedAt: order?.PurchaseDate ? new Date(order.PurchaseDate) : undefined,
-      closedAt: order?.LatestDeliveryDate ? new Date(order.LatestDeliveryDate) : undefined,
-      raw: order,
-      syncedAt: new Date(),
-      customerId: customerId || undefined,
-    },
+    baseUpdate,
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).exec();
 

@@ -5,6 +5,7 @@ import { OrderLine } from '../models/order-line';
 import { ChannelAccount } from '../models/channel-account';
 import { Customer } from '../models/customer';
 import { channelDisplayLabel } from '../lib/channel-display';
+import { normalizeWmsStatus } from '../lib/order-status-converter';
 
 export async function orderRoutes(fastify: FastifyInstance) {
   fastify.get('/orders', async (req: any, reply) => {
@@ -31,11 +32,12 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const enriched = (orders as any[]).map((o) => {
       const acc = o.channelAccountId;
       const channelDisplay = acc ? channelDisplayLabel(acc) : undefined;
-      const { channelAccountId, customerId, wmsStatus, wmsTrackingNumber, wmsShippedAt, ...rest } = o;
-      const effectiveStatus = wmsStatus ?? rest.status;
+      const { channelAccountId, customerId, wmsStatus, wmsTrackingNumber, wmsShippedAt, paid, ...rest } = o;
+      const effectiveStatus = normalizeWmsStatus(wmsStatus ?? rest.status);
       return {
         ...rest,
         status: effectiveStatus,
+        paid: paid ?? null,
         trackingNumber: wmsTrackingNumber ?? null,
         shippedAt: wmsShippedAt ?? null,
         channelAccountId: channelAccountId?._id ?? channelAccountId,
@@ -61,11 +63,12 @@ export async function orderRoutes(fastify: FastifyInstance) {
     const lines = await OrderLine.find({ orderId: order._id }).populate('itemId', 'title image sku').lean().exec();
     const acc = (order as any).channelAccountId;
     const channelDisplay = acc ? channelDisplayLabel(acc) : undefined;
-    const { channelAccountId, customerId, wmsStatus, wmsTrackingNumber, wmsShippedAt, ...rest } = order as any;
-    const effectiveStatus = wmsStatus ?? rest.status;
+    const { channelAccountId, customerId, wmsStatus, wmsTrackingNumber, wmsShippedAt, paid, ...rest } = order as any;
+    const effectiveStatus = normalizeWmsStatus(wmsStatus ?? rest.status);
     return {
       ...rest,
       status: effectiveStatus,
+      paid: paid ?? null,
       trackingNumber: wmsTrackingNumber ?? null,
       shippedAt: wmsShippedAt ?? null,
       channelAccountId: channelAccountId?._id ?? channelAccountId,
