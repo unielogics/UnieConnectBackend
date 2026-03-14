@@ -35,6 +35,19 @@ async function start() {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
   await connectMongo();
+
+  // Production sanity: WMS_API_URL must NOT be localhost
+  const isProduction = process.env.NODE_ENV === 'production';
+  const wmsUrl = config.wmsApiUrl || '';
+  if (isProduction && (wmsUrl.includes('localhost') || wmsUrl.includes('127.0.0.1'))) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[FATAL] WMS_API_URL must point to production UnieBackend in production. ' +
+      'Currently: ' + wmsUrl + '. Set WMS_API_URL=https://api.uniewms.com (or your prod WMS URL) in your hosting env.'
+    );
+    process.exit(1);
+  }
+
   const defaultCorsOrigins = ['https://unieconnect.com', 'https://user.unieconnect.com', 'http://localhost:3000'];
   const corsOrigins = Array.from(new Set([...defaultCorsOrigins, ...config.corsOrigins]));
   await app.register(cors, {

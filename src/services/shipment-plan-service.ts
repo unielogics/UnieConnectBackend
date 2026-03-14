@@ -429,6 +429,16 @@ export async function createASNForShipmentPlan(params: {
 
     if (wmsIntermediaryId) {
       const shipFromAddr = await resolveShipFromAddress(userId, String(plan.shipFromLocationId));
+      const itemIds = plan.items.map((i) => (i as any).itemId).filter(Boolean);
+      const catalogItems = itemIds.length > 0
+        ? await Item.find({ _id: { $in: itemIds } }).select('image images').lean().exec()
+        : [];
+      const imageByItemId = new Map(
+        catalogItems.map((it: any) => {
+          const img = it.image || (Array.isArray(it.images) && it.images[0]);
+          return [String(it._id), img];
+        })
+      );
       const url = `${config.wmsApiUrl}/api/v1/internal/oms/asn/create`;
       const body = {
         warehouseCode: facilityCode,
@@ -443,16 +453,21 @@ export async function createASNForShipmentPlan(params: {
           postalCode: shipFromAddr.postalCode,
           countryCode: shipFromAddr.countryCode,
         },
-        lineItems: plan.items.map((i) => ({
-          sku: i.sku,
-          wmsSku: (i as any).wmsSku,
-          itemName: (i as any).title || i.sku,
-          quantity: i.quantity,
-          unitsPerContainer: i.unitsPerBox,
-          containersCount: i.boxCount,
-          fnsku: i.fnsku,
-          expDate: i.expDate,
-        })),
+        lineItems: plan.items.map((i) => {
+          const itemId = (i as any).itemId;
+          const image = itemId ? imageByItemId.get(String(itemId)) : undefined;
+          return {
+            sku: i.sku,
+            wmsSku: (i as any).wmsSku,
+            itemName: (i as any).title || i.sku,
+            quantity: i.quantity,
+            unitsPerContainer: i.unitsPerBox,
+            containersCount: i.boxCount,
+            fnsku: i.fnsku,
+            expDate: i.expDate,
+            ...(image && { image }),
+          };
+        }),
         eta: plan.orderDate || new Date(),
       };
       const res = await fetch(url, {
