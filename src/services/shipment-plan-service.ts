@@ -430,13 +430,30 @@ export async function createASNForShipmentPlan(params: {
     if (wmsIntermediaryId) {
       const shipFromAddr = await resolveShipFromAddress(userId, String(plan.shipFromLocationId));
       const itemIds = plan.items.map((i) => (i as any).itemId).filter(Boolean);
-      const catalogItems = itemIds.length > 0
+      const catalogByItemId = itemIds.length > 0
         ? await Item.find({ _id: { $in: itemIds } }).select('image images').lean().exec()
         : [];
       const imageByItemId = new Map(
-        catalogItems.map((it: any) => {
+        catalogByItemId.map((it: any) => {
           const img = it.image || (Array.isArray(it.images) && it.images[0]);
-          return [String(it._id), img];
+          return [String(it._id), { image: img, images: it.images }];
+        })
+      );
+      const skusWithoutItemId = plan.items
+        .filter((i) => !(i as any).itemId)
+        .map((i) => i.sku)
+        .filter(Boolean);
+      const catalogBySku =
+        skusWithoutItemId.length > 0
+          ? await Item.find({ userId: new Types.ObjectId(userId), sku: { $in: skusWithoutItemId } })
+              .select('sku image images')
+              .lean()
+              .exec()
+          : [];
+      const imageBySku = new Map(
+        catalogBySku.map((it: any) => {
+          const img = it.image || (Array.isArray(it.images) && it.images[0]);
+          return [it.sku, { image: img, images: it.images }];
         })
       );
       const url = `${config.wmsApiUrl}/api/v1/internal/oms/asn/create`;
@@ -455,7 +472,11 @@ export async function createASNForShipmentPlan(params: {
         },
         lineItems: plan.items.map((i) => {
           const itemId = (i as any).itemId;
-          const image = itemId ? imageByItemId.get(String(itemId)) : undefined;
+          const byItemId = itemId ? imageByItemId.get(String(itemId)) : undefined;
+          const bySku = imageBySku.get(i.sku);
+          const content = byItemId || bySku;
+          const image = content?.image || undefined;
+          const images = Array.isArray(content?.images) && content.images.length > 0 ? content.images : undefined;
           return {
             sku: i.sku,
             wmsSku: (i as any).wmsSku,
@@ -466,6 +487,7 @@ export async function createASNForShipmentPlan(params: {
             fnsku: i.fnsku,
             expDate: i.expDate,
             ...(image && { image }),
+            ...(images && { images }),
           };
         }),
         eta: plan.orderDate || new Date(),
