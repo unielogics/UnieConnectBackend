@@ -61,6 +61,10 @@ export const config = {
     apiKey: process.env.RATE_SHOPPING_API_KEY || '',
     ttlMs: Number(process.env.RATE_SHOPPING_TTL_MS || 7 * 24 * 60 * 60 * 1000), // default 7 days
   },
+  cortex: {
+    apiUrl: (process.env.CORTEX_API_URL || 'https://api.uniecortex.com').replace(/\/+$/, ''),
+    apiKey: process.env.CORTEX_API_KEY || '',
+  },
   shippo: {
     apiKey: process.env.SHIPPO_API_KEY || '',
     mockMode: String(process.env.SHIPPO_MOCK_MODE || '').toLowerCase() === 'true',
@@ -83,4 +87,3 @@ export const config = {
   /** WMS/UnieBackend API base URL for OMS connect proxy (e.g. http://localhost:8000). */
   wmsApiUrl: (process.env.WMS_API_URL || 'http://localhost:8000').replace(/\/+$/, ''),
 };
-

@@ -35,7 +35,15 @@ async function start() {
   app.addHook('onError', async (req, _reply, err) => {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
-  await connectMongo();
+  try {
+    await connectMongo();
+  } catch (error) {
+    if (process.env.OMS_ALLOW_DEGRADED_START === 'true') {
+      app.log.error({ err: error }, 'OMS MongoDB connection failed; starting in degraded Cortex-adapter mode');
+    } else {
+      throw error;
+    }
+  }
 
   // Production sanity: WMS_API_URL must NOT be localhost
   const isProduction = process.env.NODE_ENV === 'production';
@@ -94,4 +102,3 @@ start().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-
