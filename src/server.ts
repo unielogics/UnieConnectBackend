@@ -9,10 +9,6 @@ import jwt from 'jsonwebtoken';
 import { registerRoutes } from './routes';
 import { authRoutes } from './routes/auth.routes';
 import { config } from './config/env';
-import { connectMongo } from './config/mongo';
-import { startShopifyCron } from './services/shopify-cron';
-import { startAmazonCron } from './services/amazon-cron';
-import { startCatalogSyncToWmsScheduler } from './services/catalog-sync-to-wms.scheduler';
 
 async function start() {
   const app = Fastify({ logger: true });
@@ -35,15 +31,7 @@ async function start() {
   app.addHook('onError', async (req, _reply, err) => {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
-  try {
-    await connectMongo();
-  } catch (error) {
-    if (process.env.OMS_ALLOW_DEGRADED_START === 'true') {
-      app.log.error({ err: error }, 'OMS MongoDB connection failed; starting in degraded Cortex-adapter mode');
-    } else {
-      throw error;
-    }
-  }
+  app.log.info('UnieConnect backend starting in Aurora PostgreSQL mode; MongoDB startup is disabled.');
 
   // Production sanity: WMS_API_URL must NOT be localhost
   const isProduction = process.env.NODE_ENV === 'production';
@@ -90,9 +78,7 @@ async function start() {
     await authRoutes(instance);
     await registerRoutes(instance);
   }, { prefix: '/api/v1' });
-  startShopifyCron(app.log);
-  startAmazonCron(app.log);
-  startCatalogSyncToWmsScheduler(app.log);
+  app.log.warn('legacy Mongo marketplace/catalog schedulers are purged; SQL/Cortex sync jobs must run through Aurora-backed workers.');
   await app.listen({ port: config.port, host: '0.0.0.0' });
   app.log.info(`UnieConnect listening on ${config.port}`);
 }

@@ -85,9 +85,9 @@ function main() {
   );
 
   // ---- Shared ----
-  const dbUrl = process.env.DB_URL || '';
+  const dbUrl = process.env.AURORA_POSTGRES_URL || process.env.POSTGRES_URL || process.env.DATABASE_URL || '';
   const authSecret = process.env.AUTH_SECRET || '';
-  results.push(check('Shared', !!dbUrl, `DB_URL ${dbUrl ? 'set' : 'missing'}`));
+  results.push(check('Shared', !!dbUrl, `Aurora/Postgres URL ${dbUrl ? 'set' : 'missing'}`));
   const authSecretOk = Boolean(authSecret && authSecret !== 'change-me');
   results.push(check('Shared', authSecretOk, `AUTH_SECRET ${authSecretOk ? 'set' : 'missing or default'}`));
 

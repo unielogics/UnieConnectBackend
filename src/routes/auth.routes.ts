@@ -1,290 +1,176 @@
-import { FastifyInstance } from 'fastify';
-import fs from 'fs';
-import path from 'path';
-import jwt from 'jsonwebtoken';
-
-const DBG = path.join(process.cwd(), '..', '..', '.cursor', 'debug.log');
-const dbg = (o: object) => { try { fs.appendFileSync(DBG, JSON.stringify({ ...o, ts: Date.now() }) + '\n'); } catch {} };
+import { randomBytes, randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
-import fetch from 'node-fetch';
-import { User } from '../models/user';
-import { InviteToken } from '../models/invite-token';
-import { UserActivityLog } from '../models/user-activity-log';
+import { FastifyInstance } from 'fastify';
+import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
-import { normalizeRole } from '../lib/roles';
-import crypto from 'crypto';
+import { pgQuery } from '../db/postgres';
+import { isValidRole, normalizeRole } from '../lib/roles';
+import {
+  changeSqlUserPassword,
+  findSqlUserById,
+  findSqlUserByEmail,
+  touchSqlUserLogin,
+  updateSqlUserProfile,
+  verifySqlUser,
+} from '../services/sql-auth';
+
+function setAuthCookie(reply: any, req: any, token: string, maxAgeSeconds = 7 * 24 * 60 * 60) {
+  const host = String(req.headers.host || '');
+  const isProdHost = host.endsWith('unieconnect.com');
+  const cookieParts = [
+    `unie-token=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${maxAgeSeconds}`,
+    isProdHost ? 'Secure' : '',
+    isProdHost ? 'SameSite=None' : 'SameSite=Lax',
+    isProdHost ? 'Domain=.unieconnect.com' : '',
+  ].filter(Boolean);
+  reply.header('Set-Cookie', cookieParts.join('; '));
+}
+
+function signUser(user: { userId: string; email: string; role: string }) {
+  return jwt.sign(
+    { userId: user.userId, email: user.email, role: normalizeRole(user.role), authSource: 'aurora_postgres' },
+    config.authSecret,
+    { expiresIn: '7d' },
+  );
+}
 
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const user = await User.findById(userId)
-      .select('email role firstName lastName phone llcName billingAddress lastLoginAt')
-      .lean()
-      .exec();
+    const user = await findSqlUserById(String(userId));
     if (!user) return reply.code(401).send({ error: 'User not found' });
-    return {
-      userId: user._id,
-      email: user.email,
-      role: normalizeRole(user.role),
-      firstName: user.firstName,
-      lastName: user.lastName,
-      phone: user.phone,
-      llcName: user.llcName,
-      billingAddress: user.billingAddress,
-      lastLoginAt: user.lastLoginAt,
-    };
+    return user;
   });
 
   fastify.patch('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
-    const body = (req.body || {}) as {
-      firstName?: string;
-      lastName?: string;
-      phone?: string;
-      llcName?: string;
-      billingAddress?: {
-        addressLine1?: string;
-        addressLine2?: string;
-        city?: string;
-        state?: string;
-        zipCode?: string;
-        country?: string;
-      };
-    };
-    const user = await User.findById(userId).exec();
-    if (!user) return reply.code(401).send({ error: 'User not found' });
-    if (body.firstName !== undefined) {
-      const v = body.firstName ? String(body.firstName).trim() : undefined;
-      user.set('firstName', v);
-    }
-    if (body.lastName !== undefined) {
-      const v = body.lastName ? String(body.lastName).trim() : undefined;
-      user.set('lastName', v);
-    }
-    if (body.phone !== undefined) {
-      const v = body.phone ? String(body.phone).trim() : undefined;
-      user.set('phone', v);
-    }
-    if (body.llcName !== undefined) {
-      const v = body.llcName ? String(body.llcName).trim() : undefined;
-      user.set('llcName', v);
-    }
-    if (body.billingAddress !== undefined) {
-      if (body.billingAddress == null) {
-        user.set('billingAddress', undefined);
-      } else {
-        const ba = body.billingAddress;
-        user.set('billingAddress', {
-          addressLine1: ba.addressLine1?.trim() ?? '',
-          addressLine2: ba.addressLine2?.trim() ?? '',
-          city: ba.city?.trim() ?? '',
-          state: ba.state?.trim() ?? '',
-          zipCode: ba.zipCode?.trim() ?? '',
-          country: ba.country?.trim() ?? '',
-        });
-      }
-    }
-    await user.save();
-
-    if (config.wmsApiUrl && config.internalApiKey) {
-      const { OmsIntermediary } = await import('../models/oms-intermediary');
-      const oms = await OmsIntermediary.findOne({
-        email: user.email.toLowerCase(),
-        status: 'active',
-      })
-        .select('_id')
-        .lean()
-        .exec();
-      if (oms) {
-        const body = {
-          externalOmsIntermediaryId: String(oms._id),
-          firstName: user.firstName,
-          lastName: user.lastName,
-          phone: user.phone,
-          email: user.email,
-          llcName: user.llcName,
-          billingAddress: user.billingAddress,
-        };
-        fetch(`${config.wmsApiUrl}/api/v1/internal/oms/intermediary/sync-profile`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Internal-Api-Key': config.internalApiKey,
-          },
-          body: JSON.stringify(body),
-        }).catch((err) => {
-          req.log?.warn?.(err, 'Failed to sync profile to WMS intermediaries');
-        });
-      }
-    }
-
-    return {
-      userId: user._id,
-      email: user.email,
-      role: normalizeRole(user.role),
-      firstName: user.firstName,
-      lastName: user.lastName,
-      phone: user.phone,
-      llcName: user.llcName,
-      billingAddress: user.billingAddress,
-    };
+    const updated = await updateSqlUserProfile(String(userId), req.body || {});
+    if (!updated) return reply.code(401).send({ error: 'User not found' });
+    return updated;
   });
 
   fastify.post('/auth/login', async (req: any, reply) => {
     const { email, password } = req.body || {};
-    const normalizedEmail = email ? String(email).toLowerCase() : '';
-    dbg({ src: 'UCB', step: 'entry', email: normalizedEmail, hasPw: !!password });
+    const normalizedEmail = email ? String(email).toLowerCase().trim() : '';
     req.log.info({ reqId: req.id, email: normalizedEmail, ip: req.ip }, 'login attempt');
-    if (!email || !password) return reply.code(400).send({ error: 'Email and password required' });
-    const user = await User.findOne({ email: normalizedEmail }).exec();
-    dbg({ src: 'UCB', step: 'userFind', found: !!user, email: normalizedEmail });
+    if (!normalizedEmail || !password) return reply.code(400).send({ error: 'Email and password required' });
+
+    const user = await verifySqlUser(normalizedEmail, String(password));
     if (!user) {
-      dbg({ src: 'UCB', step: '401', reason: 'user_not_found' });
-      req.log.warn({ reqId: req.id, email: normalizedEmail }, 'login failed: user not found');
+      req.log.warn({ reqId: req.id, email: normalizedEmail }, 'login failed');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    dbg({ src: 'UCB', step: 'bcrypt', ok, email: normalizedEmail });
-    if (!ok) {
-      dbg({ src: 'UCB', step: '401', reason: 'bad_password' });
-      req.log.warn({ reqId: req.id, email: normalizedEmail, userId: user._id }, 'login failed: bad password');
-      return reply.code(401).send({ error: 'Invalid credentials' });
-    }
-    user.lastLoginAt = new Date();
-    await user.save();
-    await UserActivityLog.create({ userId: user._id, action: 'login' });
-    const role = normalizeRole(user.role);
-    const token = jwt.sign(
-      { userId: user._id, email: user.email, role },
-      config.authSecret,
-      { expiresIn: '7d' }
-    );
-    const host = String(req.headers.host || '');
-    const isProdHost = host.endsWith('unieconnect.com');
-    const cookieParts = [
-      `unie-token=${encodeURIComponent(token)}`,
-      'Path=/',
-      'HttpOnly',
-      `Max-Age=${7 * 24 * 60 * 60}`,
-      isProdHost ? 'Secure' : '',
-      isProdHost ? 'SameSite=None' : 'SameSite=Lax',
-      isProdHost ? 'Domain=.unieconnect.com' : '',
-    ].filter(Boolean);
-    reply.header('Set-Cookie', cookieParts.join('; '));
-    req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'login success');
-    return { token, user: { userId: user._id, email: user.email, role } };
+
+    await touchSqlUserLogin(user.userId);
+    const token = signUser(user);
+    setAuthCookie(reply, req, token);
+    req.log.info({ reqId: req.id, userId: user.userId, email: user.email }, 'sql login success');
+    return { token, user };
   });
 
   fastify.post('/auth/change-password', async (req: any, reply) => {
     const userId = req.user?.userId;
-    req.log.info({ reqId: req.id, userId }, 'change password attempt');
     const { oldPassword, newPassword } = req.body || {};
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     if (!oldPassword || !newPassword) return reply.code(400).send({ error: 'oldPassword and newPassword required' });
-    const user = await User.findById(userId).exec();
-    if (!user) return reply.code(401).send({ error: 'Unauthorized' });
-    const ok = await bcrypt.compare(oldPassword, user.passwordHash);
-    if (!ok) return reply.code(401).send({ error: 'Invalid credentials' });
-    user.passwordHash = await bcrypt.hash(newPassword, 10);
-    user.resetToken = null as any;
-    user.resetTokenExpires = null as any;
-    await user.save();
-    await UserActivityLog.create({ userId, action: 'password_change' });
-    req.log.info({ reqId: req.id, userId }, 'password updated');
+    const result = await changeSqlUserPassword(String(userId), String(oldPassword), String(newPassword));
+    if (!result.ok) return reply.code(result.status).send({ error: 'Invalid credentials' });
     return { success: true };
   });
 
-  fastify.get('/auth/invite/validate', async (req: any, reply) => {
-    const token = (req.query as { token?: string }).token;
-    if (!token) return reply.send({ valid: false });
-    const invite = await InviteToken.findOne({ token }).lean().exec();
-    if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt.getTime() < Date.now())) {
-      return reply.send({ valid: false });
-    }
-    return reply.send({ valid: true, role: invite.role });
+  fastify.get('/auth/invite/validate', async (req: any) => {
+    const token = String(req.query?.token || '').trim();
+    if (!token) return { valid: false };
+    const res = await pgQuery<{ role: string }>(
+      'SELECT role FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
+      [token],
+    );
+    const invite = res?.rows[0];
+    return invite ? { valid: true, role: normalizeRole(invite.role) } : { valid: false };
   });
 
   fastify.post('/auth/invite/signup', async (req: any, reply) => {
-    const { token: inviteTokenValue, firstName, lastName, email, phone, password } = (req.body || {}) as {
-      token?: string;
-      firstName?: string;
-      lastName?: string;
-      email?: string;
-      phone?: string;
-      password?: string;
-    };
-    if (!inviteTokenValue || !email || !password) {
+    const { token, firstName, lastName, email, phone, password } = req.body || {};
+    const inviteToken = String(token || '').trim();
+    const normalizedEmail = String(email || '').toLowerCase().trim();
+    if (!inviteToken || !normalizedEmail || !password) {
       return reply.code(400).send({ error: 'token, email and password required' });
     }
-    const invite = await InviteToken.findOne({ token: inviteTokenValue }).exec();
-    if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt.getTime() < Date.now())) {
-      return reply.code(400).send({ error: 'Invalid or expired invite link' });
-    }
-    const normalizedEmail = String(email).toLowerCase().trim();
-    const existing = await User.findOne({ email: normalizedEmail }).exec();
-    if (existing) return reply.code(409).send({ error: 'User with this email already exists' });
-    const passwordHash = await bcrypt.hash(String(password), 10);
-    const user = await User.create({
-      email: normalizedEmail,
-      passwordHash,
-      role: invite.role,
-      firstName: firstName ? String(firstName).trim() : undefined,
-      lastName: lastName ? String(lastName).trim() : undefined,
-      phone: phone ? String(phone).trim() : undefined,
-    });
-    invite.usedAt = new Date();
-    await invite.save();
-    await UserActivityLog.create({
-      userId: user._id,
-      action: 'invite_signup',
-      metadata: { inviteTokenId: invite._id },
-    });
-    const role = normalizeRole(user.role);
-    const token = jwt.sign(
-      { userId: user._id, email: user.email, role },
-      config.authSecret,
-      { expiresIn: '7d' }
+
+    const inviteRes = await pgQuery<{ id: string; role: string }>(
+      'SELECT id, role FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
+      [inviteToken],
     );
-    req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'invite signup success');
-    return {
-      token,
-      user: { userId: user._id, email: user.email, role },
-    };
+    const invite = inviteRes?.rows[0];
+    if (!invite) return reply.code(400).send({ error: 'Invalid or expired invite link' });
+
+    const existing = await findSqlUserByEmail(normalizedEmail);
+    if (existing) return reply.code(409).send({ error: 'User with this email already exists' });
+
+    const userId = randomUUID();
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const role = normalizeRole(invite.role);
+    await pgQuery(
+      `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        userId,
+        normalizedEmail,
+        passwordHash,
+        role,
+        firstName ? String(firstName).trim() : null,
+        lastName ? String(lastName).trim() : null,
+        phone ? String(phone).trim() : null,
+      ],
+    );
+    await pgQuery('UPDATE invite_tokens SET used_at = now(), used_by = $2 WHERE id = $1', [invite.id, userId]);
+    await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
+      userId,
+      'invite_signup',
+      JSON.stringify({ inviteId: invite.id }),
+    ]);
+
+    const user = await findSqlUserById(userId);
+    if (!user) return reply.code(500).send({ error: 'User created but could not be loaded' });
+    const authToken = signUser(user);
+    setAuthCookie(reply, req, authToken);
+    return { token: authToken, user };
   });
 
-  fastify.post('/auth/request-reset', async (req: any, reply) => {
-    const { email } = req.body || {};
-    const normalizedEmail = email ? String(email).toLowerCase() : '';
-    req.log.info({ reqId: req.id, email: normalizedEmail }, 'password reset requested');
-    if (!email) return reply.code(400).send({ error: 'Email required' });
-    const user = await User.findOne({ email: normalizedEmail }).exec();
-    if (!user) return reply.send({ success: true }); // avoid leakage
-    const token = crypto.randomBytes(24).toString('hex');
-    user.resetToken = token as any;
-    user.resetTokenExpires = new Date(Date.now() + 60 * 60 * 1000);
-    await user.save();
-    req.log.info({ reqId: req.id, userId: user._id, email: user.email }, 'password reset token issued');
-    // Since email not set up, return token in response for now
+  fastify.post('/auth/request-reset', async (req: any) => {
+    const normalizedEmail = String(req.body?.email || '').toLowerCase().trim();
+    if (!normalizedEmail) return { success: true };
+    const user = await findSqlUserByEmail(normalizedEmail);
+    if (!user) return { success: true };
+    const token = randomBytes(24).toString('hex');
+    await pgQuery(
+      'UPDATE app_users SET reset_token = $2, reset_token_expires = now() + interval \'1 hour\', updated_at = now() WHERE id = $1',
+      [user.userId, token],
+    );
     return { success: true, resetToken: token };
   });
 
   fastify.post('/auth/reset-password', async (req: any, reply) => {
-    const { token, newPassword } = req.body || {};
-    req.log.info({ reqId: req.id, hasToken: Boolean(token) }, 'reset password attempt');
+    const token = String(req.body?.token || '').trim();
+    const newPassword = String(req.body?.newPassword || '');
     if (!token || !newPassword) return reply.code(400).send({ error: 'token and newPassword required' });
-    const user = await User.findOne({ resetToken: token }).exec();
-    if (!user || !user.resetTokenExpires || user.resetTokenExpires.getTime() < Date.now()) {
-      req.log.warn({ reqId: req.id }, 'reset password failed: invalid/expired token');
-      return reply.code(400).send({ error: 'Invalid or expired token' });
-    }
-    user.passwordHash = await bcrypt.hash(newPassword, 10);
-    user.resetToken = null as any;
-    user.resetTokenExpires = null as any;
-    await user.save();
-    req.log.info({ reqId: req.id, userId: user._id }, 'password reset success');
+    const res = await pgQuery<{ id: string }>(
+      'SELECT id FROM app_users WHERE reset_token = $1 AND reset_token_expires > now() LIMIT 1',
+      [token],
+    );
+    const user = res?.rows[0];
+    if (!user) return reply.code(400).send({ error: 'Invalid or expired token' });
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pgQuery(
+      'UPDATE app_users SET password_hash = $2, reset_token = NULL, reset_token_expires = NULL, updated_at = now() WHERE id = $1',
+      [user.id, passwordHash],
+    );
+    await pgQuery('INSERT INTO app_user_activity_log (user_id, action) VALUES ($1, $2)', [user.id, 'password_reset']);
     return { success: true };
   });
 }
-

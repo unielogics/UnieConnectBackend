@@ -1,4 +1,5 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
+import { pgQuery } from '../db/postgres';
 
 /** Allowed role values */
 export const ALL_ROLES = ['super_admin', 'management', 'ecommerce_client', 'billing'] as const;
@@ -30,13 +31,13 @@ export function requireRole(allowedRoles: readonly UserRole[]) {
       return reply.code(401).send({ error: 'Unauthorized' });
     }
 
-    let role: string | undefined = (req as any).user?.role;
-    if (!role) {
-      const { User } = await import('../models/user');
-      const user = await User.findById(userId).select('role').lean().exec();
+  let role: string | undefined = (req as any).user?.role;
+  if (!role) {
+      const res = await pgQuery<{ role: string }>('SELECT role FROM app_users WHERE id = $1 LIMIT 1', [String(userId)]);
+      const user = res?.rows[0];
       if (!user) return reply.code(401).send({ error: 'User not found' });
       role = user.role;
-    }
+  }
     const normalizedRole = normalizeRole(role);
 
     if (!allowedRoles.includes(normalizedRole)) {

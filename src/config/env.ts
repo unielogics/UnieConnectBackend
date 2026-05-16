@@ -53,6 +53,7 @@ export const config = {
     awsSessionToken: process.env.AMAZON_SPAPI_AWS_SESSION_TOKEN || '',
   },
   dbUrl: process.env.DB_URL || '',
+  postgresUrl: process.env.AURORA_POSTGRES_URL || process.env.POSTGRES_URL || process.env.DATABASE_URL || '',
   authSecret: process.env.AUTH_SECRET || 'change-me',
   /** Email of the top-level super_admin account (franco@unielogics.com) */
   superAdminEmail: process.env.SUPER_ADMIN_EMAIL || 'franco@unielogics.com',
