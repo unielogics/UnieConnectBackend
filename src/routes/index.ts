@@ -1,67 +1,51 @@
 import { FastifyInstance } from 'fastify';
 import { healthRoutes } from './health';
-import { shopifyAuthRoutes } from './shopify-auth.routes';
-import { ebayAuthRoutes } from './ebay-auth.routes';
-import { shopifyWebhookRoutes } from './shopify-webhooks.routes';
-import { channelAccountRoutes } from './channel-accounts.routes';
-import { itemRoutes } from './items.routes';
-import { customerRoutes } from './customers.routes';
-import { orderRoutes } from './orders.routes';
-import { shopifyFulfillmentRoutes } from './shopify-fulfillment.routes';
-import { shopifyRoutes } from './shopify.routes';
-import { amazonAuthRoutes } from './amazon-auth.routes';
-import { amazonRoutes } from './amazon.routes';
-import { auditRoutes } from './audit.routes';
-import { ebayWebhookRoutes } from './ebay-webhooks.routes';
-import { featureRoutes } from './features.routes';
-import { shipFromLocationRoutes } from './ship-from-locations.routes';
-import { shipmentPlanRoutes } from './shipment-plan.routes';
-import { asnRoutes } from './asn.routes';
-import { invoicesRoutes } from './invoices.routes';
-import { transportationTemplateRoutes } from './transportation-template.routes';
-import { facilitiesRoutes } from './facilities.routes';
-import { supplierRoutes } from './suppliers.routes';
-import { usersRoutes } from './users.routes';
 import { addressRoutes } from './address.routes';
-import { omsRoutes } from './oms.routes';
-import { internalRoutes } from './internal.routes';
-import { notesRoutes } from './notes.routes';
-import { apiKeyAuthHook } from '../middleware/api-key-auth';
 import { cortexRoutes } from './cortex.routes';
 import { omsProductionRoutes } from './oms-production.routes';
+import { isMongoDisabled } from '../services/degraded-auth';
 
 export async function registerRoutes(app: FastifyInstance) {
-  // JWT is set by server.ts preHandler (shared for auth + main routes)
-  // API key auth: if req.user not set, try ApiKey (OMS: X-Warehouse-ID required; WMS: intermediaryId)
+  await healthRoutes(app);
+  await addressRoutes(app);
+  await omsProductionRoutes(app);
+  await cortexRoutes(app);
+
+  if (isMongoDisabled()) {
+    app.get('/legacy/status', async () => ({
+      mongo: 'disabled',
+      replacement: 'aurora_postgres',
+      message: 'Legacy Mongo-backed routes are disabled while UnieConnect is running in AWS SQL mode.',
+    }));
+    return;
+  }
+
+  const { apiKeyAuthHook } = await import('../middleware/api-key-auth');
   app.addHook('preHandler', apiKeyAuthHook);
 
-  await healthRoutes(app);
-  await shopifyAuthRoutes(app);
-  await ebayAuthRoutes(app);
-  await amazonAuthRoutes(app);
-  await amazonRoutes(app);
-  await shopifyWebhookRoutes(app);
-  await channelAccountRoutes(app);
-  await itemRoutes(app);
-  await customerRoutes(app);
-  await orderRoutes(app);
-  await shopifyFulfillmentRoutes(app);
-  await shopifyRoutes(app);
-  await auditRoutes(app);
-  await ebayWebhookRoutes(app);
-  await featureRoutes(app);
-  await supplierRoutes(app);
-  await shipFromLocationRoutes(app);
-  await shipmentPlanRoutes(app);
-  await asnRoutes(app);
-  await invoicesRoutes(app);
-  await transportationTemplateRoutes(app);
-  await facilitiesRoutes(app);
-  await usersRoutes(app);
-  await addressRoutes(app);
-  await omsRoutes(app);
-  await omsProductionRoutes(app);
-  await internalRoutes(app);
-  await cortexRoutes(app);
-  await notesRoutes(app);
+  await (await import('./shopify-auth.routes')).shopifyAuthRoutes(app);
+  await (await import('./ebay-auth.routes')).ebayAuthRoutes(app);
+  await (await import('./amazon-auth.routes')).amazonAuthRoutes(app);
+  await (await import('./amazon.routes')).amazonRoutes(app);
+  await (await import('./shopify-webhooks.routes')).shopifyWebhookRoutes(app);
+  await (await import('./channel-accounts.routes')).channelAccountRoutes(app);
+  await (await import('./items.routes')).itemRoutes(app);
+  await (await import('./customers.routes')).customerRoutes(app);
+  await (await import('./orders.routes')).orderRoutes(app);
+  await (await import('./shopify-fulfillment.routes')).shopifyFulfillmentRoutes(app);
+  await (await import('./shopify.routes')).shopifyRoutes(app);
+  await (await import('./audit.routes')).auditRoutes(app);
+  await (await import('./ebay-webhooks.routes')).ebayWebhookRoutes(app);
+  await (await import('./features.routes')).featureRoutes(app);
+  await (await import('./suppliers.routes')).supplierRoutes(app);
+  await (await import('./ship-from-locations.routes')).shipFromLocationRoutes(app);
+  await (await import('./shipment-plan.routes')).shipmentPlanRoutes(app);
+  await (await import('./asn.routes')).asnRoutes(app);
+  await (await import('./invoices.routes')).invoicesRoutes(app);
+  await (await import('./transportation-template.routes')).transportationTemplateRoutes(app);
+  await (await import('./facilities.routes')).facilitiesRoutes(app);
+  await (await import('./users.routes')).usersRoutes(app);
+  await (await import('./oms.routes')).omsRoutes(app);
+  await (await import('./internal.routes')).internalRoutes(app);
+  await (await import('./notes.routes')).notesRoutes(app);
 }

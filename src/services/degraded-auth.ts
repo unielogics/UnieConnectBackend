@@ -10,9 +10,14 @@ export function isMongoReady() {
   return mongoose.connection.readyState === 1;
 }
 
+export function isMongoDisabled() {
+  return ['true', '1', 'yes'].includes(String(process.env.DISABLE_MONGO || process.env.MONGO_DISABLED || '').toLowerCase());
+}
+
 export function isDegradedAuthEnabled() {
   return (
     process.env.OMS_ALLOW_DEGRADED_START === 'true' &&
+    !isMongoDisabled() &&
     !isMongoReady() &&
     Boolean(fallbackEmail()) &&
     Boolean(process.env.OMS_DEGRADED_USER_PASSWORD_HASH || process.env.OMS_DEGRADED_USER_PASSWORD)

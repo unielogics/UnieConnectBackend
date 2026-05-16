@@ -7,22 +7,30 @@ const DBG = path.join(process.cwd(), '..', '..', '.cursor', 'debug.log');
 const dbg = (o: object) => { try { fs.appendFileSync(DBG, JSON.stringify({ ...o, ts: Date.now() }) + '\n'); } catch {} };
 import bcrypt from 'bcryptjs';
 import fetch from 'node-fetch';
-import { User } from '../models/user';
-import { InviteToken } from '../models/invite-token';
-import { UserActivityLog } from '../models/user-activity-log';
 import { config } from '../config/env';
 import { normalizeRole } from '../lib/roles';
 import crypto from 'crypto';
-import { getDegradedUser, isMongoReady, tryDegradedLogin } from '../services/degraded-auth';
+import { getDegradedUser, isMongoDisabled, isMongoReady, tryDegradedLogin } from '../services/degraded-auth';
+import {
+  changeSqlUserPassword,
+  findSqlUserById,
+  touchSqlUserLogin,
+  updateSqlUserProfile,
+  verifySqlUser,
+} from '../services/sql-auth';
 
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const sqlUser = await findSqlUserById(String(userId));
+    if (sqlUser) return sqlUser;
+    if (isMongoDisabled()) return reply.code(401).send({ error: 'User not found' });
     const degradedUser = getDegradedUser();
     if (!isMongoReady() && degradedUser && String(userId) === degradedUser.userId) {
       return degradedUser;
     }
+    const { User } = await import('../models/user');
     const user = await User.findById(userId)
       .select('email role firstName lastName phone llcName billingAddress lastLoginAt')
       .lean()
@@ -44,6 +52,13 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.patch('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const sqlUser = await findSqlUserById(String(userId));
+    if (sqlUser) {
+      const updated = await updateSqlUserProfile(String(userId), req.body || {});
+      if (!updated) return reply.code(401).send({ error: 'User not found' });
+      return updated;
+    }
+    if (isMongoDisabled()) return reply.code(401).send({ error: 'User not found' });
     const degradedUser = getDegradedUser();
     if (!isMongoReady() && degradedUser && String(userId) === degradedUser.userId) {
       return reply.code(503).send({
@@ -65,6 +80,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         country?: string;
       };
     };
+    const { User } = await import('../models/user');
     const user = await User.findById(userId).exec();
     if (!user) return reply.code(401).send({ error: 'User not found' });
     if (body.firstName !== undefined) {
@@ -150,6 +166,33 @@ export async function authRoutes(fastify: FastifyInstance) {
     dbg({ src: 'UCB', step: 'entry', email: normalizedEmail, hasPw: !!password });
     req.log.info({ reqId: req.id, email: normalizedEmail, ip: req.ip }, 'login attempt');
     if (!email || !password) return reply.code(400).send({ error: 'Email and password required' });
+    const sqlUser = await verifySqlUser(normalizedEmail, String(password));
+    if (sqlUser) {
+      await touchSqlUserLogin(sqlUser.userId);
+      const token = jwt.sign(
+        { userId: sqlUser.userId, email: sqlUser.email, role: sqlUser.role, authSource: 'aurora_postgres' },
+        config.authSecret,
+        { expiresIn: '7d' }
+      );
+      const host = String(req.headers.host || '');
+      const isProdHost = host.endsWith('unieconnect.com');
+      const cookieParts = [
+        `unie-token=${encodeURIComponent(token)}`,
+        'Path=/',
+        'HttpOnly',
+        `Max-Age=${7 * 24 * 60 * 60}`,
+        isProdHost ? 'Secure' : '',
+        isProdHost ? 'SameSite=None' : 'SameSite=Lax',
+        isProdHost ? 'Domain=.unieconnect.com' : '',
+      ].filter(Boolean);
+      reply.header('Set-Cookie', cookieParts.join('; '));
+      req.log.info({ reqId: req.id, userId: sqlUser.userId, email: sqlUser.email }, 'sql login success');
+      return { token, user: sqlUser };
+    }
+    if (isMongoDisabled()) {
+      req.log.warn({ reqId: req.id, email: normalizedEmail }, 'login failed: SQL user not found and Mongo disabled');
+      return reply.code(401).send({ error: 'Invalid credentials' });
+    }
     if (!isMongoReady()) {
       const fallbackUser = await tryDegradedLogin(normalizedEmail, String(password));
       if (!fallbackUser) {
@@ -176,6 +219,8 @@ export async function authRoutes(fastify: FastifyInstance) {
       req.log.info({ reqId: req.id, userId: fallbackUser.userId, email: fallbackUser.email }, 'degraded login success');
       return { token, user: fallbackUser, degraded: true };
     }
+    const { User } = await import('../models/user');
+    const { UserActivityLog } = await import('../models/user-activity-log');
     const user = await User.findOne({ email: normalizedEmail }).exec();
     dbg({ src: 'UCB', step: 'userFind', found: !!user, email: normalizedEmail });
     if (!user) {
@@ -221,6 +266,16 @@ export async function authRoutes(fastify: FastifyInstance) {
     const { oldPassword, newPassword } = req.body || {};
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     if (!oldPassword || !newPassword) return reply.code(400).send({ error: 'oldPassword and newPassword required' });
+    const sqlUser = await findSqlUserById(String(userId));
+    if (sqlUser) {
+      const result = await changeSqlUserPassword(String(userId), String(oldPassword), String(newPassword));
+      if (!result.ok) return reply.code(result.status).send({ error: 'Invalid credentials' });
+      req.log.info({ reqId: req.id, userId }, 'sql password updated');
+      return { success: true };
+    }
+    if (isMongoDisabled()) return reply.code(401).send({ error: 'Unauthorized' });
+    const { User } = await import('../models/user');
+    const { UserActivityLog } = await import('../models/user-activity-log');
     const user = await User.findById(userId).exec();
     if (!user) return reply.code(401).send({ error: 'Unauthorized' });
     const ok = await bcrypt.compare(oldPassword, user.passwordHash);
@@ -237,6 +292,8 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/invite/validate', async (req: any, reply) => {
     const token = (req.query as { token?: string }).token;
     if (!token) return reply.send({ valid: false });
+    if (isMongoDisabled()) return reply.send({ valid: false });
+    const { InviteToken } = await import('../models/invite-token');
     const invite = await InviteToken.findOne({ token }).lean().exec();
     if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt.getTime() < Date.now())) {
       return reply.send({ valid: false });
@@ -256,6 +313,12 @@ export async function authRoutes(fastify: FastifyInstance) {
     if (!inviteTokenValue || !email || !password) {
       return reply.code(400).send({ error: 'token, email and password required' });
     }
+    if (isMongoDisabled()) {
+      return reply.code(503).send({ error: 'Invite signup is disabled until invite storage is migrated to Aurora.' });
+    }
+    const { InviteToken } = await import('../models/invite-token');
+    const { User } = await import('../models/user');
+    const { UserActivityLog } = await import('../models/user-activity-log');
     const invite = await InviteToken.findOne({ token: inviteTokenValue }).exec();
     if (!invite || invite.usedAt || (invite.expiresAt && invite.expiresAt.getTime() < Date.now())) {
       return reply.code(400).send({ error: 'Invalid or expired invite link' });
@@ -297,6 +360,8 @@ export async function authRoutes(fastify: FastifyInstance) {
     const normalizedEmail = email ? String(email).toLowerCase() : '';
     req.log.info({ reqId: req.id, email: normalizedEmail }, 'password reset requested');
     if (!email) return reply.code(400).send({ error: 'Email required' });
+    if (isMongoDisabled()) return reply.send({ success: true });
+    const { User } = await import('../models/user');
     const user = await User.findOne({ email: normalizedEmail }).exec();
     if (!user) return reply.send({ success: true }); // avoid leakage
     const token = crypto.randomBytes(24).toString('hex');
@@ -312,6 +377,10 @@ export async function authRoutes(fastify: FastifyInstance) {
     const { token, newPassword } = req.body || {};
     req.log.info({ reqId: req.id, hasToken: Boolean(token) }, 'reset password attempt');
     if (!token || !newPassword) return reply.code(400).send({ error: 'token and newPassword required' });
+    if (isMongoDisabled()) {
+      return reply.code(503).send({ error: 'Password reset tokens are disabled until reset storage is migrated to Aurora.' });
+    }
+    const { User } = await import('../models/user');
     const user = await User.findOne({ resetToken: token }).exec();
     if (!user || !user.resetTokenExpires || user.resetTokenExpires.getTime() < Date.now()) {
       req.log.warn({ reqId: req.id }, 'reset password failed: invalid/expired token');
