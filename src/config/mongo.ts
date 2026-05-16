@@ -4,6 +4,8 @@ import { config } from './env';
 export async function connectMongo() {
   if (!config.dbUrl) throw new Error('DB_URL not set');
   if (mongoose.connection.readyState === 1) return;
-  await mongoose.connect(config.dbUrl);
+  await mongoose.connect(config.dbUrl, {
+    serverSelectionTimeoutMS: process.env.OMS_ALLOW_DEGRADED_START === 'true' ? 5000 : 30000,
+  });
 }
 

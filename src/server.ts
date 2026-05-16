@@ -13,6 +13,7 @@ import { connectMongo } from './config/mongo';
 import { startShopifyCron } from './services/shopify-cron';
 import { startAmazonCron } from './services/amazon-cron';
 import { startCatalogSyncToWmsScheduler } from './services/catalog-sync-to-wms.scheduler';
+import { isMongoReady } from './services/degraded-auth';
 
 async function start() {
   const app = Fastify({ logger: true });
@@ -90,9 +91,13 @@ async function start() {
     await authRoutes(instance);
     await registerRoutes(instance);
   }, { prefix: '/api/v1' });
-  startShopifyCron(app.log);
-  startAmazonCron(app.log);
-  startCatalogSyncToWmsScheduler(app.log);
+  if (isMongoReady()) {
+    startShopifyCron(app.log);
+    startAmazonCron(app.log);
+    startCatalogSyncToWmsScheduler(app.log);
+  } else {
+    app.log.warn('legacy marketplace/catalog schedulers disabled until MongoDB is reachable');
+  }
   await app.listen({ port: config.port, host: '0.0.0.0' });
   app.log.info(`UnieConnect listening on ${config.port}`);
 }

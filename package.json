@@ -14,6 +14,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "debug:order-status": "ts-node scripts/debug-order-status.ts",
     "migrate:order-status-fix": "ts-node scripts/migrate-order-status-fix.ts",
+    "migrate:oms-postgres": "ts-node scripts/migrate-oms-postgres.ts",
     "sync-catalog-to-wms": "ts-node scripts/sync-catalog-content-to-wms.ts"
   },
   "keywords": [],
@@ -24,6 +25,7 @@
     "@fastify/cors": "^11.2.0",
     "@types/jsonwebtoken": "^9.0.10",
     "amqplib": "^0.10.9",
+    "aws4": "^1.12.0",
     "bcryptjs": "^3.0.3",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.2",
@@ -31,12 +33,13 @@
     "mongoose": "^8.8.1",
     "ngrok": "^5.0.0-beta.2",
     "node-fetch": "^2.7.0",
-    "aws4": "^1.12.0"
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.8",
     "@types/node": "^25.0.8",
     "@types/node-fetch": "^2.6.13",
+    "@types/pg": "^8.20.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

@@ -28,6 +28,7 @@ import { internalRoutes } from './internal.routes';
 import { notesRoutes } from './notes.routes';
 import { apiKeyAuthHook } from '../middleware/api-key-auth';
 import { cortexRoutes } from './cortex.routes';
+import { omsProductionRoutes } from './oms-production.routes';
 
 export async function registerRoutes(app: FastifyInstance) {
   // JWT is set by server.ts preHandler (shared for auth + main routes)
@@ -59,6 +60,7 @@ export async function registerRoutes(app: FastifyInstance) {
   await usersRoutes(app);
   await addressRoutes(app);
   await omsRoutes(app);
+  await omsProductionRoutes(app);
   await internalRoutes(app);
   await cortexRoutes(app);
   await notesRoutes(app);

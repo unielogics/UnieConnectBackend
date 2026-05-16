@@ -13,11 +13,16 @@ import { UserActivityLog } from '../models/user-activity-log';
 import { config } from '../config/env';
 import { normalizeRole } from '../lib/roles';
 import crypto from 'crypto';
+import { getDegradedUser, isMongoReady, tryDegradedLogin } from '../services/degraded-auth';
 
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const degradedUser = getDegradedUser();
+    if (!isMongoReady() && degradedUser && String(userId) === degradedUser.userId) {
+      return degradedUser;
+    }
     const user = await User.findById(userId)
       .select('email role firstName lastName phone llcName billingAddress lastLoginAt')
       .lean()
@@ -39,6 +44,13 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.patch('/auth/me', async (req: any, reply) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
+    const degradedUser = getDegradedUser();
+    if (!isMongoReady() && degradedUser && String(userId) === degradedUser.userId) {
+      return reply.code(503).send({
+        error: 'Profile updates require the legacy account database to be reachable.',
+        degraded: true,
+      });
+    }
     const body = (req.body || {}) as {
       firstName?: string;
       lastName?: string;
@@ -138,6 +150,32 @@ export async function authRoutes(fastify: FastifyInstance) {
     dbg({ src: 'UCB', step: 'entry', email: normalizedEmail, hasPw: !!password });
     req.log.info({ reqId: req.id, email: normalizedEmail, ip: req.ip }, 'login attempt');
     if (!email || !password) return reply.code(400).send({ error: 'Email and password required' });
+    if (!isMongoReady()) {
+      const fallbackUser = await tryDegradedLogin(normalizedEmail, String(password));
+      if (!fallbackUser) {
+        req.log.warn({ reqId: req.id, email: normalizedEmail }, 'login failed: Mongo unavailable and degraded auth did not match');
+        return reply.code(401).send({ error: 'Invalid credentials' });
+      }
+      const token = jwt.sign(
+        { userId: fallbackUser.userId, email: fallbackUser.email, role: fallbackUser.role, degraded: true },
+        config.authSecret,
+        { expiresIn: '12h' }
+      );
+      const host = String(req.headers.host || '');
+      const isProdHost = host.endsWith('unieconnect.com');
+      const cookieParts = [
+        `unie-token=${encodeURIComponent(token)}`,
+        'Path=/',
+        'HttpOnly',
+        `Max-Age=${12 * 60 * 60}`,
+        isProdHost ? 'Secure' : '',
+        isProdHost ? 'SameSite=None' : 'SameSite=Lax',
+        isProdHost ? 'Domain=.unieconnect.com' : '',
+      ].filter(Boolean);
+      reply.header('Set-Cookie', cookieParts.join('; '));
+      req.log.info({ reqId: req.id, userId: fallbackUser.userId, email: fallbackUser.email }, 'degraded login success');
+      return { token, user: fallbackUser, degraded: true };
+    }
     const user = await User.findOne({ email: normalizedEmail }).exec();
     dbg({ src: 'UCB', step: 'userFind', found: !!user, email: normalizedEmail });
     if (!user) {
@@ -287,4 +325,3 @@ export async function authRoutes(fastify: FastifyInstance) {
     return { success: true };
   });
 }
-
