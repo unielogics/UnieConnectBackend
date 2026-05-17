@@ -54,7 +54,7 @@ async function start() {
       return cb(null, false);
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Warehouse-ID'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Warehouse-ID', 'X-WMS-Client-ID', 'X-WMS-Passkey', 'Idempotency-Key', 'X-Internal-Api-Key'],
     credentials: true,
   });
   // Single /api/v1 plugin: JWT preHandler for ALL routes (auth + main). apiKeyAuthHook only affects routes that need it.

@@ -1,6 +1,7 @@
 import fetch from 'node-fetch';
 import { config } from '../config/env';
 import { routeOrderToClosestWarehouse } from './order-routing.service';
+import { getWmsCredentialHeaders } from './oms-wms-credentials.service';
 
 export interface CreateWmsOrderInput {
   userId: string;
@@ -31,7 +32,7 @@ export async function createOrderInWms(params: CreateWmsOrderInput): Promise<{
   warehouseCode: string;
 } | null> {
   const { userId, shippingAddress, lineItems, alternativeOrderNumber, log } = params;
-  if (!config.wmsApiUrl || !config.internalApiKey) return null;
+  if (!config.wmsApiUrl) return null;
 
   const shWithCoords = shippingAddress as typeof shippingAddress & { lat?: number; long?: number };
   const routeParams: Parameters<typeof routeOrderToClosestWarehouse>[0] = {
@@ -68,11 +69,17 @@ export async function createOrderInWms(params: CreateWmsOrderInput): Promise<{
   };
 
   try {
+    const credentialHeaders = await getWmsCredentialHeaders({ userId, warehouseCode: routed.warehouseCode });
+    if (!credentialHeaders) {
+      log?.warn?.({ warehouseCode: routed.warehouseCode }, 'No WMS integration credential available for order create');
+      return null;
+    }
     const res = await fetch(`${config.wmsApiUrl}/api/v1/internal/oms/order/create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Internal-Api-Key': config.internalApiKey,
+        ...credentialHeaders,
+        'Idempotency-Key': alternativeOrderNumber || `order:${userId}:${Date.now()}`,
       },
       body: JSON.stringify({
         warehouseCode: routed.warehouseCode,

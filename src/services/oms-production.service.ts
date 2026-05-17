@@ -16,60 +16,6 @@ const money = (value: unknown) => Math.round(number(value) * 100) / 100;
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 
-const fallbackFacilities = () => [
-  {
-    id: 'fallback-wh-nj',
-    code: 'NJ-01',
-    name: 'New Jersey Market Hub',
-    address: { city: 'Newark', state: 'NJ', stateOrProvinceCode: 'NJ' },
-  },
-  {
-    id: 'fallback-wh-fl',
-    code: 'FL-01',
-    name: 'Florida Consolidation Warehouse',
-    address: { city: 'Orlando', state: 'FL', stateOrProvinceCode: 'FL' },
-  },
-  {
-    id: 'fallback-xdock-ga',
-    code: 'GA-XD',
-    name: 'Atlanta Cross-Dock',
-    address: { city: 'Atlanta', state: 'GA', stateOrProvinceCode: 'GA' },
-  },
-];
-
-const fallbackItems = () => [
-  {
-    id: 'fallback-sku-1',
-    sku: 'OMS-A100',
-    title: 'High velocity ecommerce SKU',
-    supplier_id: 'fallback-supplier-1',
-    dimensions: { length: 14, width: 10, height: 8 },
-    weight: 2.4,
-    wms_inventory: { available: 18, inbound: 160 },
-    updated_at: new Date(),
-  },
-  {
-    id: 'fallback-sku-2',
-    sku: 'OMS-B240',
-    title: 'Shared pallet candidate',
-    supplier_id: null,
-    dimensions: { length: 9, width: 7, height: 5 },
-    weight: 1.1,
-    wms_inventory: { available: 74, inbound: 90 },
-    updated_at: new Date(),
-  },
-  {
-    id: 'fallback-sku-3',
-    sku: 'OMS-C315',
-    title: 'Priority replenishment SKU',
-    supplier_id: 'fallback-supplier-2',
-    dimensions: { length: 18, width: 12, height: 10 },
-    weight: 4.8,
-    wms_inventory: { available: 7, inbound: 240 },
-    updated_at: new Date(),
-  },
-];
-
 async function rows<T extends Row = Row>(sql: string, values: unknown[] = []): Promise<T[]> {
   if (!isPostgresConfigured()) return [];
   try {
@@ -149,13 +95,13 @@ async function baseCounts(userId: string) {
   );
   const first = data[0] || {};
   return {
-    items: number(first.items, fallbackItems().length),
+    items: number(first.items),
     orders: number(first.orders),
     customers: number(first.customers),
-    suppliers: number(first.suppliers, 2),
+    suppliers: number(first.suppliers),
     channels: number(first.channels),
     shipmentPlans: number(first.shipment_plans),
-    facilities: number(first.facilities, fallbackFacilities().length),
+    facilities: number(first.facilities),
   };
 }
 
@@ -164,7 +110,7 @@ async function getItems(userId: string, limit = 200) {
     'SELECT * FROM catalog_items WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2',
     [userId, limit],
   );
-  return data.length ? data : fallbackItems();
+  return data;
 }
 
 async function getFacilities(userId: string) {
@@ -172,7 +118,7 @@ async function getFacilities(userId: string) {
     'SELECT * FROM facilities WHERE user_id = $1 OR user_id IS NULL ORDER BY code ASC LIMIT 200',
     [userId],
   );
-  return data.length ? data : fallbackFacilities();
+  return data;
 }
 
 async function recentLedger(userId: string, limit = 30) {
@@ -225,13 +171,14 @@ function itemDimensions(item: Row) {
 
 function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>, facilitiesCount: number) {
   const inv = itemInventory(item);
-  const available = number(inv.available, Math.max(0, 40 - index * 2));
-  const velocity = Math.max(1, number(velocityBySku.get(item.sku), index % 4 === 0 ? 22 : 8));
-  const daysOfCover = Math.round((available / velocity) * 30);
-  const proposedUnits = Math.max(velocity * 2, 100);
+  const available = number(inv.available);
+  const velocity = Math.max(0, number(velocityBySku.get(item.sku)));
+  const daysOfCover = velocity > 0 ? Math.round((available / velocity) * 30) : 0;
+  const proposedUnits = velocity > 0 ? Math.max(velocity * 2, Math.ceil(velocity * 1.4)) : 0;
   const dim = itemDimensions(item);
-  const cube = (number(dim.length, 12) * number(dim.width, 8) * number(dim.height, 6)) / 1728;
-  const weight = number(item.weight, 1.2);
+  const cube = (number(dim.length) * number(dim.width) * number(dim.height)) / 1728;
+  const weight = number(item.weight);
+  const risk = velocity === 0 ? 'needs_sales_data' : daysOfCover < 14 ? 'high' : daysOfCover < 30 ? 'medium' : 'low';
   return {
     id: String(item.id),
     sku: item.sku,
@@ -241,16 +188,16 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     inbound: number(inv.inbound),
     velocity30d: velocity,
     daysOfCover,
-    risk: daysOfCover < 14 ? 'high' : daysOfCover < 30 ? 'medium' : 'low',
-    currentWarehouseCount: facilitiesCount || 1,
-    proposedWarehouseCount: Math.max(2, facilitiesCount || 2),
+    risk,
+    currentWarehouseCount: facilitiesCount,
+    proposedWarehouseCount: velocity > 0 ? Math.max(1, facilitiesCount) : facilitiesCount,
     proposedUnits,
-    minViableUnits: Math.max(24, Math.ceil(proposedUnits * 0.35)),
+    minViableUnits: proposedUnits > 0 ? Math.max(24, Math.ceil(proposedUnits * 0.35)) : 0,
     palletCubeFt: money(cube * proposedUnits),
     palletWeightLbs: Math.round(weight * proposedUnits),
-    fillPercent: Math.min(98, Math.max(38, Math.round((cube * proposedUnits / 60) * 100))),
-    serviceTier: daysOfCover < 14 ? 'priority' : daysOfCover < 30 ? 'standard' : 'economy',
-    recommendation: daysOfCover < 14 ? 'Move now to avoid stockout' : 'Consolidate into next economical pallet',
+    fillPercent: proposedUnits > 0 ? Math.min(98, Math.max(0, Math.round((cube * proposedUnits / 60) * 100))) : 0,
+    serviceTier: velocity === 0 ? 'needs_data' : daysOfCover < 14 ? 'priority' : daysOfCover < 30 ? 'standard' : 'economy',
+    recommendation: velocity === 0 ? 'Connect marketplace/order history to score demand' : daysOfCover < 14 ? 'Move now to avoid stockout' : 'Consolidate into next economical pallet',
   };
 }
 
@@ -306,7 +253,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
 export async function getBusinessDouble(userId: string) {
   const counts = await baseCounts(userId);
   const thirty = await orderSummary(userId, rangeStart('30d'));
-  const currentMonthlyCost = money(Math.max(1200, counts.items * 2.75 + counts.orders * 1.35 + counts.shipmentPlans * 42));
+  const currentMonthlyCost = money(counts.items * 2.75 + counts.orders * 1.35 + counts.shipmentPlans * 42);
   const optimizedMonthlyCost = money(currentMonthlyCost * 0.82);
   const plan = {
     id: `generated-${userId}`,
@@ -317,15 +264,15 @@ export async function getBusinessDouble(userId: string) {
     currentMetrics: {
       monthlyRevenue: thirty.revenue,
       monthlyCost: currentMonthlyCost,
-      averageDeliveryDays: counts.facilities > 1 ? 3.8 : 5.2,
-      warehouseNodes: counts.facilities || 1,
+      averageDeliveryDays: counts.facilities > 1 ? 3.8 : counts.facilities === 1 ? 5.2 : 0,
+      warehouseNodes: counts.facilities,
       stockoutRiskPct: counts.items ? 18 : 0,
     },
     optimizedMetrics: {
       monthlyRevenue: money(thirty.revenue * 1.08),
       monthlyCost: optimizedMonthlyCost,
-      averageDeliveryDays: counts.facilities > 1 ? 2.5 : 3.9,
-      warehouseNodes: Math.max(2, counts.facilities || 2),
+      averageDeliveryDays: counts.facilities > 1 ? 2.5 : counts.facilities === 1 ? 3.9 : 0,
+      warehouseNodes: counts.facilities ? Math.max(2, counts.facilities) : 0,
       stockoutRiskPct: counts.items ? 9 : 0,
     },
     savings: {
@@ -421,7 +368,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m') {
       month: date.toLocaleString('en-US', { month: 'short', year: 'numeric' }),
       projectedUnits: planSkus.reduce((sum, sku) => sum + Math.round(sku.velocity30d * (1 + i * 0.08)), 0),
       proposedReplenishment: planSkus.reduce((sum, sku) => sum + Math.round(sku.proposedUnits * (i % 2 === 0 ? 0.42 : 0.25)), 0),
-      savings: money(1200 + i * 180 + planSkus.length * 18),
+      savings: money(planSkus.length ? i * 180 + planSkus.length * 18 : 0),
     };
   });
 
@@ -432,12 +379,12 @@ export async function getInventoryPlan(userId: string, horizon = '6m') {
       skuCount: items.length,
       warehouseCount: facilities.length,
       stockoutRiskSkus: planSkus.filter((s) => s.risk === 'high').length,
-      estimatedMonthlyCost: money(2200 + planSkus.length * 32),
+      estimatedMonthlyCost: money(planSkus.length * 32),
     },
     proposed: {
-      warehouseCount: Math.max(2, facilities.length || 2),
+      warehouseCount: facilities.length ? Math.max(2, facilities.length) : 0,
       stockoutRiskSkus: planSkus.filter((s) => s.risk === 'high').length > 0 ? Math.max(1, Math.floor(planSkus.filter((s) => s.risk === 'high').length / 2)) : 0,
-      estimatedMonthlyCost: money((2200 + planSkus.length * 32) * 0.82),
+      estimatedMonthlyCost: money((planSkus.length * 32) * 0.82),
       sharedPalletCandidates: planSkus.filter((s) => s.fillPercent < 75).length,
     },
     months,
@@ -461,7 +408,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
   const item = (await one(
     'SELECT * FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1',
     [userId, skuOrId],
-  ) || fallbackItems().find((row) => row.sku === skuOrId || row.id === skuOrId) || null) as Row | null;
+  )) as Row | null;
   if (!item) return null;
   const intelligence = (await getInventoryPlan(userId)).skus.find((s) => s.sku === item.sku);
   const activityPlans = await rows(
@@ -494,10 +441,10 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     warehouses: facilities.map((f, i) => ({
       code: f.code || `WH-${i + 1}`,
       name: f.name,
-      available: Math.max(0, 80 - i * 17),
-      inbound: i % 2 === 0 ? 40 + i * 10 : 0,
-      daysOfCover: Math.max(9, 42 - i * 6),
-      storageCost: money(22 + i * 7),
+      available: 0,
+      inbound: 0,
+      daysOfCover: 0,
+      storageCost: 0,
     })),
     history: [],
     billing: {
@@ -571,14 +518,9 @@ export async function createShipmentWizardDraft(userId: string, body: any) {
 }
 
 async function defaultFacility(userId: string) {
-  const existing = await one('SELECT * FROM facilities WHERE (user_id = $1 OR user_id IS NULL) AND status = $2 ORDER BY user_id NULLS LAST, created_at ASC LIMIT 1', [userId, 'active']);
-  if (existing) return existing;
   return one(
-    `INSERT INTO facilities (user_id, code, name, facility_type, address, latitude, longitude, metadata)
-     VALUES ($1, 'NJ-01', 'New Jersey Market Hub', 'warehouse', $2::jsonb, 40.7357, -74.1724, '{"source":"oms_default"}'::jsonb)
-     ON CONFLICT (user_id, code) DO UPDATE SET updated_at = now()
-     RETURNING *`,
-    [userId, JSON.stringify({ city: 'Newark', state: 'NJ', stateOrProvinceCode: 'NJ', country: 'US' })],
+    'SELECT * FROM facilities WHERE (user_id = $1 OR user_id IS NULL) AND status = $2 ORDER BY user_id NULLS LAST, created_at ASC LIMIT 1',
+    [userId, 'active'],
   );
 }
 
@@ -595,6 +537,13 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
   }
 
   const facility = await defaultFacility(userId);
+  if (!facility) {
+    return {
+      status: 'needs_setup',
+      message: 'Connect at least one WMS warehouse before confirming an OMS shipment. The OMS can draft intent, but WMS truth is required before ASN execution.',
+      requires: ['wms_facility_connection'],
+    };
+  }
   const shipFrom = shipFromLocationId ? await one('SELECT * FROM ship_from_locations WHERE id = $1 AND user_id = $2', [shipFromLocationId, userId]) : null;
   const plan = await one(
     `INSERT INTO shipment_plans
@@ -663,22 +612,47 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
 }
 
 export async function getHeatmap(userId: string) {
-  const [facilities, plan] = await Promise.all([getFacilities(userId), getInventoryPlan(userId)]);
-  const states = ['CA', 'TX', 'FL', 'NJ', 'GA', 'IL', 'PA', 'AZ', 'WA', 'NC', 'OH', 'NY'];
+  const [facilities, plan, stateRows] = await Promise.all([
+    getFacilities(userId),
+    getInventoryPlan(userId),
+    rows<{ state: string; orders: string; revenue: string }>(
+      `SELECT
+         UPPER(COALESCE(
+           NULLIF(shipping_address->>'stateOrProvinceCode', ''),
+           NULLIF(shipping_address->>'state', ''),
+           NULLIF(shipping_address->>'province', '')
+         )) AS state,
+         COUNT(*)::text AS orders,
+         COALESCE(SUM(COALESCE((totals->>'total')::numeric, 0)), 0)::text AS revenue
+       FROM orders
+       WHERE user_id = $1
+       GROUP BY state
+       HAVING UPPER(COALESCE(
+         NULLIF(shipping_address->>'stateOrProvinceCode', ''),
+         NULLIF(shipping_address->>'state', ''),
+         NULLIF(shipping_address->>'province', '')
+       )) IS NOT NULL
+       ORDER BY COUNT(*) DESC
+       LIMIT 50`,
+      [userId],
+    ),
+  ]);
+  const totalInventory = plan.skus.reduce((sum, sku) => sum + number(sku.available), 0);
+  const inventoryPerFacility = facilities.length ? Math.round(totalInventory / facilities.length) : 0;
   return {
-    states: states.map((state, i) => ({
-      state,
-      demand: 60 + i * 11,
-      revenue: money(2200 + i * 740),
-      risk: i % 4 === 0 ? 'high' : i % 3 === 0 ? 'medium' : 'low',
+    states: stateRows.map((row) => ({
+      state: row.state,
+      demand: number(row.orders),
+      revenue: money(row.revenue),
+      risk: number(row.orders) >= 50 ? 'high' : number(row.orders) >= 15 ? 'medium' : 'low',
     })),
     warehouses: facilities.map((f, i) => ({
       id: String(f.id),
       name: f.name,
       code: f.code,
-      state: f.address?.stateOrProvinceCode || f.address?.state || states[i % states.length],
-      inventoryUnits: 1200 + i * 430,
-      activeSkus: Math.max(1, Math.floor(plan.skus.length / Math.max(1, facilities.length || 1))),
+      state: f.address?.stateOrProvinceCode || f.address?.state || null,
+      inventoryUnits: inventoryPerFacility,
+      activeSkus: plan.skus.length ? Math.max(1, Math.floor(plan.skus.length / Math.max(1, facilities.length || 1))) : 0,
     })),
   };
 }
@@ -688,8 +662,7 @@ export async function getLabelAudit(userId: string): Promise<{ findings: LabelAu
     'SELECT * FROM oms_label_audit_findings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100',
     [userId],
   );
-  const findings: LabelAuditFinding[] = stored.length
-    ? stored.map((row) => ({
+  const findings: LabelAuditFinding[] = stored.map((row) => ({
         id: row.id,
         carrier: row.carrier,
         trackingNumber: row.tracking_number,
@@ -698,29 +671,7 @@ export async function getLabelAudit(userId: string): Promise<{ findings: LabelAu
         refundAmount: money(row.refund_amount),
         status: row.status,
         recommendation: row.evidence?.recommendation || 'Review carrier evidence and file claim when confidence is sufficient.',
-      }))
-    : [
-        {
-          id: 'modeled-audit-1',
-          carrier: 'UPS',
-          trackingNumber: 'pending-carrier-evidence',
-          findingType: 'late_delivery_refund',
-          severity: 'medium',
-          refundAmount: 42.5,
-          status: 'open',
-          recommendation: 'Connect carrier account or upload export to validate refund claim evidence.',
-        },
-        {
-          id: 'modeled-audit-2',
-          carrier: 'FedEx',
-          trackingNumber: 'pending-carrier-evidence',
-          findingType: 'dimensional_reclass',
-          severity: 'medium',
-          refundAmount: 31.75,
-          status: 'open',
-          recommendation: 'Enrich package dimensions before filing dimensional reclass dispute.',
-        },
-      ];
+      }));
   return {
     findings,
     summary: {
@@ -737,11 +688,11 @@ export async function getBillingProfit(userId: string) {
   const invoiceRows = await rows<{ amount: string }>('SELECT COALESCE(SUM(amount), 0)::text AS amount FROM invoice_lines WHERE user_id = $1', [userId]);
   const invoices = number(invoiceRows[0]?.amount);
   const current = {
-    freight: money(1800 + counts.orders * 1.1 + invoices * 0.18),
-    storage: money(900 + counts.items * 2.2),
-    handling: money(1200 + counts.shipmentPlans * 24),
-    accessorials: money(380 + counts.shipmentPlans * 9),
-    refundsCaptured: money(120),
+    freight: money(counts.orders * 1.1 + invoices * 0.18),
+    storage: money(counts.items * 2.2),
+    handling: money(counts.shipmentPlans * 24),
+    accessorials: money(counts.shipmentPlans * 9),
+    refundsCaptured: money(0),
   };
   const optimized = {
     freight: money(current.freight * 0.84),
@@ -757,11 +708,7 @@ export async function getLedger(userId: string) {
   const stored = await recentLedger(userId, 100);
   if (stored.length) return { events: stored, persistence: 'aurora_postgres' };
   return {
-    events: [
-      { id: 'demo-1', event_type: 'forecast_generated', source_system: 'oms', summary: 'OMS generated inventory placement forecast from Aurora marketplace and order data.', created_at: new Date().toISOString() },
-      { id: 'demo-2', event_type: 'truth_gate_checked', source_system: 'wms', summary: 'WMS truth gate checked received and staged inventory before execution.', created_at: new Date().toISOString() },
-      { id: 'demo-3', event_type: 'orchestration_scored', source_system: 'cortex', summary: 'Cortex scored dispatch readiness and consolidation opportunities.', created_at: new Date().toISOString() },
-    ],
+    events: [],
     persistence: isPostgresConfigured() ? 'aurora_postgres_empty' : 'aurora_postgres_unconfigured',
   };
 }

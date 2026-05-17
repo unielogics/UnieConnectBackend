@@ -1,9 +1,11 @@
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { FastifyInstance } from 'fastify';
+import fetch from 'node-fetch';
 import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
+import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 
 type AnyRow = Record<string, any>;
 
@@ -322,6 +324,108 @@ async function seedDefaultFacility(userId: string) {
     [userId, JSON.stringify({ city: 'Newark', state: 'NJ', stateOrProvinceCode: 'NJ', country: 'US' })],
   );
 }
+
+function wmsBillingAddress(address: AnyRow | null | undefined) {
+  const a = json(address, {}) || {};
+  return {
+    addressLine1: trim(a.addressLine1 || a.line1 || a.address1 || a.street || a.address),
+    addressLine2: trim(a.addressLine2 || a.line2 || a.address2),
+    city: trim(a.city),
+    state: trim(a.state || a.stateOrProvinceCode || a.province),
+    zipCode: trim(a.zipCode || a.postalCode || a.zip || a.postcode),
+    country: trim(a.country || a.countryCode || 'US') || 'US',
+  };
+}
+
+async function buildWmsOmsProfile(userId: string) {
+  const user = await one(
+    `SELECT id, email, first_name, last_name, phone, llc_name, billing_address
+     FROM app_users
+     WHERE id = $1`,
+    [userId],
+  );
+  if (!user) return { profile: null, missing: ['user'] };
+
+  const billingAddress = wmsBillingAddress(user.billing_address);
+  const firstName = trim(user.first_name);
+  const lastName = trim(user.last_name);
+  const phone = trim(user.phone);
+  const email = normalizedEmail(user.email);
+  const llcName = trim(user.llc_name);
+
+  const missing: string[] = [];
+  if (!firstName) missing.push('firstName');
+  if (!lastName) missing.push('lastName');
+  if (!email) missing.push('email');
+  if (!phone) missing.push('phone');
+  if (!llcName) missing.push('llcName');
+  for (const [key, value] of Object.entries({
+    billingAddressLine1: billingAddress.addressLine1,
+    billingCity: billingAddress.city,
+    billingState: billingAddress.state,
+    billingZipCode: billingAddress.zipCode,
+    billingCountry: billingAddress.country,
+  })) {
+    if (!value) missing.push(key);
+  }
+
+  return {
+    profile: {
+      omsIntermediaryId: userId,
+      omsCompanyName: llcName || [firstName, lastName].filter(Boolean).join(' ') || email || `OMS ${userId}`,
+      omsFirstName: firstName,
+      omsLastName: lastName,
+      omsPhone: phone,
+      omsEmail: email,
+      omsLlcName: llcName,
+      omsBillingAddress: billingAddress,
+    },
+    missing,
+  };
+}
+
+async function callWmsInternal<T = AnyRow>(path: string, body: AnyRow): Promise<T> {
+  if (!config.wmsApiUrl) {
+    const err = new Error('WMS_API_URL is not configured');
+    (err as any).status = 503;
+    throw err;
+  }
+  if (!config.internalApiKey) {
+    const err = new Error('UNIECONNECT_INTERNAL_API_KEY is not configured');
+    (err as any).status = 503;
+    throw err;
+  }
+  const res = await fetch(`${config.wmsApiUrl}/api/v1${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Internal-Api-Key': config.internalApiKey,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => ({}))) as AnyRow;
+  if (!res.ok) {
+    const err = new Error(String(data.message || data.error || `WMS request failed with ${res.status}`));
+    (err as any).status = res.status;
+    (err as any).payload = data;
+    throw err;
+  }
+  return data as T;
+}
+
+const DEFAULT_WMS_BRIDGE_SCOPES = [
+  'inventory:read',
+  'inventory:update',
+  'orders:create',
+  'orders:update',
+  'asns:read',
+  'asns:create',
+  'asns:update',
+  'billing:read',
+  'events:write',
+  'disputes:write',
+  'account:deactivate',
+];
 
 export async function sqlModeRoutes(app: FastifyInstance) {
   app.get('/legacy/status', async () => ({
@@ -1302,15 +1406,144 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const code = trim(req.body?.connectionCode || req.body?.warehouseCode);
     if (!code) return reply.code(400).send({ error: 'connectionCode required' });
-    const facility = await one('SELECT * FROM facilities WHERE code = $1 AND (user_id = $2 OR user_id IS NULL)', [code, userId]) || await seedDefaultFacility(userId);
-    const link = await one(
-      `INSERT INTO oms_warehouse_links (user_id, facility_id, warehouse_code, connection_code, metadata)
-       VALUES ($1, $2, $3, $4, $5::jsonb)
-       ON CONFLICT (user_id, warehouse_code) DO UPDATE SET status = 'connected', connected_at = now(), metadata = EXCLUDED.metadata
-       RETURNING *`,
-      [userId, facility?.id || null, facility?.code || code, code, JSON.stringify({ connectedBy: 'sql_mode', connectedAt: new Date().toISOString() })],
-    );
-    return { success: true, message: 'Warehouse connected.', warehouseCode: link?.warehouse_code || code };
+    const { profile, missing } = await buildWmsOmsProfile(userId);
+    if (!profile || missing.length > 0) {
+      return reply.code(400).send({
+        error: 'profile_incomplete',
+        message: 'Complete your OMS company profile before connecting a warehouse.',
+        missingFields: missing,
+      });
+    }
+
+    try {
+      const connected = await callWmsInternal<{
+        warehouseCode: string;
+        omsIntermediaryId?: string;
+        wmsIntermediaryId: string;
+        message?: string;
+      }>('/internal/oms/connect', {
+        connectionCode: code,
+        ...profile,
+      });
+
+      const warehouseCode = trim(connected.warehouseCode);
+      const wmsOmsIntermediaryId = trim(connected.omsIntermediaryId);
+      const wmsIntermediaryId = trim(connected.wmsIntermediaryId);
+      if (!warehouseCode || !wmsOmsIntermediaryId || !wmsIntermediaryId) {
+        return reply.code(502).send({
+          error: 'wms_connect_invalid_response',
+          message: 'WMS connected the code but did not return a warehouse/intermediary identity.',
+        });
+      }
+
+      const credentialResponse = await callWmsInternal<{
+        clientId: string;
+        passkey: string;
+        credential?: {
+          scopes?: string[];
+          expiresAt?: string | null;
+          id?: string;
+        };
+      }>('/internal/oms/integration-credentials', {
+        warehouseCode,
+        omsIntermediaryId: wmsOmsIntermediaryId,
+        wmsIntermediaryId,
+        name: `UnieConnect bridge - ${warehouseCode}`,
+        scopes: DEFAULT_WMS_BRIDGE_SCOPES,
+        metadata: {
+          source: 'unieconnect_oms_connect',
+          connectionCode: code,
+        },
+      });
+
+      if (!credentialResponse.clientId || !credentialResponse.passkey) {
+        return reply.code(502).send({
+          error: 'wms_credential_invalid_response',
+          message: 'WMS connected the warehouse but did not return bridge credentials.',
+        });
+      }
+
+      await registerWmsCredential({
+        userId,
+        warehouseCode,
+        clientId: credentialResponse.clientId,
+        passkey: credentialResponse.passkey,
+        scopes: credentialResponse.credential?.scopes || DEFAULT_WMS_BRIDGE_SCOPES,
+        expiresAt: credentialResponse.credential?.expiresAt ? new Date(credentialResponse.credential.expiresAt) : null,
+        metadata: {
+          wmsCredentialId: credentialResponse.credential?.id,
+          wmsOmsIntermediaryId,
+          wmsIntermediaryId,
+          source: 'wms_internal_bootstrap',
+        },
+      });
+
+      const facility =
+        (await one('SELECT * FROM facilities WHERE code = $1 AND (user_id = $2 OR user_id IS NULL)', [warehouseCode, userId])) ||
+        (await seedDefaultFacility(userId));
+      const link = await one(
+        `INSERT INTO oms_warehouse_links (user_id, facility_id, warehouse_code, connection_code, metadata)
+         VALUES ($1, $2, $3, $4, $5::jsonb)
+         ON CONFLICT (user_id, warehouse_code) DO UPDATE SET
+          facility_id = EXCLUDED.facility_id,
+          status = 'connected',
+          connection_code = EXCLUDED.connection_code,
+          connected_at = now(),
+          metadata = EXCLUDED.metadata
+         RETURNING *`,
+        [
+          userId,
+          facility?.id || null,
+          warehouseCode,
+          code,
+          JSON.stringify({
+            connectedBy: 'wms_internal_connect',
+            connectedAt: new Date().toISOString(),
+            wmsIntermediaryId,
+            wmsOmsIntermediaryId,
+            wmsCredentialClientId: credentialResponse.clientId,
+          }),
+        ],
+      );
+
+      await writeLedger(userId, {
+        entityType: 'oms_wms_bridge',
+        entityId: link?.id || null,
+        eventType: 'warehouse_connected',
+        sourceSystem: 'wms',
+        summary: `Connected OMS account to WMS warehouse ${warehouseCode}.`,
+        payload: {
+          warehouseCode,
+          wmsOmsIntermediaryId,
+          wmsIntermediaryId,
+          clientId: credentialResponse.clientId,
+          scopes: credentialResponse.credential?.scopes || DEFAULT_WMS_BRIDGE_SCOPES,
+        },
+      });
+
+      return {
+        success: true,
+        message: connected.message || 'Warehouse connected.',
+        warehouseCode,
+        wmsOmsIntermediaryId,
+        wmsIntermediaryId,
+        credential: {
+          clientId: credentialResponse.clientId,
+          scopes: credentialResponse.credential?.scopes || DEFAULT_WMS_BRIDGE_SCOPES,
+          expiresAt: credentialResponse.credential?.expiresAt || null,
+        },
+      };
+    } catch (err: any) {
+      const status = Number(err?.status || 502);
+      const payload = err?.payload || {};
+      const message = String(err?.message || 'WMS connection failed');
+      req.log?.warn?.({ err: message, status, payload }, 'OMS-WMS connect failed');
+      return reply.code(status >= 400 && status < 600 ? status : 502).send({
+        error: payload.error || 'wms_connect_failed',
+        message,
+        details: payload,
+      });
+    }
   });
 
   app.get('/oms/warehouses', async (req: any, reply) => {
