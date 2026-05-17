@@ -906,6 +906,95 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     return data.map((row) => mapOrder(row));
   });
 
+  app.post('/orders', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const body = req.body || {};
+    const linesInput = Array.isArray(body.lines) ? body.lines : [];
+    if (!body.customerId) return reply.code(400).send({ error: 'customerId required' });
+    if (!linesInput.length) return reply.code(400).send({ error: 'at least one order line required' });
+
+    const customer = await one('SELECT * FROM customers WHERE id = $1 AND user_id = $2', [body.customerId, userId]);
+    if (!customer) return reply.code(400).send({ error: 'Customer must exist before creating an order' });
+
+    const normalizedLines: Array<{
+      itemId: string;
+      sku: string;
+      title: string;
+      quantity: number;
+      unitPrice: number;
+      totalPrice: number;
+      metadata: AnyRow;
+    }> = [];
+    for (const raw of linesInput) {
+      const quantity = Math.max(1, number(raw?.quantity, 1));
+      const unitPrice = money(raw?.unitPrice ?? raw?.unit_price ?? 0);
+      let item: AnyRow | null = null;
+      if (raw?.itemId) {
+        item = await one('SELECT * FROM catalog_items WHERE id = $1 AND user_id = $2', [raw.itemId, userId]);
+      } else if (trim(raw?.sku)) {
+        item = await one('SELECT * FROM catalog_items WHERE lower(sku) = lower($1) AND user_id = $2 ORDER BY updated_at DESC LIMIT 1', [trim(raw.sku), userId]);
+      }
+      if (!item) return reply.code(400).send({ error: `Item/SKU must exist before creating an order line${raw?.sku ? `: ${raw.sku}` : ''}` });
+      normalizedLines.push({
+        itemId: item.id,
+        sku: item.sku,
+        title: raw?.title || item.title,
+        quantity,
+        unitPrice,
+        totalPrice: money(quantity * unitPrice),
+        metadata: raw?.metadata || {},
+      });
+    }
+
+    const subtotal = money(normalizedLines.reduce((sum, line) => sum + line.totalPrice, 0));
+    const total = money(body.total ?? subtotal);
+    const result = await withPgTransaction(async (client) => {
+      const orderResult = await client.query(
+        `INSERT INTO orders
+          (user_id, customer_id, channel, external_order_id, order_number, status, paid, placed_at, totals, shipping_address, billing_address, metadata)
+         VALUES ($1, $2, COALESCE($3, 'manual'), $4, $5, COALESCE($6, 'open'), $7, COALESCE($8::timestamptz, now()), $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb)
+         RETURNING *`,
+        [
+          userId,
+          customer.id,
+          body.channel || 'manual',
+          trim(body.externalOrderId || body.external_order_id || body.orderNumber) || null,
+          trim(body.orderNumber || body.order_number || body.externalOrderId) || null,
+          body.status || 'open',
+          body.paid == null ? null : String(body.paid),
+          body.placedAt || body.placed_at || null,
+          JSON.stringify({ subtotal, total, currency: body.currency || 'USD', ...(body.totals || {}) }),
+          JSON.stringify(body.shippingAddress || body.shipping_address || {}),
+          JSON.stringify(body.billingAddress || body.billing_address || {}),
+          JSON.stringify(body.metadata || {}),
+        ],
+      );
+      const order = orderResult.rows[0];
+      const createdLines = [];
+      for (const line of normalizedLines) {
+        const lineResult = await client.query(
+          `INSERT INTO order_lines (user_id, order_id, item_id, sku, title, quantity, unit_price, total_price, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+           RETURNING *`,
+          [userId, order.id, line.itemId, line.sku, line.title, line.quantity, line.unitPrice, line.totalPrice, JSON.stringify(line.metadata)],
+        );
+        createdLines.push(lineResult.rows[0]);
+      }
+      return { order, lines: createdLines };
+    });
+
+    if (!result) return reply.code(500).send({ error: 'Postgres is not configured' });
+    await writeLedger(userId, {
+      entityType: 'order',
+      entityId: result.order.id,
+      eventType: 'created',
+      summary: `Manual OMS order ${result.order.order_number || result.order.external_order_id || result.order.id} created with ${result.lines.length} line item(s).`,
+      payload: { source: body.source || 'oms_manual', lineCount: result.lines.length, total },
+    });
+    return mapOrder(result.order, result.lines);
+  });
+
   app.get('/orders/:id', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
