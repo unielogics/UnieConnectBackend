@@ -15,6 +15,7 @@ import {
   getOmsOrders,
   getOmsSkuDetail,
   getOmsSkus,
+  getOmsSupplierActivity,
   getOmsSuppliers,
 } from '../services/oms-production.service';
 
@@ -84,6 +85,14 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getOmsSuppliers(userId);
+  });
+
+  fastify.get('/oms/suppliers/:supplierId/activity', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const detail = await getOmsSupplierActivity(userId, String(req.params?.supplierId || ''));
+    if (!detail) return reply.code(404).send({ error: 'Supplier not found' });
+    return detail;
   });
 
   fastify.post('/oms/shipment-wizard/drafts', async (req: any, reply) => {

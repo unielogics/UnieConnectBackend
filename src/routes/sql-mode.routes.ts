@@ -80,6 +80,59 @@ function addressText(address: any): string | null {
     .join(', ') || null;
 }
 
+function supplierMetadataFromBody(body: any) {
+  const metadata = { ...((body?.metadata && typeof body.metadata === 'object') ? body.metadata : {}) };
+  const pickupProfile = { ...((metadata as any).pickupProfile || {}) };
+  const pickupKeys = [
+    'loadingDock',
+    'maxVehicleSize',
+    'hoursOfOperation',
+    'equipmentRequired',
+    'appointmentRequired',
+    'dockAppointmentLeadTimeHours',
+    'liftgateRequired',
+    'insidePickup',
+    'palletExchange',
+    'pickupInstructions',
+    'contactName',
+  ];
+  pickupKeys.forEach((key) => {
+    if (body?.[key] !== undefined) (pickupProfile as any)[key] = body[key];
+  });
+  ['website', 'notes', 'onlineSupplier', 'paymentTerms', 'relationship'].forEach((key) => {
+    if (body?.[key] !== undefined) (metadata as any)[key] = body[key];
+  });
+  if (Object.keys(pickupProfile).length) {
+    (metadata as any).pickupProfile = pickupProfile;
+    if ((pickupProfile as any).hoursOfOperation !== undefined) {
+      (metadata as any).hoursOfOperation = (pickupProfile as any).hoursOfOperation;
+    }
+  }
+  return metadata;
+}
+
+function supplierPickupProfile(row: AnyRow) {
+  const metadata = json(row.metadata, {});
+  const pickup = metadata.pickupProfile || metadata.pickup || {};
+  return {
+    loadingDock: pickup.loadingDock ?? metadata.loadingDock ?? null,
+    maxVehicleSize: pickup.maxVehicleSize || metadata.maxVehicleSize || null,
+    hoursOfOperation: pickup.hoursOfOperation || metadata.hoursOfOperation || '',
+    equipmentRequired: Array.isArray(pickup.equipmentRequired)
+      ? pickup.equipmentRequired
+      : Array.isArray(metadata.equipmentRequired)
+        ? metadata.equipmentRequired
+        : [],
+    appointmentRequired: Boolean(pickup.appointmentRequired ?? metadata.appointmentRequired ?? false),
+    dockAppointmentLeadTimeHours: pickup.dockAppointmentLeadTimeHours ?? metadata.dockAppointmentLeadTimeHours ?? null,
+    liftgateRequired: Boolean(pickup.liftgateRequired ?? metadata.liftgateRequired ?? false),
+    insidePickup: Boolean(pickup.insidePickup ?? metadata.insidePickup ?? false),
+    palletExchange: Boolean(pickup.palletExchange ?? metadata.palletExchange ?? false),
+    pickupInstructions: pickup.pickupInstructions || metadata.pickupInstructions || '',
+    contactName: pickup.contactName || metadata.contactName || metadata.primaryContact || '',
+  };
+}
+
 function channelDisplay(row: AnyRow) {
   return row.display_name || row.shop_domain || row.selling_partner_id || row.external_account_id || row.channel;
 }
@@ -146,6 +199,8 @@ function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
 }
 
 function mapSupplier(row: AnyRow) {
+  const metadata = json(row.metadata, {});
+  const pickupProfile = supplierPickupProfile(row);
   return {
     _id: row.id,
     id: row.id,
@@ -155,7 +210,22 @@ function mapSupplier(row: AnyRow) {
     phone: row.phone,
     status: row.status,
     address: json(row.address, {}),
-    metadata: json(row.metadata, {}),
+    website: metadata.website || null,
+    notes: metadata.notes || null,
+    onlineSupplier: Boolean(metadata.onlineSupplier ?? false),
+    hoursOfOperation: pickupProfile.hoursOfOperation,
+    loadingDock: pickupProfile.loadingDock,
+    maxVehicleSize: pickupProfile.maxVehicleSize,
+    equipmentRequired: pickupProfile.equipmentRequired,
+    appointmentRequired: pickupProfile.appointmentRequired,
+    dockAppointmentLeadTimeHours: pickupProfile.dockAppointmentLeadTimeHours,
+    liftgateRequired: pickupProfile.liftgateRequired,
+    insidePickup: pickupProfile.insidePickup,
+    palletExchange: pickupProfile.palletExchange,
+    pickupInstructions: pickupProfile.pickupInstructions,
+    contactName: pickupProfile.contactName,
+    pickupProfile,
+    metadata,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
@@ -1154,10 +1224,11 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const body = req.body || {};
     if (!trim(body.name)) return reply.code(400).send({ error: 'name required' });
+    const metadata = supplierMetadataFromBody(body);
     const supplier = await one(
       `INSERT INTO suppliers (user_id, name, email, phone, status, address, metadata)
        VALUES ($1, $2, $3, $4, COALESCE($5, 'active'), $6::jsonb, $7::jsonb) RETURNING *`,
-      [userId, trim(body.name), normalizedEmail(body.email) || null, body.phone || null, body.status || 'active', JSON.stringify(body.address || {}), JSON.stringify(body.metadata || {})],
+      [userId, trim(body.name), normalizedEmail(body.email) || null, body.phone || null, body.status || 'active', JSON.stringify(body.address || {}), JSON.stringify(metadata)],
     );
     return mapSupplier(supplier || {});
   });
@@ -1181,12 +1252,32 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const body = req.body || {};
+    const hasMetadataPatch = body.metadata !== undefined
+      || [
+        'website',
+        'notes',
+        'onlineSupplier',
+        'paymentTerms',
+        'relationship',
+        'loadingDock',
+        'maxVehicleSize',
+        'hoursOfOperation',
+        'equipmentRequired',
+        'appointmentRequired',
+        'dockAppointmentLeadTimeHours',
+        'liftgateRequired',
+        'insidePickup',
+        'palletExchange',
+        'pickupInstructions',
+        'contactName',
+      ].some((key) => body[key] !== undefined);
+    const metadata = hasMetadataPatch ? supplierMetadataFromBody(body) : null;
     const supplier = await one(
       `UPDATE suppliers
        SET name = COALESCE($3, name), email = COALESCE($4, email), phone = COALESCE($5, phone), status = COALESCE($6, status),
            address = COALESCE($7::jsonb, address), metadata = metadata || COALESCE($8::jsonb, '{}'::jsonb), updated_at = now()
        WHERE id = $1 AND user_id = $2 RETURNING *`,
-      [req.params.id, userId, body.name ?? null, body.email === undefined ? null : normalizedEmail(body.email), body.phone ?? null, body.status ?? null, body.address === undefined ? null : JSON.stringify(body.address || {}), body.metadata === undefined ? null : JSON.stringify(body.metadata || {})],
+      [req.params.id, userId, body.name ?? null, body.email === undefined ? null : normalizedEmail(body.email), body.phone ?? null, body.status ?? null, body.address === undefined ? null : JSON.stringify(body.address || {}), metadata === null ? null : JSON.stringify(metadata)],
     );
     if (!supplier) return reply.code(404).send({ error: 'Not found' });
     return mapSupplier(supplier);

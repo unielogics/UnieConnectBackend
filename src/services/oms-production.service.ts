@@ -16,6 +16,80 @@ const money = (value: unknown) => Math.round(number(value) * 100) / 100;
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 
+function supplierPickupProfile(row: Row) {
+  const metadata = json(row.metadata, {});
+  const address = json(row.address, {});
+  const pickup = metadata.pickupProfile || metadata.pickup || {};
+  return {
+    loadingDock: pickup.loadingDock ?? metadata.loadingDock ?? null,
+    maxVehicleSize: pickup.maxVehicleSize || metadata.maxVehicleSize || null,
+    hoursOfOperation: pickup.hoursOfOperation || metadata.hoursOfOperation || row.hours_of_operation || '',
+    equipmentRequired: Array.isArray(pickup.equipmentRequired)
+      ? pickup.equipmentRequired
+      : Array.isArray(metadata.equipmentRequired)
+        ? metadata.equipmentRequired
+        : [],
+    appointmentRequired: Boolean(pickup.appointmentRequired ?? metadata.appointmentRequired ?? false),
+    dockAppointmentLeadTimeHours: pickup.dockAppointmentLeadTimeHours ?? metadata.dockAppointmentLeadTimeHours ?? null,
+    liftgateRequired: Boolean(pickup.liftgateRequired ?? metadata.liftgateRequired ?? false),
+    insidePickup: Boolean(pickup.insidePickup ?? metadata.insidePickup ?? false),
+    palletExchange: Boolean(pickup.palletExchange ?? metadata.palletExchange ?? false),
+    pickupInstructions: pickup.pickupInstructions || metadata.pickupInstructions || '',
+    contactName: pickup.contactName || metadata.contactName || metadata.primaryContact || '',
+    address,
+  };
+}
+
+function mapOmsSupplier(row: Row, skuCount = 0) {
+  const metadata = json(row.metadata, {});
+  const address = json(row.address, {});
+  const pickupProfile = supplierPickupProfile(row);
+  return {
+    id: String(row.id),
+    name: row.name,
+    email: row.email || null,
+    phone: row.phone || null,
+    status: row.status || 'active',
+    website: metadata.website || null,
+    notes: metadata.notes || null,
+    country: address.countryCode || address.country || metadata.country || null,
+    region: address.stateOrProvinceCode || address.state || address.city || metadata.region || null,
+    leadTime: metadata.leadTimeDays ?? metadata.leadTime,
+    onTime: metadata.onTimeRate ?? metadata.onTime,
+    qualityPass: metadata.qualityPassRate ?? metadata.qualityPass,
+    paymentTerms: metadata.paymentTerms,
+    relationship: metadata.relationship,
+    spend90d: metadata.spend90d,
+    spendYTD: metadata.spendYTD,
+    skuCount,
+    rating: metadata.rating,
+    contact: pickupProfile.contactName || row.email || row.phone || '',
+    skus: Array.isArray(metadata.skus) ? metadata.skus : [],
+    pickupProfile,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+    metadata,
+  };
+}
+
+function itemLines(value: unknown): any[] {
+  const lines = json(value, []);
+  return Array.isArray(lines) ? lines : [];
+}
+
+function lineQuantity(line: any) {
+  return number(line?.quantity ?? line?.qty ?? line?.units ?? line?.availableQuantity);
+}
+
+function sumItemUnits(lines: any[]) {
+  return lines.reduce((sum, line) => sum + lineQuantity(line), 0);
+}
+
+function requiresPlanDocument(plan: Row, key: 'requiresBol' | 'requiresLabels') {
+  const metadata = json(plan.metadata, {});
+  return Boolean(metadata[key] ?? metadata[key === 'requiresBol' ? 'requires_bol' : 'requires_labels']);
+}
+
 async function rows<T extends Row = Row>(sql: string, values: unknown[] = []): Promise<T[]> {
   if (!isPostgresConfigured()) return [];
   try {
@@ -474,11 +548,249 @@ export async function getOmsCustomers(userId: string) {
 }
 
 export async function getOmsSuppliers(userId: string) {
-  const [suppliers, locations] = await Promise.all([
+  const [suppliers, locations, skuCounts] = await Promise.all([
     rows('SELECT * FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200', [userId]),
     rows('SELECT * FROM ship_from_locations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200', [userId]),
+    rows<{ supplier_id: string; sku_count: string }>(
+      'SELECT supplier_id, COUNT(*)::text AS sku_count FROM catalog_items WHERE user_id = $1 AND supplier_id IS NOT NULL GROUP BY supplier_id',
+      [userId],
+    ),
   ]);
-  return { suppliers, locations };
+  const countBySupplier = new Map(skuCounts.map((row) => [String(row.supplier_id), number(row.sku_count)]));
+  return {
+    suppliers: suppliers.map((supplier) => mapOmsSupplier(supplier, countBySupplier.get(String(supplier.id)) || 0)),
+    locations,
+  };
+}
+
+export async function getOmsSupplierActivity(userId: string, supplierId: string) {
+  const supplier = await one('SELECT * FROM suppliers WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, supplierId]);
+  if (!supplier) return null;
+
+  const [skus, shipmentPlans, asns, orderRows, invoiceRows, activityLogs, ledgerRows] = await Promise.all([
+    rows(
+      `SELECT id, sku, title, wms_inventory, updated_at
+       FROM catalog_items
+       WHERE user_id = $1 AND supplier_id = $2
+       ORDER BY updated_at DESC LIMIT 100`,
+      [userId, supplierId],
+    ),
+    rows(
+      `SELECT sp.*, f.code AS facility_code, f.name AS facility_name
+       FROM shipment_plans sp
+       LEFT JOIN facilities f ON f.id = sp.facility_id
+       WHERE sp.user_id = $1 AND sp.supplier_id = $2
+       ORDER BY sp.created_at DESC LIMIT 100`,
+      [userId, supplierId],
+    ),
+    rows(
+      `SELECT a.*, sp.internal_shipment_id, sp.shipment_title
+       FROM asns a
+       INNER JOIN shipment_plans sp ON sp.id = a.shipment_plan_id
+       WHERE a.user_id = $1 AND sp.supplier_id = $2
+       ORDER BY a.created_at DESC LIMIT 100`,
+      [userId, supplierId],
+    ),
+    rows(
+      `SELECT o.id, o.order_number, o.status, o.channel, o.placed_at, o.created_at,
+              COALESCE(SUM(ol.quantity), 0)::text AS units,
+              COALESCE(SUM(ol.total_price), 0)::text AS revenue
+       FROM orders o
+       INNER JOIN order_lines ol ON ol.order_id = o.id
+       INNER JOIN catalog_items ci ON ci.id = ol.item_id
+       WHERE o.user_id = $1 AND ci.supplier_id = $2
+       GROUP BY o.id
+       ORDER BY COALESCE(o.placed_at, o.created_at) DESC LIMIT 100`,
+      [userId, supplierId],
+    ),
+    rows(
+      `SELECT il.*, sp.internal_shipment_id, sp.shipment_title
+       FROM invoice_lines il
+       INNER JOIN shipment_plans sp ON sp.id = il.shipment_plan_id
+       WHERE il.user_id = $1 AND sp.supplier_id = $2
+       ORDER BY il.created_at DESC LIMIT 100`,
+      [userId, supplierId],
+    ),
+    rows(
+      `SELECT sal.*, sp.internal_shipment_id, sp.shipment_title
+       FROM shipment_activity_log sal
+       INNER JOIN shipment_plans sp ON sp.id = sal.shipment_plan_id
+       WHERE sal.user_id = $1 AND sp.supplier_id = $2
+       ORDER BY sal.created_at DESC LIMIT 100`,
+      [userId, supplierId],
+    ),
+    rows(
+      `SELECT id, entity_type, entity_id, event_type, source_system, summary, payload, confidence, created_at
+       FROM oms_execution_ledger
+       WHERE user_id = $1
+         AND (
+           (entity_type = 'supplier' AND entity_id = $2)
+           OR payload::text ILIKE $3
+         )
+       ORDER BY created_at DESC LIMIT 50`,
+      [userId, supplierId, `%${supplierId}%`],
+    ),
+  ]);
+
+  const records: Array<Record<string, unknown>> = [];
+
+  skus.forEach((sku) => {
+    const inv = json(sku.wms_inventory, {});
+    records.push({
+      id: sku.id,
+      type: 'sku',
+      title: sku.title || sku.sku,
+      subtitle: sku.sku,
+      status: 'active',
+      units: number(inv.available),
+      date: iso(sku.updated_at),
+      target: 'sku-detail',
+      targetId: sku.id,
+    });
+  });
+
+  shipmentPlans.forEach((plan) => {
+    const lines = itemLines(plan.items);
+    const units = sumItemUnits(lines);
+    records.push({
+      id: plan.id,
+      type: 'shipment_plan',
+      title: plan.shipment_title || plan.internal_shipment_id || 'Shipment plan',
+      subtitle: plan.internal_shipment_id || 'OMS shipment',
+      status: plan.status || 'draft',
+      units,
+      date: iso(plan.estimated_arrival_date || plan.order_date || plan.created_at),
+      summary: `${lines.length} SKU lines · ${plan.facility_name || plan.facility_code || 'auto-routed warehouse'}`,
+      target: 'shipments',
+      targetId: plan.id,
+    });
+    if (requiresPlanDocument(plan, 'requiresBol')) {
+      records.push({
+        id: `${plan.id}:bol`,
+        type: 'bol',
+        title: `BOL for ${plan.internal_shipment_id || plan.shipment_title || 'shipment'}`,
+        subtitle: 'Bill of lading requirement',
+        status: plan.status || 'draft',
+        units,
+        date: iso(plan.created_at),
+        summary: 'Required by shipment plan and visible to Cortex dispatch.',
+        target: 'shipments',
+        targetId: plan.id,
+      });
+    }
+    if (requiresPlanDocument(plan, 'requiresLabels')) {
+      records.push({
+        id: `${plan.id}:labels`,
+        type: 'label',
+        title: `Labels for ${plan.internal_shipment_id || plan.shipment_title || 'shipment'}`,
+        subtitle: 'Supplier label submission',
+        status: plan.status || 'draft',
+        units,
+        date: iso(plan.created_at),
+        summary: 'Label workflow requested for supplier pickup/receiving.',
+        target: 'shipments',
+        targetId: plan.id,
+      });
+    }
+  });
+
+  asns.forEach((asn) => {
+    const payload = json(asn.payload, {});
+    records.push({
+      id: asn.id,
+      type: 'asn',
+      title: asn.asn_number || 'Projected ASN',
+      subtitle: asn.shipment_title || asn.internal_shipment_id || 'Advance shipment notice',
+      status: asn.status || 'created',
+      units: sumItemUnits(itemLines(payload.selectedItems || payload.items)),
+      date: iso(asn.created_at),
+      summary: payload.requiresWmsTruth ? 'Projected until WMS confirms receiving truth.' : 'ASN created for WMS receiving.',
+      target: 'shipments',
+      targetId: asn.shipment_plan_id,
+    });
+  });
+
+  orderRows.forEach((order) => {
+    records.push({
+      id: order.id,
+      type: 'order',
+      title: order.order_number || order.id,
+      subtitle: order.channel || 'OMS order',
+      status: order.status || 'open',
+      units: number(order.units),
+      amount: money(order.revenue),
+      date: iso(order.placed_at || order.created_at),
+      summary: 'Demand tied to SKUs supplied by this supplier.',
+      target: 'orders',
+      targetId: order.id,
+    });
+  });
+
+  invoiceRows.forEach((line) => {
+    records.push({
+      id: line.id,
+      type: 'invoice',
+      title: line.description || 'Supplier-related invoice line',
+      subtitle: line.invoice_id || line.internal_shipment_id || 'Billing',
+      status: line.status || 'open',
+      amount: money(line.amount),
+      date: iso(line.created_at),
+      summary: line.shipment_title || 'Cost tied to supplier shipment activity.',
+      target: 'billing',
+      targetId: line.id,
+    });
+  });
+
+  activityLogs.forEach((log) => {
+    records.push({
+      id: log.id,
+      type: 'activity',
+      title: log.action || 'Shipment activity',
+      subtitle: log.internal_shipment_id || log.shipment_title || 'Activity log',
+      status: 'logged',
+      date: iso(log.created_at),
+      summary: log.summary || 'Supplier shipment activity recorded.',
+      target: 'shipments',
+      targetId: log.shipment_plan_id,
+    });
+  });
+
+  ledgerRows.forEach((event) => {
+    records.push({
+      id: event.id,
+      type: 'ledger',
+      title: event.event_type || 'Ledger event',
+      subtitle: event.source_system || 'OMS ledger',
+      status: 'logged',
+      date: iso(event.created_at),
+      confidence: event.confidence == null ? null : number(event.confidence),
+      summary: event.summary,
+      target: 'ledger',
+      targetId: event.id,
+    });
+  });
+
+  records.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+
+  const shipmentUnits = shipmentPlans.reduce((sum, plan) => sum + sumItemUnits(itemLines(plan.items)), 0);
+  const orderUnits = orderRows.reduce((sum, order) => sum + number(order.units), 0);
+  const documents = records.filter((record) => record.type === 'asn' || record.type === 'bol' || record.type === 'label').length;
+
+  return {
+    supplier: mapOmsSupplier(supplier, skus.length),
+    summary: {
+      skus: skus.length,
+      shipmentPlans: shipmentPlans.length,
+      asns: asns.length,
+      documents,
+      orderCount: orderRows.length,
+      orderUnits,
+      shipmentUnits,
+      invoiceAmount: money(invoiceRows.reduce((sum, line) => sum + number(line.amount), 0)),
+      lastActivityAt: records[0]?.date || iso(supplier.updated_at),
+    },
+    records,
+  };
 }
 
 export async function createShipmentWizardDraft(userId: string, body: any) {
@@ -545,6 +857,8 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     };
   }
   const shipFrom = shipFromLocationId ? await one('SELECT * FROM ship_from_locations WHERE id = $1 AND user_id = $2', [shipFromLocationId, userId]) : null;
+  const supplier = supplierId ? await one('SELECT * FROM suppliers WHERE id = $1 AND user_id = $2', [supplierId, userId]) : null;
+  const supplierPickup = supplier ? supplierPickupProfile(supplier) : null;
   const plan = await one(
     `INSERT INTO shipment_plans
       (user_id, supplier_id, ship_from_location_id, facility_id, internal_shipment_id, shipment_title, status, prep_services_only, estimated_arrival_date, ship_from_address, items, metadata)
@@ -565,6 +879,9 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
         autoRoutedBy: 'cortex_oms',
         warehouseSelectionHiddenFromClient: true,
         requiresWmsTruth: true,
+        requiresBol: body?.requiresBol !== false,
+        requiresLabels: Boolean(body?.requiresLabels),
+        supplierPickupProfile: supplierPickup,
       }),
     ],
   );
@@ -588,6 +905,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     selectedItems,
     requiresBol: body?.requiresBol !== false,
     requiresLabels: Boolean(body?.requiresLabels),
+    supplierPickupProfile: supplierPickup,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
 
   await writeOmsLedgerEvent({
