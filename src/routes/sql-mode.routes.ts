@@ -292,6 +292,7 @@ function mapUser(row: AnyRow) {
     firstName: row.first_name,
     lastName: row.last_name,
     phone: row.phone,
+    avatarUrl: row.avatar_url,
     llcName: row.llc_name,
     billingAddress: json(row.billing_address, null),
     enabledFeatures: row.enabled_features || [],
@@ -1555,7 +1556,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
 
   app.get('/users', async (req: any, reply) => {
     if (!requireManager(req, reply)) return;
-    const data = await rows('SELECT id, email, role, first_name, last_name, phone, llc_name, billing_address, enabled_features, last_login_at, created_at, updated_at FROM app_users ORDER BY created_at DESC');
+    const data = await rows('SELECT id, email, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at, created_at, updated_at FROM app_users ORDER BY created_at DESC');
     return { users: data.map(mapUser) };
   });
 
@@ -1570,7 +1571,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const user = await one(
       `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, email, role, first_name, last_name, phone, llc_name, billing_address, enabled_features, last_login_at, created_at, updated_at`,
+       RETURNING id, email, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at, created_at, updated_at`,
       [randomUUID(), email, passwordHash, role, body.firstName || null, body.lastName || null, body.phone || null],
     );
     await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [user?.id, 'created_by_manager', JSON.stringify({ managerId })]);

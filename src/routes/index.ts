@@ -3,6 +3,7 @@ import { healthRoutes } from './health';
 import { addressRoutes } from './address.routes';
 import { cortexRoutes } from './cortex.routes';
 import { omsProductionRoutes } from './oms-production.routes';
+import { omsCustomizationRoutes } from './oms-customization.routes';
 import { sqlModeRoutes } from './sql-mode.routes';
 import { wmsIntegrationRoutes } from './wms-integration.routes';
 import { supportRoutes } from './support.routes';
@@ -12,6 +13,7 @@ export async function registerRoutes(app: FastifyInstance) {
   await healthRoutes(app);
   await addressRoutes(app);
   await omsProductionRoutes(app);
+  await omsCustomizationRoutes(app);
   await supportRoutes(app);
   await uploadRoutes(app);
   await cortexRoutes(app);

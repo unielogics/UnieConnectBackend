@@ -10,6 +10,7 @@ type SqlUserRow = {
   first_name: string | null;
   last_name: string | null;
   phone: string | null;
+  avatar_url: string | null;
   llc_name: string | null;
   billing_address: any;
   enabled_features: string[] | null;
@@ -23,6 +24,7 @@ export type AppUserProfile = {
   firstName?: string;
   lastName?: string;
   phone?: string;
+  avatarUrl?: string;
   llcName?: string;
   billingAddress?: any;
   enabledFeatures?: string[];
@@ -40,6 +42,7 @@ const toProfile = (row: SqlUserRow): AppUserProfile => {
   if (row.first_name) profile.firstName = row.first_name;
   if (row.last_name) profile.lastName = row.last_name;
   if (row.phone) profile.phone = row.phone;
+  if (row.avatar_url) profile.avatarUrl = row.avatar_url;
   if (row.llc_name) profile.llcName = row.llc_name;
   if (row.billing_address) profile.billingAddress = row.billing_address;
   return profile;
@@ -52,7 +55,7 @@ export function isSqlAuthEnabled() {
 export async function findSqlUserById(userId: string): Promise<AppUserProfile | null> {
   if (!isSqlAuthEnabled()) return null;
   const res = await pgQuery<SqlUserRow>(
-    `SELECT id, email, password_hash, role, first_name, last_name, phone, llc_name, billing_address, enabled_features, last_login_at
+    `SELECT id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at
      FROM app_users WHERE id = $1 LIMIT 1`,
     [userId],
   );
@@ -64,7 +67,7 @@ export async function findSqlUserByEmail(email: string): Promise<(AppUserProfile
   if (!isSqlAuthEnabled()) return null;
   const normalizedEmail = email.toLowerCase().trim();
   const res = await pgQuery<SqlUserRow>(
-    `SELECT id, email, password_hash, role, first_name, last_name, phone, llc_name, billing_address, enabled_features, last_login_at
+    `SELECT id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at
      FROM app_users WHERE email = $1 LIMIT 1`,
     [normalizedEmail],
   );
@@ -91,19 +94,21 @@ export async function updateSqlUserProfile(userId: string, body: any): Promise<A
     firstName: body.firstName !== undefined ? (body.firstName ? String(body.firstName).trim() : null) : current.firstName || null,
     lastName: body.lastName !== undefined ? (body.lastName ? String(body.lastName).trim() : null) : current.lastName || null,
     phone: body.phone !== undefined ? (body.phone ? String(body.phone).trim() : null) : current.phone || null,
+    avatarUrl: body.avatarUrl !== undefined ? (body.avatarUrl ? String(body.avatarUrl).trim() : null) : current.avatarUrl || null,
     llcName: body.llcName !== undefined ? (body.llcName ? String(body.llcName).trim() : null) : current.llcName || null,
     billingAddress: body.billingAddress !== undefined ? body.billingAddress || null : current.billingAddress || null,
   };
   const res = await pgQuery<SqlUserRow>(
     `UPDATE app_users
-     SET first_name = $2, last_name = $3, phone = $4, llc_name = $5, billing_address = $6::jsonb, updated_at = now()
+     SET first_name = $2, last_name = $3, phone = $4, avatar_url = $5, llc_name = $6, billing_address = $7::jsonb, updated_at = now()
      WHERE id = $1
-     RETURNING id, email, password_hash, role, first_name, last_name, phone, llc_name, billing_address, enabled_features, last_login_at`,
+     RETURNING id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at`,
     [
       userId,
       next.firstName,
       next.lastName,
       next.phone,
+      next.avatarUrl,
       next.llcName,
       next.billingAddress ? JSON.stringify(next.billingAddress) : null,
     ],

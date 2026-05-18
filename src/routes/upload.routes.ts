@@ -3,6 +3,7 @@ import { Readable } from 'stream';
 import { FastifyInstance } from 'fastify';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { config } from '../config/env';
+import { pgQuery } from '../db/postgres';
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 
@@ -75,7 +76,9 @@ export async function uploadRoutes(app: FastifyInstance) {
       });
     }
 
-    const key = `oms/${userId}/catalog-images/${randomUUID()}-${filename}`;
+    const purpose = String(body.purpose || '').toLowerCase();
+    const folder = purpose === 'profile-avatar' ? 'profile-avatars' : 'catalog-images';
+    const key = `oms/${userId}/${folder}/${randomUUID()}-${filename}`;
     await s3().send(
       new PutObjectCommand({
         Bucket: config.uploads.s3Bucket,
@@ -91,13 +94,19 @@ export async function uploadRoutes(app: FastifyInstance) {
       }),
     );
 
+    const url = imageResponseUrl(key);
+    if (purpose === 'profile-avatar') {
+      await pgQuery('UPDATE app_users SET avatar_url = $2, updated_at = now() WHERE id = $1', [userId, url]);
+    }
+
     return {
       key,
       bucket: config.uploads.s3Bucket,
       contentType,
       size: image.length,
-      url: imageResponseUrl(key),
+      url,
       storage: 's3',
+      purpose: purpose || 'catalog-image',
     };
   });
 
