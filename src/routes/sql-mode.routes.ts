@@ -6,6 +6,7 @@ import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
+import { buildEbayAuthUrl, exchangeEbayCodeForToken } from '../services/ebay';
 
 type AnyRow = Record<string, any>;
 
@@ -93,6 +94,15 @@ function mapChannel(row: AnyRow) {
     updatedAt: iso(row.updated_at),
     label: channelDisplay(row),
   };
+}
+
+function wantsJson(req: any) {
+  return trim(req.query?.format).toLowerCase() === 'json' || String(req.headers?.accept || '').includes('application/json');
+}
+
+function redirectOrJson(req: any, reply: any, url: string, extra: Record<string, unknown> = {}) {
+  if (wantsJson(req)) return reply.send({ url, ...extra });
+  return reply.redirect(url);
 }
 
 function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
@@ -517,7 +527,10 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       redirect_uri: redirectUri,
       state,
     });
-    return reply.redirect(`https://${shop}/admin/oauth/authorize?${params.toString()}`);
+    return redirectOrJson(req, reply, `https://${shop}/admin/oauth/authorize?${params.toString()}`, {
+      channel: 'shopify',
+      state,
+    });
   });
 
   app.get('/auth/shopify/callback', async (req: any, reply) => {
@@ -559,6 +572,30 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         'INSERT INTO oauth_states (user_id, channel, state, payload) VALUES ($1, $2, $3, $4::jsonb)',
         [userId, channel, state, JSON.stringify(req.query || {})],
       );
+
+      if (channel === 'ebay') {
+        if (!config.ebay.clientId || !config.ebay.ruName) {
+          await one(
+            `INSERT INTO marketplace_connections (user_id, channel, status, display_name, metadata)
+             VALUES ($1, 'ebay', 'needs_configuration', 'EBAY pending configuration', $2::jsonb)
+             RETURNING *`,
+            [userId, JSON.stringify({ state, reason: 'missing_ebay_oauth_env' })],
+          );
+          return reply.code(503).send({ error: 'eBay OAuth is missing server configuration', state });
+        }
+        await one(
+          `INSERT INTO marketplace_connections (user_id, channel, status, display_name, metadata)
+           VALUES ($1, 'ebay', 'needs_authorization', 'EBAY pending authorization', $2::jsonb)
+           RETURNING *`,
+          [userId, JSON.stringify({ state, provider: 'ebay' })],
+        );
+        return redirectOrJson(req, reply, buildEbayAuthUrl(state), {
+          status: 'authorization_url_created',
+          channel,
+          state,
+        });
+      }
+
       await one(
         `INSERT INTO marketplace_connections (user_id, channel, status, display_name, metadata)
          VALUES ($1, $2, 'needs_authorization', $3, $4::jsonb)
@@ -578,6 +615,71 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       const saved = await one('SELECT * FROM oauth_states WHERE state = $1 AND channel = $2 AND used_at IS NULL AND expires_at > now()', [state, channel]);
       if (!saved) return reply.code(400).send({ error: `Invalid ${channel} OAuth state` });
       await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
+
+      if (channel === 'ebay' && trim(req.query?.code)) {
+        try {
+          const token = await exchangeEbayCodeForToken(trim(req.query?.code));
+          const scopes = config.ebay.scope.replace(/\\/g, ' ').split(/\s+/).filter(Boolean);
+          const metadata = {
+            state,
+            callbackReceivedAt: new Date().toISOString(),
+            marketplaceId: config.ebay.marketplaceId,
+            tokenSource: 'oauth_callback',
+          };
+          let account = await one(
+            `UPDATE marketplace_connections
+             SET status = 'connected',
+                 display_name = COALESCE(display_name, 'eBay'),
+                 marketplace_id = $3,
+                 access_token_enc = $4,
+                 refresh_token_enc = COALESCE($5, refresh_token_enc),
+                 token_expires_at = $6,
+                 scopes = $7,
+                 last_sync_at = now(),
+                 updated_at = now(),
+                 metadata = metadata || $8::jsonb
+             WHERE user_id = $1 AND channel = 'ebay' AND metadata->>'state' = $2
+             RETURNING *`,
+            [
+              saved.user_id,
+              state,
+              config.ebay.marketplaceId,
+              token.accessToken,
+              token.refreshToken || null,
+              token.expiresAt || null,
+              scopes,
+              JSON.stringify(metadata),
+            ],
+          );
+          if (!account) {
+            account = await one(
+              `INSERT INTO marketplace_connections
+                (user_id, channel, status, display_name, marketplace_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, metadata, last_sync_at)
+               VALUES ($1, 'ebay', 'connected', 'eBay', $2, $3, $4, $5, $6, $7::jsonb, now())
+               RETURNING *`,
+              [
+                saved.user_id,
+                config.ebay.marketplaceId,
+                token.accessToken,
+                token.refreshToken || null,
+                token.expiresAt || null,
+                scopes,
+                JSON.stringify(metadata),
+              ],
+            );
+          }
+          await writeLedger(saved.user_id, {
+            entityType: 'marketplace_connection',
+            entityId: account?.id || null,
+            eventType: 'connected',
+            summary: 'eBay marketplace connected through OAuth.',
+          });
+          return reply.redirect(`${config.frontendOrigin.replace(/\/+$/, '')}/oms?view=connections&connected=ebay`);
+        } catch (err: any) {
+          return reply.code(400).send({ error: err?.message || 'eBay token exchange failed' });
+        }
+      }
+
       await pgQuery(
         `UPDATE marketplace_connections
          SET status = 'needs_token_exchange', updated_at = now(), metadata = metadata || $3::jsonb

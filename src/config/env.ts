@@ -8,6 +8,7 @@ const normalizeRedirectUri = (value: string) => value.trim().replace(/^=+/, '');
 
 export const config = {
   port: Number(process.env.PORT || 4000),
+  apiBaseUrl: (process.env.API_BASE_URL || process.env.APP_BASE_URL || `http://localhost:${process.env.PORT || 4000}`).replace(/\/+$/, ''),
   rabbitUrl: process.env.RABBITMQ_URL || '',
   shopify: {
     clientId: process.env.SHOPIFY_CLIENT_ID || '',
@@ -78,6 +79,11 @@ export const config = {
   },
   geoapify: {
     apiKey: process.env.GEOAPIFY_API_KEY || '',
+  },
+  uploads: {
+    s3Bucket: process.env.S3_UPLOAD_BUCKET || process.env.UPLOADS_S3_BUCKET || '',
+    s3Region: process.env.S3_UPLOAD_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1',
+    maxImageBytes: Number(process.env.S3_UPLOAD_MAX_IMAGE_BYTES || 8 * 1024 * 1024),
   },
   corsOrigins: (process.env.CORS_ORIGINS || '')
     .split(',')

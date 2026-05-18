@@ -11,7 +11,7 @@ import { authRoutes } from './routes/auth.routes';
 import { config } from './config/env';
 
 async function start() {
-  const app = Fastify({ logger: true });
+  const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
 
   // Request/response tracing for observability
   app.addHook('onRequest', async (req) => {
