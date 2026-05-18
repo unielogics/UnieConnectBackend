@@ -6,6 +6,17 @@ import { config } from '../config/env';
 import { pgQuery } from '../db/postgres';
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const FILE_TYPES = new Set([
+  ...IMAGE_TYPES,
+  'application/pdf',
+  'text/csv',
+  'text/plain',
+  'application/json',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
 
 function requireUser(req: any, reply: any): string | null {
   const userId = req.user?.userId;
@@ -29,6 +40,10 @@ function decodeImage(dataBase64: string) {
 
 function imageResponseUrl(key: string) {
   return `${config.apiBaseUrl}/api/v1/uploads/images?key=${encodeURIComponent(key)}`;
+}
+
+function fileResponseUrl(key: string) {
+  return `${config.apiBaseUrl}/api/v1/uploads/files?key=${encodeURIComponent(key)}`;
 }
 
 async function streamToBuffer(body: any): Promise<Buffer> {
@@ -110,6 +125,61 @@ export async function uploadRoutes(app: FastifyInstance) {
     };
   });
 
+  app.post('/uploads/files', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    if (!config.uploads.s3Bucket) {
+      return reply.code(503).send({ error: 'S3 upload bucket is not configured' });
+    }
+
+    const body = req.body || {};
+    const filename = safeFileName(body.filename || 'attachment');
+    const contentType = String(body.contentType || 'application/octet-stream').toLowerCase();
+    if (!FILE_TYPES.has(contentType)) {
+      return reply.code(400).send({ error: 'Unsupported attachment type' });
+    }
+    if (!body.dataBase64) {
+      return reply.code(400).send({ error: 'dataBase64 is required' });
+    }
+
+    const file = decodeImage(String(body.dataBase64));
+    if (!file.length || file.length > config.uploads.maxFileBytes) {
+      return reply.code(400).send({
+        error: `File must be between 1 byte and ${Math.floor(config.uploads.maxFileBytes / 1024 / 1024)} MB`,
+      });
+    }
+
+    const purpose = String(body.purpose || 'support-attachment').toLowerCase();
+    const folder = purpose === 'support-attachment' ? 'support-attachments' : 'files';
+    const key = `oms/${userId}/${folder}/${randomUUID()}-${filename}`;
+    await s3().send(
+      new PutObjectCommand({
+        Bucket: config.uploads.s3Bucket,
+        Key: key,
+        Body: file,
+        ContentType: contentType,
+        CacheControl: 'private, max-age=86400',
+        Metadata: {
+          userId,
+          originalFilename: filename,
+          source: 'unieconnect-oms',
+          purpose,
+        },
+      }),
+    );
+
+    return {
+      key,
+      bucket: config.uploads.s3Bucket,
+      contentType,
+      filename,
+      size: file.length,
+      url: fileResponseUrl(key),
+      storage: 's3',
+      purpose,
+    };
+  });
+
   app.get('/uploads/images', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
@@ -120,6 +190,31 @@ export async function uploadRoutes(app: FastifyInstance) {
     const key = String(req.query?.key || '').trim();
     if (!key || !key.startsWith(`oms/${userId}/`)) {
       return reply.code(403).send({ error: 'Image is not available for this account' });
+    }
+
+    const object = await s3().send(
+      new GetObjectCommand({
+        Bucket: config.uploads.s3Bucket,
+        Key: key,
+      }),
+    );
+    const data = await streamToBuffer(object.Body);
+    reply
+      .header('Content-Type', object.ContentType || 'application/octet-stream')
+      .header('Cache-Control', object.CacheControl || 'private, max-age=86400');
+    return reply.send(data);
+  });
+
+  app.get('/uploads/files', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    if (!config.uploads.s3Bucket) {
+      return reply.code(503).send({ error: 'S3 upload bucket is not configured' });
+    }
+
+    const key = String(req.query?.key || '').trim();
+    if (!key || !key.startsWith(`oms/${userId}/`)) {
+      return reply.code(403).send({ error: 'File is not available for this account' });
     }
 
     const object = await s3().send(

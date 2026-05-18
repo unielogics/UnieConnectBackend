@@ -84,6 +84,7 @@ export const config = {
     s3Bucket: process.env.S3_UPLOAD_BUCKET || process.env.UPLOADS_S3_BUCKET || '',
     s3Region: process.env.S3_UPLOAD_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1',
     maxImageBytes: Number(process.env.S3_UPLOAD_MAX_IMAGE_BYTES || 8 * 1024 * 1024),
+    maxFileBytes: Number(process.env.S3_UPLOAD_MAX_FILE_BYTES || 15 * 1024 * 1024),
   },
   corsOrigins: (process.env.CORS_ORIGINS || '')
     .split(',')

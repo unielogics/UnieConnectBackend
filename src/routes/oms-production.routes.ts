@@ -11,6 +11,7 @@ import {
   getInventoryPlan,
   getLabelAudit,
   getLedger,
+  getOmsAsns,
   getOmsCustomers,
   getOmsOrders,
   getOmsSkuDetail,
@@ -73,6 +74,12 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getOmsOrders(userId);
+  });
+
+  fastify.get('/oms/asns', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getOmsAsns(userId);
   });
 
   fastify.get('/oms/customers', async (req: any, reply) => {

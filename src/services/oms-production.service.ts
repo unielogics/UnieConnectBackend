@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { FastifyBaseLogger } from 'fastify';
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
+import { publicEntityId } from '../lib/public-id';
 import { LabelAuditFinding } from './oms-production.types';
 import { postCortex, cortexConfigStatus } from './cortex-orchestration';
 
@@ -46,6 +47,8 @@ function mapOmsSupplier(row: Row, skuCount = 0) {
   const pickupProfile = supplierPickupProfile(row);
   return {
     id: String(row.id),
+    publicId: publicEntityId('SU', row.id),
+    displayId: publicEntityId('SU', row.id),
     name: row.name,
     email: row.email || null,
     phone: row.phone || null,
@@ -539,12 +542,93 @@ export async function getOmsOrders(userId: string) {
      ORDER BY COALESCE(o.placed_at, o.created_at) DESC LIMIT 200`,
     [userId],
   );
-  return { orders };
+  return {
+    orders: orders.map((order) => {
+      const totals = json(order.totals, {});
+      return {
+        ...order,
+        id: order.id,
+        publicId: publicEntityId('OR', order.id),
+        displayId: publicEntityId('OR', order.id),
+        customerDisplayId: order.customer_id ? publicEntityId('CU', order.customer_id) : null,
+        customer: order.customer_name || order.customer_email || undefined,
+        ch: order.channel || order.account_channel || 'manual',
+        total: money(totals.total || totals.subtotal || 0),
+        placedAt: iso(order.placed_at),
+        createdAt: iso(order.created_at),
+        updatedAt: iso(order.updated_at),
+      };
+    }),
+  };
+}
+
+export async function getOmsAsns(userId: string) {
+  const asns = await rows(
+    `SELECT a.*,
+            sp.internal_shipment_id,
+            sp.shipment_title,
+            sp.status AS shipment_status,
+            sp.supplier_id,
+            sp.facility_id,
+            sp.estimated_arrival_date,
+            sp.items,
+            s.name AS supplier_name,
+            f.code AS facility_code,
+            f.name AS facility_name
+     FROM asns a
+     LEFT JOIN shipment_plans sp ON sp.id = a.shipment_plan_id AND sp.user_id = a.user_id
+     LEFT JOIN suppliers s ON s.id = sp.supplier_id AND s.user_id = a.user_id
+     LEFT JOIN facilities f ON f.id = sp.facility_id
+     WHERE a.user_id = $1
+     ORDER BY COALESCE(a.updated_at, a.created_at) DESC
+     LIMIT 200`,
+    [userId],
+  );
+  return {
+    asns: asns.map((asn) => {
+      const items = json(asn.items, []);
+      const units = Array.isArray(items)
+        ? items.reduce((sum, item) => sum + number(item.quantity || item.units || 0), 0)
+        : 0;
+      return {
+        id: asn.id,
+        _id: asn.id,
+        publicId: publicEntityId('AS', asn.id),
+        displayId: publicEntityId('AS', asn.id),
+        asnNumber: asn.asn_number,
+        status: asn.status || 'created',
+        shipmentPlanId: asn.shipment_plan_id,
+        shipmentDisplayId: asn.shipment_plan_id ? publicEntityId('SH', asn.shipment_plan_id) : null,
+        shipmentTitle: asn.shipment_title || asn.internal_shipment_id || 'Inbound shipment',
+        shipmentStatus: asn.shipment_status || null,
+        supplierId: asn.supplier_id || null,
+        supplierDisplayId: asn.supplier_id ? publicEntityId('SU', asn.supplier_id) : null,
+        supplierName: asn.supplier_name || null,
+        facilityId: asn.facility_id || null,
+        facilityCode: asn.facility_code || null,
+        facilityName: asn.facility_name || null,
+        estimatedArrivalDate: iso(asn.estimated_arrival_date),
+        units,
+        payload: json(asn.payload, {}),
+        createdAt: iso(asn.created_at),
+        updatedAt: iso(asn.updated_at),
+      };
+    }),
+  };
 }
 
 export async function getOmsCustomers(userId: string) {
   const customers = await rows('SELECT * FROM customers WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200', [userId]);
-  return { customers };
+  return {
+    customers: customers.map((customer) => ({
+      ...customer,
+      id: customer.id,
+      publicId: publicEntityId('CU', customer.id),
+      displayId: publicEntityId('CU', customer.id),
+      createdAt: iso(customer.created_at),
+      updatedAt: iso(customer.updated_at),
+    })),
+  };
 }
 
 export async function getOmsSuppliers(userId: string) {

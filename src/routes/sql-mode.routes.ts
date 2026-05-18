@@ -5,6 +5,7 @@ import fetch from 'node-fetch';
 import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
+import { publicEntityId } from '../lib/public-id';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken } from '../services/ebay';
 
@@ -171,6 +172,8 @@ function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
   return {
     _id: row.id,
     id: row.id,
+    publicId: publicEntityId('SK', row.id),
+    displayId: publicEntityId('SK', row.id),
     userId: row.user_id,
     sku: row.sku,
     title: row.title,
@@ -204,6 +207,8 @@ function mapSupplier(row: AnyRow) {
   return {
     _id: row.id,
     id: row.id,
+    publicId: publicEntityId('SU', row.id),
+    displayId: publicEntityId('SU', row.id),
     userId: row.user_id,
     name: row.name,
     email: row.email,
@@ -235,6 +240,8 @@ function mapCustomer(row: AnyRow) {
   return {
     _id: row.id,
     id: row.id,
+    publicId: publicEntityId('CU', row.id),
+    displayId: publicEntityId('CU', row.id),
     userId: row.user_id,
     name: row.name,
     email: row.email,
@@ -253,8 +260,11 @@ function mapOrder(row: AnyRow, lines: AnyRow[] = []) {
   return {
     _id: row.id,
     id: row.id,
+    publicId: publicEntityId('OR', row.id),
+    displayId: publicEntityId('OR', row.id),
     userId: row.user_id,
     customerId: row.customer_id,
+    customerDisplayId: row.customer_id ? publicEntityId('CU', row.customer_id) : undefined,
     channelAccountId: row.channel_connection_id,
     channel: row.channel,
     externalOrderId: row.external_order_id,
@@ -270,6 +280,7 @@ function mapOrder(row: AnyRow, lines: AnyRow[] = []) {
     lines: lines.map((line) => ({
       _id: line.id,
       id: line.id,
+      publicId: publicEntityId('SK', line.id),
       itemId: line.item_id,
       sku: line.sku,
       title: line.title,
@@ -325,8 +336,11 @@ function mapShipmentPlan(row: AnyRow) {
   return {
     _id: row.id,
     id: row.id,
+    publicId: publicEntityId('SH', row.id),
+    displayId: publicEntityId('SH', row.id),
     userId: row.user_id,
     supplierId: row.supplier_id,
+    supplierDisplayId: row.supplier_id ? publicEntityId('SU', row.supplier_id) : undefined,
     shipFromLocationId: row.ship_from_location_id,
     facilityId: row.facility_id,
     internalShipmentId: row.internal_shipment_id,
@@ -1211,6 +1225,39 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     return mapOrder(order, lines);
   });
 
+  app.post('/orders/:id/cancel', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const reason = trim(req.body?.reason || 'Cancelled from OMS');
+    const order = await one(
+      `UPDATE orders
+       SET status = 'cancelled',
+           metadata = metadata || $3::jsonb,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [
+        req.params.id,
+        userId,
+        JSON.stringify({
+          cancelledAt: new Date().toISOString(),
+          cancelReason: reason,
+          cancelledBy: req.user?.email || userId,
+        }),
+      ],
+    );
+    if (!order) return reply.code(404).send({ error: 'Not found' });
+    await writeLedger(userId, {
+      entityType: 'order',
+      entityId: order.id,
+      eventType: 'cancelled',
+      summary: `Order ${order.order_number || publicEntityId('OR', order.id)} cancelled.`,
+      payload: { reason, publicId: publicEntityId('OR', order.id) },
+    });
+    const lines = await rows('SELECT * FROM order_lines WHERE order_id = $1 AND user_id = $2 ORDER BY created_at ASC', [order.id, userId]);
+    return { order: mapOrder(order, lines), success: true };
+  });
+
   app.get('/suppliers', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
@@ -1508,7 +1555,123 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       [userId, plan.id, `ASN-${Date.now().toString(36).toUpperCase()}`, JSON.stringify({ shipmentPlan: mapShipmentPlan(plan), source: 'aurora_postgres' })],
     );
     await pgQuery('UPDATE shipment_plans SET status = $3, updated_at = now() WHERE id = $1 AND user_id = $2', [plan.id, userId, 'asn_created']);
-    return { asn: { _id: asn?.id, id: asn?.id, asnNumber: asn?.asn_number, status: asn?.status, payload: json(asn?.payload, {}), createdAt: iso(asn?.created_at) }, plan: mapShipmentPlan({ ...plan, status: 'asn_created' }) };
+    return {
+      asn: {
+        _id: asn?.id,
+        id: asn?.id,
+        publicId: publicEntityId('AS', asn?.id),
+        displayId: publicEntityId('AS', asn?.id),
+        asnNumber: asn?.asn_number,
+        status: asn?.status,
+        payload: json(asn?.payload, {}),
+        createdAt: iso(asn?.created_at),
+      },
+      plan: mapShipmentPlan({ ...plan, status: 'asn_created' }),
+    };
+  });
+
+  app.post('/asn/:id/cancel', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const reason = trim(req.body?.reason || 'Cancelled from OMS');
+    const asn = await one(
+      `UPDATE asns
+       SET status = 'cancelled',
+           payload = COALESCE(payload, '{}'::jsonb) || $3::jsonb,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [
+        req.params.id,
+        userId,
+        JSON.stringify({
+          cancelledAt: new Date().toISOString(),
+          cancelReason: reason,
+          cancelledBy: req.user?.email || userId,
+        }),
+      ],
+    );
+    if (!asn) return reply.code(404).send({ error: 'ASN not found' });
+    if (asn.shipment_plan_id) {
+      await pgQuery('UPDATE shipment_plans SET status = $3, updated_at = now() WHERE id = $1 AND user_id = $2', [asn.shipment_plan_id, userId, 'asn_cancelled']);
+      await pgQuery(
+        'INSERT INTO shipment_activity_log (user_id, shipment_plan_id, action, summary) VALUES ($1, $2, $3, $4)',
+        [userId, asn.shipment_plan_id, 'asn_cancelled', `ASN ${asn.asn_number || publicEntityId('AS', asn.id)} cancelled.`],
+      );
+    }
+    await writeLedger(userId, {
+      entityType: 'asn',
+      entityId: asn.id,
+      eventType: 'cancelled',
+      summary: `ASN ${asn.asn_number || publicEntityId('AS', asn.id)} cancelled.`,
+      payload: { reason, publicId: publicEntityId('AS', asn.id), shipmentPlanId: asn.shipment_plan_id || null },
+    });
+    return {
+      asn: {
+        _id: asn.id,
+        id: asn.id,
+        publicId: publicEntityId('AS', asn.id),
+        displayId: publicEntityId('AS', asn.id),
+        asnNumber: asn.asn_number,
+        status: asn.status,
+        payload: json(asn.payload, {}),
+        createdAt: iso(asn.created_at),
+        updatedAt: iso(asn.updated_at),
+      },
+      success: true,
+    };
+  });
+
+  app.post('/asn/:id/stop', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const reason = trim(req.body?.reason || 'Stopped from OMS before warehouse execution');
+    const asn = await one(
+      `UPDATE asns
+       SET status = 'stopped',
+           payload = COALESCE(payload, '{}'::jsonb) || $3::jsonb,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [
+        req.params.id,
+        userId,
+        JSON.stringify({
+          stoppedAt: new Date().toISOString(),
+          stopReason: reason,
+          stoppedBy: req.user?.email || userId,
+        }),
+      ],
+    );
+    if (!asn) return reply.code(404).send({ error: 'ASN not found' });
+    if (asn.shipment_plan_id) {
+      await pgQuery('UPDATE shipment_plans SET status = $3, updated_at = now() WHERE id = $1 AND user_id = $2', [asn.shipment_plan_id, userId, 'asn_stopped']);
+      await pgQuery(
+        'INSERT INTO shipment_activity_log (user_id, shipment_plan_id, action, summary) VALUES ($1, $2, $3, $4)',
+        [userId, asn.shipment_plan_id, 'asn_stopped', `ASN ${asn.asn_number || publicEntityId('AS', asn.id)} stopped before execution.`],
+      );
+    }
+    await writeLedger(userId, {
+      entityType: 'asn',
+      entityId: asn.id,
+      eventType: 'stopped',
+      summary: `ASN ${asn.asn_number || publicEntityId('AS', asn.id)} stopped before warehouse execution.`,
+      payload: { reason, publicId: publicEntityId('AS', asn.id), shipmentPlanId: asn.shipment_plan_id || null },
+    });
+    return {
+      asn: {
+        _id: asn.id,
+        id: asn.id,
+        publicId: publicEntityId('AS', asn.id),
+        displayId: publicEntityId('AS', asn.id),
+        asnNumber: asn.asn_number,
+        status: asn.status,
+        payload: json(asn.payload, {}),
+        createdAt: iso(asn.created_at),
+        updatedAt: iso(asn.updated_at),
+      },
+      success: true,
+    };
   });
 
   app.post('/shipment-plans/:id/rate-shop-to-warehouse', async (req: any, reply) => {
