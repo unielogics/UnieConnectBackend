@@ -661,4 +661,49 @@ export async function omsCustomizationRoutes(app: FastifyInstance) {
     });
     return { apiKey: raw, key: mapApiKey(row || {}), warning: 'Save this key now. It is not shown again.' };
   });
+
+  app.post('/oms/api-keys/:id/rotate', async (req: any, reply) => {
+    const userId = requireJwtUser(req, reply);
+    if (!userId) return;
+    const raw = `uc_${randomBytes(24).toString('hex')}`;
+    const keyHash = createHash('sha256').update(raw).digest('hex');
+    const prefix = raw.slice(0, 10);
+    const row = await one(
+      `UPDATE api_keys
+       SET key_hash = $3, prefix = $4, status = 'active', revoked_at = NULL, last_used_at = NULL
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, name, prefix, scopes, status, last_used_at, revoked_at, created_at`,
+      [req.params.id, userId, keyHash, prefix],
+    );
+    if (!row) return reply.code(404).send({ error: 'API key not found' });
+    await writeLedger(userId, {
+      entityType: 'oms_api_key',
+      entityId: row.id,
+      eventType: 'rotated',
+      summary: `OMS API key ${row.name || prefix} rotated.`,
+      payload: { prefix },
+    });
+    return { apiKey: raw, key: mapApiKey(row), warning: 'Save this rotated key now. It is not shown again.' };
+  });
+
+  app.post('/oms/api-keys/:id/revoke', async (req: any, reply) => {
+    const userId = requireJwtUser(req, reply);
+    if (!userId) return;
+    const row = await one(
+      `UPDATE api_keys
+       SET status = 'revoked', revoked_at = now()
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, name, prefix, scopes, status, last_used_at, revoked_at, created_at`,
+      [req.params.id, userId],
+    );
+    if (!row) return reply.code(404).send({ error: 'API key not found' });
+    await writeLedger(userId, {
+      entityType: 'oms_api_key',
+      entityId: row.id,
+      eventType: 'revoked',
+      summary: `OMS API key ${row.name || row.prefix} revoked.`,
+      payload: { prefix: row.prefix },
+    });
+    return { success: true, key: mapApiKey(row) };
+  });
 }

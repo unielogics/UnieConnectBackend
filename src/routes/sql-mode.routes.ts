@@ -20,6 +20,15 @@ const json = (value: unknown, fallback: any) => (value == null ? fallback : valu
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 const trim = (value: unknown) => (value == null ? '' : String(value).trim());
 const normalizedEmail = (value: unknown) => trim(value).toLowerCase();
+const CORE_FEATURE_IDS = [
+  'core-command-center',
+  'core-inventory',
+  'core-orders',
+  'core-connections',
+  'core-marketplace',
+  'core-support',
+  'app-studio',
+];
 
 function requireUser(req: any, reply: any): string | null {
   const userId = req.user?.userId;
@@ -269,15 +278,40 @@ function mapShipmentPlan(row: AnyRow) {
 }
 
 function mapFeature(row: AnyRow) {
+  const payload = json(row.payload, {}) || {};
+  const pricing = payload.pricing || {
+    type: money(row.price) > 0 ? 'subscription' : 'free',
+    amount: money(row.price),
+    currency: 'USD',
+  };
+  const metadata = payload.metadata || {};
+  const isStandard = Boolean(payload.isStandard || payload.isCore);
+  const userStatus = row.user_status || (isStandard ? 'enabled' : 'available');
+  const isEnabled = Boolean(isStandard || row.is_enabled || userStatus === 'enabled');
   return {
     _id: row.id,
     id: row.id,
     name: row.name,
+    slug: payload.slug || row.id,
     description: row.description,
+    longDescription: payload.longDescription || row.description,
     category: row.category,
     status: row.status,
     price: money(row.price),
-    payload: json(row.payload, {}),
+    pricing,
+    tags: Array.isArray(payload.tags) ? payload.tags : [],
+    icon: payload.icon || metadata.navIcon,
+    screenshots: Array.isArray(payload.screenshots) ? payload.screenshots : [],
+    isActive: row.status === 'active',
+    isStandard,
+    isEnabled,
+    userStatus,
+    enabledAt: iso(row.enabled_at),
+    metadata,
+    unlockedScreens: payload.unlockedScreens || metadata.unlockedScreens || [],
+    requiredConnections: payload.requiredConnections || metadata.requiredConnections || [],
+    setupSteps: payload.setupSteps || metadata.setupSteps || [],
+    payload,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
@@ -1448,14 +1482,31 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     return { _id: note?.id, id: note?.id, entityType: note?.entity_type, entityId: note?.entity_id, note: note?.note, body: note?.body, createdAt: iso(note?.created_at) };
   });
 
-  app.get('/features', async () => {
-    const data = await rows('SELECT * FROM features ORDER BY category, name');
+  app.get('/features', async (req: any) => {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    const data = await rows(
+      `SELECT f.*, uf.status AS user_status, uf.enabled_at, (uf.status = 'enabled') AS is_enabled
+       FROM features f
+       LEFT JOIN user_features uf ON uf.feature_id = f.id AND uf.user_id = $1
+       ORDER BY COALESCE((f.payload->>'marketplaceOrder')::int, 999), f.category, f.name`,
+      [userId],
+    );
     return { features: data.map(mapFeature) };
   });
 
-  app.get('/features/marketplace', async () => {
-    const data = await rows("SELECT * FROM features WHERE category = 'marketplace' OR id = 'marketplace-connections' ORDER BY name");
-    return { features: data.map(mapFeature) };
+  app.get('/features/marketplace', async (req: any) => {
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    const data = await rows(
+      `SELECT f.*, uf.status AS user_status, uf.enabled_at, (uf.status = 'enabled') AS is_enabled
+       FROM features f
+       LEFT JOIN user_features uf ON uf.feature_id = f.id AND uf.user_id = $1
+       WHERE f.status = 'active'
+         AND COALESCE((f.payload->>'isMarketplaceApp')::boolean, f.category IN ('marketplace','optimization','finance','audit','analytics'))
+       ORDER BY COALESCE((f.payload->>'marketplaceOrder')::int, 999), f.name`,
+      [userId],
+    );
+    const categories = Array.from(new Set(data.map((feature) => String(feature.category || '')).filter(Boolean)));
+    return { features: data.map(mapFeature), categories };
   });
 
   app.get('/features/:id', async (req: any, reply) => {
@@ -1468,40 +1519,71 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const data = await rows(
-      `SELECT f.*, uf.status AS user_status, uf.enabled_at
+      `SELECT f.*,
+              COALESCE(uf.status, CASE WHEN COALESCE((f.payload->>'isCore')::boolean, false) THEN 'enabled' ELSE NULL END) AS user_status,
+              uf.enabled_at,
+              COALESCE((f.payload->>'isCore')::boolean, false) OR uf.status = 'enabled' AS is_enabled
        FROM features f
        LEFT JOIN user_features uf ON uf.feature_id = f.id AND uf.user_id = $1
-       ORDER BY f.category, f.name`,
+       ORDER BY COALESCE((f.payload->>'marketplaceOrder')::int, 999), f.category, f.name`,
       [userId],
     );
-    return { features: data.map((f) => ({ ...mapFeature(f), userStatus: f.user_status || 'available', enabledAt: iso(f.enabled_at) })) };
+    return { features: data.map(mapFeature) };
   });
 
   for (const action of ['enable', 'purchase']) {
     app.post(`/features/:id/${action}`, async (req: any, reply) => {
       const userId = requireUser(req, reply);
       if (!userId) return;
+      const target = trim(req.params.id);
+      const featureRow = await one('SELECT * FROM features WHERE id = $1 OR payload->>\'slug\' = $1 LIMIT 1', [target]);
+      if (!featureRow) return reply.code(404).send({ error: 'Feature not found' });
       const feature = await one(
         `INSERT INTO user_features (user_id, feature_id, status, payload)
          VALUES ($1, $2, 'enabled', $3::jsonb)
          ON CONFLICT (user_id, feature_id) DO UPDATE SET status = 'enabled', enabled_at = now(), payload = EXCLUDED.payload
          RETURNING *`,
-        [userId, req.params.id, JSON.stringify({ action, at: new Date().toISOString() })],
+        [userId, featureRow.id, JSON.stringify({ action, at: new Date().toISOString() })],
       );
-      return { success: true, featureId: feature?.feature_id || req.params.id, status: 'enabled' };
+      await pgQuery(
+        `UPDATE app_users
+         SET enabled_features = (
+           SELECT ARRAY(
+             SELECT DISTINCT value
+             FROM unnest(COALESCE(enabled_features, ARRAY[]::TEXT[]) || $2::TEXT[]) AS value
+             WHERE value <> ''
+           )
+         ), updated_at = now()
+         WHERE id = $1`,
+        [userId, [featureRow.id]],
+      ).catch(() => null);
+      return { success: true, message: `${featureRow.name} enabled`, feature: mapFeature({ ...featureRow, user_status: feature?.status || 'enabled', enabled_at: feature?.enabled_at, is_enabled: true }) };
     });
   }
 
   app.post('/features/:id/disable', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
+    const target = trim(req.params.id);
+    const featureRow = await one('SELECT * FROM features WHERE id = $1 OR payload->>\'slug\' = $1 LIMIT 1', [target]);
+    if (!featureRow) return reply.code(404).send({ error: 'Feature not found' });
+    const payload = json(featureRow.payload, {}) || {};
+    if (payload.isCore || featureRow.id === 'app-studio') {
+      return reply.code(400).send({ error: 'Core features cannot be disabled' });
+    }
     await pgQuery(
       `INSERT INTO user_features (user_id, feature_id, status)
        VALUES ($1, $2, 'disabled')
        ON CONFLICT (user_id, feature_id) DO UPDATE SET status = 'disabled'`,
-      [userId, req.params.id],
+      [userId, featureRow.id],
     );
-    return { success: true, featureId: req.params.id, status: 'disabled' };
+    await pgQuery(
+      `UPDATE app_users
+       SET enabled_features = array_remove(COALESCE(enabled_features, ARRAY[]::TEXT[]), $2), updated_at = now()
+       WHERE id = $1`,
+      [userId, featureRow.id],
+    ).catch(() => null);
+    return { success: true, message: `${featureRow.name} disabled`, feature: mapFeature({ ...featureRow, user_status: 'disabled', is_enabled: false }) };
   });
 
   app.get('/transportation-templates', async (req: any, reply) => {
@@ -1574,6 +1656,17 @@ export async function sqlModeRoutes(app: FastifyInstance) {
        RETURNING id, email, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at, created_at, updated_at`,
       [randomUUID(), email, passwordHash, role, body.firstName || null, body.lastName || null, body.phone || null],
     );
+    if (user?.id) {
+      await pgQuery(
+        `INSERT INTO user_features (user_id, feature_id, status, payload)
+         SELECT $1, f.id, 'enabled', '{"source":"admin_create_default"}'::jsonb
+         FROM features f
+         WHERE f.id = ANY($2::TEXT[])
+         ON CONFLICT (user_id, feature_id) DO NOTHING`,
+        [user.id, CORE_FEATURE_IDS],
+      ).catch(() => null);
+      await pgQuery('UPDATE app_users SET enabled_features = $2::TEXT[], updated_at = now() WHERE id = $1', [user.id, CORE_FEATURE_IDS]).catch(() => null);
+    }
     await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [user?.id, 'created_by_manager', JSON.stringify({ managerId })]);
     return mapUser(user || {});
   });

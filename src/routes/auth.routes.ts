@@ -14,6 +14,16 @@ import {
   verifySqlUser,
 } from '../services/sql-auth';
 
+const DEFAULT_ENABLED_FEATURE_IDS = [
+  'core-command-center',
+  'core-inventory',
+  'core-orders',
+  'core-connections',
+  'core-marketplace',
+  'core-support',
+  'app-studio',
+];
+
 function setAuthCookie(reply: any, req: any, token: string, maxAgeSeconds = 7 * 24 * 60 * 60) {
   const host = String(req.headers.host || '');
   const isProdHost = host.endsWith('unieconnect.com');
@@ -128,6 +138,15 @@ export async function authRoutes(fastify: FastifyInstance) {
         phone ? String(phone).trim() : null,
       ],
     );
+    await pgQuery(
+      `INSERT INTO user_features (user_id, feature_id, status, payload)
+       SELECT $1, f.id, 'enabled', '{"source":"signup_default"}'::jsonb
+       FROM features f
+       WHERE f.id = ANY($2::TEXT[])
+       ON CONFLICT (user_id, feature_id) DO NOTHING`,
+      [userId, DEFAULT_ENABLED_FEATURE_IDS],
+    ).catch(() => null);
+    await pgQuery('UPDATE app_users SET enabled_features = $2::TEXT[] WHERE id = $1', [userId, DEFAULT_ENABLED_FEATURE_IDS]).catch(() => null);
     await pgQuery('UPDATE invite_tokens SET used_at = now(), used_by = $2 WHERE id = $1', [invite.id, userId]);
     await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
       userId,
