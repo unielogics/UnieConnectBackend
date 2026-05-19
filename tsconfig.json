@@ -54,12 +54,14 @@
     "src/routes/address.routes.ts",
     "src/routes/cortex.routes.ts",
     "src/routes/oms-production.routes.ts",
+    "src/routes/oms-intelligence.routes.ts",
     "src/routes/sql-mode.routes.ts",
     "src/services/address-validation.service.ts",
     "src/services/cortex-orchestration.ts",
     "src/services/degraded-auth.ts",
     "src/services/oms-production.service.ts",
     "src/services/oms-production.types.ts",
+    "src/services/oms-intelligence.service.ts",
     "src/services/sql-auth.ts"
   ],
   "exclude": ["node_modules", "dist", "scripts/**/*"]

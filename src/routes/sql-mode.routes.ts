@@ -868,8 +868,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     try {
       const item = await one(
         `INSERT INTO catalog_items
-          (user_id, sku, title, description, attributes, default_uom, tags, supplier_id, image, images, upc, ean, asin, category, sub_category, lob, weight, dimensions)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18::jsonb)
+          (user_id, sku, title, description, attributes, default_uom, tags, supplier_id, image, images, upc, ean, asin, category, sub_category, lob, weight, dimensions, metadata)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19::jsonb)
          RETURNING *`,
         [
           userId,
@@ -890,6 +890,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           body.lob || null,
           body.weight === '' || body.weight == null ? null : Number(body.weight),
           JSON.stringify(body.dimensions || {}),
+          JSON.stringify(body.metadata || {}),
         ],
       );
       await writeLedger(userId, { entityType: 'catalog_item', entityId: item?.id, eventType: 'created', summary: `Catalog item ${trim(body.sku)} created in Aurora.` });
