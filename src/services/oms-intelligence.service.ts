@@ -17,6 +17,16 @@ const number = (value: unknown, fallback = 0) => {
 
 const json = (value: unknown, fallback: any = {}) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
+const SELLER_OPTIMIZATION_RECOMMENDATION_TYPES = [
+  'business_double',
+  'sku_placement',
+  'supplier_pickup',
+  'order_fulfillment',
+  'shipment_consolidation',
+  'billing_profit',
+  'carrier_audit',
+  'data_readiness',
+];
 
 async function rows<T extends Row = Row>(sql: string, values: unknown[] = []): Promise<T[]> {
   const res = await pgQuery<T>(sql, values);
@@ -179,6 +189,29 @@ function dimensionsCubeFt(item: Row | null, input: any) {
   return Math.round((length * width * height / 1728) * 100) / 100;
 }
 
+function normalizeProductInput(input: any = {}) {
+  const normalized: any = { ...input };
+  for (const [key, value] of Object.entries(input || {})) {
+    const compact = key.trim().toLowerCase().replace(/[\s_-]+/g, '');
+    if (compact === 'sku' || compact === 'sellersku' || compact === 'itemsku') normalized.sku = value;
+    if (compact === 'title' || compact === 'name' || compact === 'productname') normalized.title = value;
+    if (compact === 'asin' || compact === 'marketplaceid') normalized.asin = value;
+    if (compact === 'cost' || compact === 'unitcost') normalized.cost = value;
+    if (compact === 'price' || compact === 'unitprice' || compact === 'sellingprice' || compact === 'saleprice') normalized.price = value;
+    if (compact === 'weight' || compact === 'weightlb' || compact === 'weightlbs') normalized.weight = value;
+    if (compact === 'length' || compact === 'lengthin') normalized.length = value;
+    if (compact === 'width' || compact === 'widthin') normalized.width = value;
+    if (compact === 'height' || compact === 'heightin') normalized.height = value;
+  }
+  normalized.dimensions = {
+    ...(normalized.dimensions || {}),
+    length: normalized.dimensions?.length ?? normalized.dimensions?.l ?? normalized.length,
+    width: normalized.dimensions?.width ?? normalized.dimensions?.w ?? normalized.width,
+    height: normalized.dimensions?.height ?? normalized.dimensions?.h ?? normalized.height,
+  };
+  return normalized;
+}
+
 function productResearchResult(input: any, item: Row | null, readiness: Awaited<ReturnType<typeof getDataReadiness>>, cortex: any) {
   const sku = String(input?.sku || item?.sku || input?.asin || 'NEW-SKU');
   const cubeFt = dimensionsCubeFt(item, input);
@@ -245,22 +278,23 @@ function productResearchResult(input: any, item: Row | null, readiness: Awaited<
 
 export async function createProductResearchRun(userId: string, input: any) {
   const readiness = await getDataReadiness(userId);
-  const item = input?.itemId || input?.sku
+  const normalizedInput = normalizeProductInput(input);
+  const item = normalizedInput?.itemId || normalizedInput?.sku
     ? await one(
         'SELECT * FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1',
-        [userId, String(input.itemId || input.sku)],
+        [userId, String(normalizedInput.itemId || normalizedInput.sku)],
       )
     : null;
-  const run = await createRun(userId, 'product_research', input, readiness);
+  const run = await createRun(userId, 'product_research', normalizedInput, readiness);
   const cortex = await postCortex('/v1/assessment/product-research/runs', {
     userId,
     tenant_id: userId,
     source_priority: readiness.sourcePriority,
     readiness,
-    item: item || input,
+    item: item || normalizedInput,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
 
-  const { result, confidence } = productResearchResult(input, item, readiness, cortex);
+  const { result, confidence } = productResearchResult(normalizedInput, item, readiness, cortex);
   const status = result.missingData.length ? 'needs_data' : 'completed';
   const saved = await one(
     `INSERT INTO oms_product_research_results
@@ -270,10 +304,10 @@ export async function createProductResearchRun(userId: string, input: any) {
     [
       userId,
       run?.id || null,
-      item?.id || input?.itemId || null,
+      item?.id || normalizedInput?.itemId || null,
       result.sku,
       status,
-      JSON.stringify(input || {}),
+      JSON.stringify(normalizedInput || {}),
       JSON.stringify(result),
       confidence,
       JSON.stringify(readiness),
@@ -329,7 +363,7 @@ export async function createProductResearchRun(userId: string, input: any) {
 
 export async function createBulkProductResearchRun(userId: string, body: any) {
   const readiness = await getDataReadiness(userId);
-  const inputRows = Array.isArray(body?.rows) ? body.rows.slice(0, 500) : [];
+  const inputRows = Array.isArray(body?.rows) ? body.rows.slice(0, 500).map(normalizeProductInput) : [];
   const run = await createRun(userId, 'product_research_bulk', { rows: inputRows, filename: body?.filename }, readiness);
   const cortex = await postCortex('/v1/assessment/product-research/bulk', {
     userId,
@@ -437,10 +471,153 @@ async function createRecommendation(userId: string, params: {
   return mapRecommendation(rec);
 }
 
+async function supersedeOpenRecommendations(userId: string, recommendationTypes: string[]) {
+  if (!recommendationTypes.length) return;
+  await pgQuery(
+    `UPDATE oms_recommendations
+     SET status = 'superseded',
+         approval_state = CASE WHEN approval_state IN ('approved', 'rejected') THEN approval_state ELSE 'superseded' END,
+         updated_at = now()
+     WHERE user_id = $1
+       AND status = 'open'
+       AND recommendation_type = ANY($2::text[])`,
+    [userId, recommendationTypes],
+  ).catch(() => null);
+}
+
+async function createSellerContextRecommendations(params: {
+  userId: string;
+  runId?: string | null;
+  stored: Row | null;
+  readiness: Awaited<ReturnType<typeof getDataReadiness>>;
+  inventory: any;
+  summary: any;
+}) {
+  const { userId, runId, stored, readiness, summary } = params;
+  const recommendations = [];
+  const scopedRunId = runId || null;
+  const confidence = stored?.confidence == null ? readiness.score / 100 : Number(stored.confidence);
+  const wmsTruthState = readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only';
+  const currentMonthlyCost = number(summary.currentMonthlyCost);
+  const optimizedMonthlyCost = number(summary.optimizedMonthlyCost);
+  const monthlySavings = number(summary.monthlySavings);
+  const sourceSummary = readiness;
+
+  if (readiness.counts.suppliers > 0) {
+    const missingPickup = Math.max(0, readiness.counts.suppliers - readiness.counts.suppliersWithPickup);
+    recommendations.push(await createRecommendation(userId, {
+      runId: scopedRunId,
+      recommendationType: 'supplier_pickup',
+      entityType: 'supplier',
+      entityId: userId,
+      title: missingPickup ? 'Complete supplier pickup profiles' : 'Optimize supplier pickup windows',
+      summary: missingPickup
+        ? `${missingPickup} suppliers are missing dock, hours, or equipment details that Cortex needs for truck booking.`
+        : 'Supplier profiles are ready for Cortex to model pickup timing, equipment, and replenishment routing.',
+      currentValue: { suppliers: readiness.counts.suppliers, pickupProfilesComplete: readiness.counts.suppliersWithPickup },
+      optimizedValue: { pickupProfilesComplete: readiness.counts.suppliers, cortexTruckBookingReady: true },
+      estimatedImpact: { confidenceGain: missingPickup ? Math.min(20, missingPickup * 5) : 8 },
+      requiredAction: missingPickup ? 'complete_supplier_pickup_profiles' : 'review_supplier_pickup_plan',
+      approvalState: missingPickup ? 'not_required' : 'draft',
+      wmsTruthState,
+      confidence,
+      sourceSummary,
+    }));
+  }
+
+  if (readiness.counts.orders > 0 || readiness.counts.marketplaceConnections > 0) {
+    recommendations.push(await createRecommendation(userId, {
+      runId: scopedRunId,
+      recommendationType: 'order_fulfillment',
+      entityType: 'order',
+      entityId: userId,
+      title: 'Compare current order flow against optimized fulfillment',
+      summary: readiness.counts.marketplaceOrders > 0
+        ? 'Marketplace order history is available for fulfillment cost, speed, and warehouse placement optimization.'
+        : 'Order data exists, but marketplace-connected history will improve fulfillment recommendations.',
+      currentValue: { orders: readiness.counts.orders, marketplaceOrders: readiness.counts.marketplaceOrders, csvOrders: readiness.counts.csvOrders },
+      optimizedValue: { sourceMode: readiness.sourceMode, expectedRoutingMode: readiness.counts.wmsLinks > 0 ? 'wms_truth_gated' : 'forecast_only' },
+      estimatedImpact: { annualizedSavings: monthlySavings * 12 },
+      requiredAction: readiness.counts.marketplaceOrders > 0 ? 'review_order_optimization' : 'connect_marketplace_order_feed',
+      approvalState: 'not_required',
+      wmsTruthState,
+      confidence,
+      sourceSummary,
+    }));
+  }
+
+  if (readiness.counts.catalogItems > 0 || readiness.counts.wmsLinks > 0) {
+    recommendations.push(await createRecommendation(userId, {
+      runId: scopedRunId,
+      recommendationType: 'shipment_consolidation',
+      entityType: 'shipment_plan',
+      entityId: userId,
+      title: 'Draft Cortex shipment consolidation plan',
+      summary: readiness.counts.wmsLinks > 0
+        ? 'WMS truth is connected, so shipment recommendations can move from forecast planning into guarded execution approval.'
+        : 'SKU data can support forecast shipment planning, but WMS truth is required before final dispatch.',
+      currentValue: { catalogItems: readiness.counts.catalogItems, wmsLinks: readiness.counts.wmsLinks },
+      optimizedValue: { sharedPalletCandidates: summary.sharedPalletCandidates, optimizedStockoutRiskSkus: summary.optimizedStockoutRiskSkus },
+      estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12 },
+      requiredAction: readiness.counts.wmsLinks > 0 ? 'draft_cortex_shipment_plan' : 'connect_wms_truth',
+      approvalState: readiness.counts.wmsLinks > 0 ? 'waiting_approval' : 'blocked',
+      wmsTruthState,
+      confidence,
+      sourceSummary,
+    }));
+  }
+
+  if (currentMonthlyCost > 0 || optimizedMonthlyCost > 0 || monthlySavings > 0) {
+    recommendations.push(await createRecommendation(userId, {
+      runId: scopedRunId,
+      recommendationType: 'billing_profit',
+      entityType: 'billing',
+      entityId: stored?.id || userId,
+      title: 'Track optimized cost basis against current spend',
+      summary: monthlySavings > 0
+        ? `Optimize Suite modeled ${Math.round(monthlySavings).toLocaleString()} dollars in monthly cost improvement.`
+        : 'Cost basis is available, but more marketplace/WMS data is needed to prove savings.',
+      currentValue: { monthlyCost: currentMonthlyCost },
+      optimizedValue: { monthlyCost: optimizedMonthlyCost },
+      estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12 },
+      requiredAction: monthlySavings > 0 ? 'review_cost_savings' : 'improve_cost_inputs',
+      approvalState: 'not_required',
+      wmsTruthState,
+      confidence,
+      sourceSummary,
+    }));
+  }
+
+  if (readiness.counts.orders > 0 || readiness.counts.csvOrders > 0 || readiness.counts.marketplaceOrders > 0) {
+    const claimableBaseline = Math.max(0, Math.round(currentMonthlyCost * 0.012 * 100) / 100);
+    recommendations.push(await createRecommendation(userId, {
+      runId: scopedRunId,
+      recommendationType: 'carrier_audit',
+      entityType: 'carrier_audit',
+      entityId: userId,
+      title: 'Audit carrier leakage from order and label history',
+      summary: readiness.counts.marketplaceOrders > 0
+        ? 'Marketplace order history can be paired with label/courier evidence to expose refund and dispute opportunities.'
+        : 'CSV order data can seed audit review, but carrier evidence improves claim confidence.',
+      currentValue: { orders: readiness.counts.orders, marketplaceOrders: readiness.counts.marketplaceOrders, csvOrders: readiness.counts.csvOrders },
+      optimizedValue: { preventableLeakage: claimableBaseline, evidenceMode: readiness.counts.marketplaceOrders > 0 ? 'marketplace_plus_carrier' : 'csv_evidence_needed' },
+      estimatedImpact: { monthlySavings: claimableBaseline, annualizedSavings: claimableBaseline * 12 },
+      requiredAction: 'review_carrier_audit_evidence',
+      approvalState: 'not_required',
+      wmsTruthState,
+      confidence,
+      sourceSummary,
+    }));
+  }
+
+  return recommendations.filter(Boolean);
+}
+
 export async function createSellerOptimizationRun(userId: string, input: any = {}) {
   const readiness = await getDataReadiness(userId);
   const [business, inventory] = await Promise.all([getBusinessDouble(userId), getInventoryPlan(userId, input?.horizon || '6m')]);
   const run = await createRun(userId, 'seller_optimization', input, readiness);
+  await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
   const cortex = await postCortex('/v1/assessment/seller-optimization/runs', {
     userId,
     tenant_id: userId,
@@ -543,6 +720,14 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
       sourceSummary: readiness,
     }));
   }
+  recommendations.push(...await createSellerContextRecommendations({
+    userId,
+    runId: run?.id || null,
+    stored,
+    readiness,
+    inventory,
+    summary,
+  }));
 
   await writeOmsLedgerEvent({
     userId,
