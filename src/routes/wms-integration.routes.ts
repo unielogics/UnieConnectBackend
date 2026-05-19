@@ -42,6 +42,85 @@ async function verifyWmsCallback(req: any, reply: any) {
   return credential;
 }
 
+function normalizeInventoryRows(body: any): Array<{ sku: string; snapshot: Record<string, unknown> }> {
+  const source = body?.inventory || body?.items || body?.skus || [];
+  if (Array.isArray(source)) {
+    return source
+      .map((row) => ({
+        sku: String(row?.sku || row?.sellerSku || row?.itemSku || '').trim(),
+        snapshot: {
+          inbound: Number(row?.inbound || 0),
+          received: Number(row?.received || 0),
+          available: Number(row?.available ?? row?.onHand ?? row?.quantity ?? 0),
+          orders: Number(row?.orders || row?.allocated || 0),
+          shippedToday: Number(row?.shippedToday || row?.shipped_today || 0),
+          openAsnsCount: Number(row?.openAsnsCount || row?.open_asns_count || 0),
+          receiving: Number(row?.receiving || 0),
+          source: 'wms_inventory_snapshot',
+        },
+      }))
+      .filter((row) => row.sku);
+  }
+  if (source && typeof source === 'object') {
+    return Object.entries(source)
+      .map(([sku, value]: [string, any]) => ({
+        sku: String(sku || '').trim(),
+        snapshot: {
+          inbound: Number(value?.inbound || 0),
+          received: Number(value?.received || 0),
+          available: Number(value?.available ?? value?.onHand ?? value?.quantity ?? 0),
+          orders: Number(value?.orders || value?.allocated || 0),
+          shippedToday: Number(value?.shippedToday || value?.shipped_today || 0),
+          openAsnsCount: Number(value?.openAsnsCount || value?.open_asns_count || 0),
+          receiving: Number(value?.receiving || 0),
+          source: 'wms_inventory_snapshot',
+        },
+      }))
+      .filter((row) => row.sku);
+  }
+  return [];
+}
+
+async function applyInventorySnapshot(params: {
+  userId: string;
+  warehouseCode: string;
+  body: any;
+}) {
+  const rows = normalizeInventoryRows(params.body);
+  let applied = 0;
+  let unmatched = 0;
+  for (const row of rows) {
+    const snapshot = {
+      ...row.snapshot,
+      warehouseCode: params.warehouseCode,
+      updatedAt: new Date().toISOString(),
+    };
+    const result = await pgQuery(
+      `UPDATE catalog_items
+       SET wms_inventory = jsonb_set(
+             COALESCE(wms_inventory, '{}'::jsonb),
+             ARRAY[$3],
+             $4::jsonb,
+             true
+           ),
+           metadata = jsonb_set(
+             COALESCE(metadata, '{}'::jsonb),
+             '{lastWmsInventorySnapshotAt}',
+             to_jsonb(now()::text),
+             true
+           ),
+           updated_at = now()
+       WHERE user_id = $1
+         AND sku = $2`,
+      [params.userId, row.sku, params.warehouseCode, JSON.stringify(snapshot)],
+    );
+    const rowCount = result?.rowCount || 0;
+    if (rowCount > 0) applied += rowCount;
+    else unmatched += 1;
+  }
+  return { received: rows.length, applied, unmatched };
+}
+
 async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
   const credential = await verifyWmsCallback(req, reply);
   if (!credential) return;
@@ -49,10 +128,11 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
   const body = req.body || {};
   const idempotencyKey = headerValue(req.headers['idempotency-key']) || body.idempotencyKey || `${credential.client_id}:${defaultEventType}:${Date.now()}`;
   const eventType = body.eventType || defaultEventType;
+  const warehouseCode = String(body.warehouseCode || credential.warehouse_code || '').trim();
   const payload = {
     ...body,
     clientId: credential.client_id,
-    warehouseCode: body.warehouseCode || credential.warehouse_code,
+    warehouseCode,
   };
 
   const event = await pgQuery(
@@ -67,7 +147,7 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
       credential.user_id,
       credential.id,
       credential.client_id,
-      body.warehouseCode || credential.warehouse_code,
+      warehouseCode,
       body.wmsIntermediaryId || body.wms_intermediary_id || null,
       eventType,
       body.entityType || body.entity_type || null,
@@ -76,6 +156,14 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
       JSON.stringify(payload),
     ],
   );
+
+  const inventoryApplied = eventType === 'inventory_snapshot'
+    ? await applyInventorySnapshot({
+        userId: String(credential.user_id),
+        warehouseCode,
+        body,
+      })
+    : null;
 
   await pgQuery(
     `INSERT INTO oms_execution_ledger
@@ -91,7 +179,7 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
     ],
   );
 
-  return reply.code(202).send({ accepted: true, event: event?.rows[0] || null });
+  return reply.code(202).send({ accepted: true, event: event?.rows[0] || null, inventoryApplied });
 }
 
 export async function wmsIntegrationRoutes(app: FastifyInstance) {
