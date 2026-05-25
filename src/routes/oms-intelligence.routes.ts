@@ -14,6 +14,9 @@ import {
   getSellerOptimizationRun,
   getSellerOptimizationRuns,
   rejectRecommendation,
+  ingestCortexResult,
+  verifyCortexWebhookSignature,
+  type CortexCallbackBody,
 } from '../services/oms-intelligence.service';
 
 function requireUser(req: any, reply: any): string | null {
@@ -119,4 +122,46 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     return getScreenIntelligenceContext(userId, String(req.query?.screen || 'command'));
   });
+  fastify.get('/oms/intelligence/runs/:id/status', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getIntelligenceRun(userId, String(req.params.id));
+  });
+
+  fastify.post(
+    '/oms/intelligence/cortex-callback',
+    {
+      // Capture raw body for HMAC verification. The hook runs before the
+      // JSON parser, buffers the bytes onto req.rawBody, then hands the
+      // body parser an identical readable stream so JSON parsing still
+      // works for the handler.
+      preParsing: async (req: any, _reply: any, payload: any) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of payload) {
+          chunks.push(chunk as Buffer);
+        }
+        const raw = Buffer.concat(chunks);
+        (req as any).rawBody = raw;
+        const { Readable } = await import('stream');
+        return Readable.from(raw);
+      },
+    },
+    async (req: any, reply: any) => {
+      const signature = String(req.headers['x-cortex-signature'] || '');
+      const raw: Buffer = (req as any).rawBody || Buffer.from('');
+      if (!verifyCortexWebhookSignature(raw, signature)) {
+        return reply.code(401).send({ error: 'bad signature' });
+      }
+      const body = (req.body || JSON.parse(raw.toString('utf8'))) as CortexCallbackBody;
+      if (!body || !body.tenant_id || !body.run_id) {
+        return reply.code(400).send({ error: 'missing tenant_id or run_id' });
+      }
+      const result = await ingestCortexResult(body).catch((err: any) => ({
+        ok: false,
+        error: err?.message || 'ingest failed',
+      }));
+      return reply.code(result.ok ? 200 : 500).send(result);
+    },
+  );
+
 }

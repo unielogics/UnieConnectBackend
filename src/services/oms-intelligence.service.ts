@@ -3,6 +3,7 @@ import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
 import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent } from './oms-production.service';
 
+import { createHmac, timingSafeEqual } from "crypto";
 type Row = Record<string, any>;
 
 const money = (value: unknown) => {
@@ -1045,4 +1046,193 @@ function mapRunEvent(row: any) {
     payload: json(row.payload, {}),
     createdAt: iso(row.created_at),
   };
+}
+
+type CortexRecommendation = {
+  recommendation_type?: string;
+  recommendationType?: string;
+  entity_type?: string;
+  entityType?: string;
+  entity_id?: string;
+  entityId?: string;
+  title?: string;
+  summary?: string;
+  current_value?: Record<string, unknown>;
+  currentValue?: Record<string, unknown>;
+  optimized_value?: Record<string, unknown>;
+  optimizedValue?: Record<string, unknown>;
+  estimated_impact?: Record<string, unknown>;
+  estimatedImpact?: Record<string, unknown>;
+  required_action?: string;
+  requiredAction?: string;
+  confidence?: number;
+};
+
+export type CortexCallbackBody = {
+  tenant_id: string;
+  run_id: string;
+  engagement_id: string;
+  status: string;
+  result: {
+    business_double?: Record<string, any>;
+    summary?: Record<string, any>;
+    planning?: Record<string, any>;
+    recommendations?: CortexRecommendation[];
+    [k: string]: unknown;
+  };
+};
+
+function pick<T>(...args: (T | undefined)[]): T | undefined {
+  for (const v of args) if (v !== undefined) return v;
+  return undefined;
+}
+
+export function verifyCortexWebhookSignature(rawBody: Buffer, headerValue: string | undefined): boolean {
+  const secret = process.env.CORTEX_WEBHOOK_SECRET || '';
+  if (!secret || !headerValue) return false;
+  const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+  const provided = headerValue.startsWith('sha256=') ? headerValue.slice(7) : headerValue;
+  if (provided.length !== expected.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(provided, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+export async function ingestCortexResult(body: CortexCallbackBody) {
+  const { tenant_id: userId, run_id: cortexRunId, engagement_id: engagementId, result } = body;
+  if (!userId || !cortexRunId) return { ok: false, reason: 'missing tenant or run id' };
+
+  // Match a UnieConnect-side run row by cortex_run_id (set on enqueue), else
+  // pick the latest pending row for this tenant.
+  let run: Row | null = await one(
+    `SELECT * FROM oms_intelligence_runs WHERE user_id = $1 AND cortex_run_id = $2 LIMIT 1`,
+    [userId, cortexRunId],
+  );
+  if (!run) {
+    run = await one(
+      `SELECT * FROM oms_intelligence_runs
+       WHERE user_id = $1 AND run_type = 'seller_optimization'
+         AND status IN ('pending_cortex','running')
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId],
+    );
+  }
+
+  const summary = (result.summary || {}) as Record<string, any>;
+  const bd = (result.business_double || {}) as Record<string, any>;
+  const monthlySavings =
+    number(summary.monthlySavings) ||
+    Math.max(0, number(bd?.currentMetrics?.monthlyCost) - number(bd?.optimizedMetrics?.monthlyCost));
+  const confidence = number(summary.confidence, 0.85);
+
+  const stored = await one(
+    `INSERT INTO oms_seller_optimization_runs
+       (user_id, run_id, status, summary, business_double, inventory_plan, source_summary, confidence)
+     VALUES ($1, $2, 'completed', $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7)
+     RETURNING *`,
+    [
+      userId,
+      run?.id || null,
+      JSON.stringify({ ...summary, from_cortex: true, engagementId, cortexRunId, monthlySavings, annualizedSavings: monthlySavings * 12 }),
+      JSON.stringify(bd),
+      JSON.stringify(result.planning || {}),
+      JSON.stringify({ source: 'cortex_webhook', cortexRunId, engagementId }),
+      Math.min(0.98, Math.max(0.5, confidence)),
+    ],
+  );
+
+  const cortexRecs = Array.isArray(result.recommendations) ? result.recommendations : [];
+  let created = 0;
+  const haveReplacements = cortexRecs.length > 0 || monthlySavings > 0;
+  if (haveReplacements) {
+    await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
+  }
+
+  if (cortexRecs.length === 0 && monthlySavings > 0) {
+    await createRecommendation(userId, {
+      runId: run?.id || null,
+      recommendationType: 'business_double',
+      entityType: 'business_double',
+      entityId: stored?.id,
+      title: 'Approve Cortex-optimized operating model',
+      summary: `Cortex projects $${Math.round(monthlySavings).toLocaleString()}/mo savings from the optimized plan.`,
+      currentValue: bd?.currentMetrics || {},
+      optimizedValue: bd?.optimizedMetrics || {},
+      estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12 },
+      requiredAction: 'approve_business_double',
+      approvalState: 'waiting_approval',
+      wmsTruthState: 'forecast_only',
+      confidence,
+      sourceSummary: { from_cortex: true, cortexRunId },
+    });
+    created = 1;
+  } else {
+    for (const rec of cortexRecs) {
+      const recommendationType = pick(rec.recommendationType, rec.recommendation_type) || 'business_double';
+      const entityType = pick(rec.entityType, rec.entity_type) || 'business_double';
+      const entityId = pick(rec.entityId, rec.entity_id) || stored?.id || null;
+      await createRecommendation(userId, {
+        runId: run?.id || null,
+        recommendationType,
+        entityType,
+        entityId: entityId ? String(entityId) : null,
+        title: rec.title || 'Cortex recommendation',
+        summary: rec.summary || '',
+        currentValue: (pick(rec.currentValue, rec.current_value) as Record<string, unknown>) || {},
+        optimizedValue: (pick(rec.optimizedValue, rec.optimized_value) as Record<string, unknown>) || {},
+        estimatedImpact: (pick(rec.estimatedImpact, rec.estimated_impact) as Record<string, unknown>) || {},
+        requiredAction: pick(rec.requiredAction, rec.required_action) || 'review',
+        approvalState: 'waiting_approval',
+        wmsTruthState: 'wms_confirmed',
+        confidence: rec.confidence ?? confidence,
+        sourceSummary: { from_cortex: true, cortexRunId },
+      });
+      created += 1;
+    }
+  }
+
+  if (run?.id) {
+    await completeRun({
+      userId,
+      runId: run.id,
+      status: 'completed',
+      output: { summary, recommendationCount: created, cortexRunId, from_cortex: true },
+      confidence,
+      cortexStatus: 'ok',
+      cortexResponse: result as Record<string, unknown>,
+    });
+  }
+
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'seller_optimization',
+    entityId: stored?.id || run?.id || null,
+    eventType: 'cortex_callback_ingested',
+    sourceSystem: 'cortex',
+    summary: `Cortex completed seller-optimization run; ${created} recommendations.`,
+    payload: { cortexRunId, engagementId, recommendationCount: created, monthlySavings },
+    confidence,
+  });
+
+  // Advance next_intelligence_run_at on the credential row so the UI shows
+  // when the next refresh is expected (best-effort, swallow errors).
+  await pgQuery(
+    `UPDATE oms_cortex_credentials
+       SET last_intelligence_run_at = now(),
+           next_intelligence_run_at = now() + (
+             CASE intelligence_tier
+               WHEN 'demo' THEN INTERVAL '5 minutes'
+               WHEN 'fast' THEN INTERVAL '1 hour'
+               WHEN 'slow' THEN INTERVAL '24 hours'
+               ELSE INTERVAL '6 hours'
+             END
+           ),
+           updated_at = now()
+     WHERE user_id = $1`,
+    [userId],
+  ).catch(() => null);
+
+  return { ok: true, runId: run?.id || null, cortexRunId, recommendationCount: created };
 }
