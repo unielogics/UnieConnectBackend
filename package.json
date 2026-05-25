@@ -17,6 +17,7 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1048.0",
+    "@aws-sdk/client-secrets-manager": "^3.1053.0",
     "@fastify/cors": "^11.2.0",
     "@types/jsonwebtoken": "^9.0.10",
     "amqplib": "^0.10.9",
@@ -31,10 +32,10 @@
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.8",
-    "@types/node": "^25.0.8",
+    "@types/node": "^20.14.0",
     "@types/node-fetch": "^2.6.13",
     "@types/pg": "^8.20.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.6.3"
   }
 }

@@ -31,7 +31,7 @@ async function start() {
   app.addHook('onError', async (req, _reply, err) => {
     req.log.error({ reqId: req.id, err }, 'unhandled error');
   });
-  app.log.info('UnieConnect backend starting in Aurora PostgreSQL mode; MongoDB startup is disabled.');
+  app.log.info('UnieConnect backend starting in Aurora PostgreSQL mode.');
 
   // Production sanity: WMS_API_URL must NOT be localhost
   const isProduction = process.env.NODE_ENV === 'production';
@@ -78,7 +78,6 @@ async function start() {
     await authRoutes(instance);
     await registerRoutes(instance);
   }, { prefix: '/api/v1' });
-  app.log.warn('legacy Mongo marketplace/catalog schedulers are purged; SQL/Cortex sync jobs must run through Aurora-backed workers.');
   await app.listen({ port: config.port, host: '0.0.0.0' });
   app.log.info(`UnieConnect listening on ${config.port}`);
 }

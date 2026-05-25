@@ -7,6 +7,7 @@ import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
 import { publicEntityId } from '../lib/public-id';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
+import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken } from '../services/ebay';
 
 type AnyRow = Record<string, any>;
@@ -558,9 +559,8 @@ const DEFAULT_WMS_BRIDGE_SCOPES = [
 
 export async function sqlModeRoutes(app: FastifyInstance) {
   app.get('/legacy/status', async () => ({
-    mongo: 'purged',
-    replacement: 'aurora_postgres',
-    message: 'Legacy Mongo-backed feature groups are served by Aurora SQL routes.',
+    database: "aurora_postgres",
+    message: 'Legacy feature groups are served by Aurora SQL routes.',
   }));
 
   app.get('/channel-accounts', async (req: any, reply) => {
@@ -1921,6 +1921,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         [user.id, CORE_FEATURE_IDS],
       ).catch(() => null);
       await pgQuery('UPDATE app_users SET enabled_features = $2::TEXT[], updated_at = now() WHERE id = $1', [user.id, CORE_FEATURE_IDS]).catch(() => null);
+      await ensureCortexCredentialForUser(user.id).catch((err) => {
+        req.log.warn({ err, userId: user.id }, 'cortex credential auto-provision failed during manager create');
+      });
     }
     await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [user?.id, 'created_by_manager', JSON.stringify({ managerId })]);
     return mapUser(user || {});
