@@ -19,6 +19,7 @@ import {
   getOmsSupplierActivity,
   getOmsSuppliers,
 } from '../services/oms-production.service';
+import { getKeepaSnapshot, peekKeepaSnapshot } from '../services/keepa';
 
 function requireUser(req: any, reply: any): string | null {
   const userId = req.user?.userId;
@@ -143,4 +144,26 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     return getCopilotContext(userId, String(req.query?.screen || 'command-center'));
   });
+  fastify.get('/oms/keepa/:asin', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const asin = String(req.params?.asin || '').trim().toUpperCase();
+    if (!asin) return reply.code(400).send({ error: 'asin required' });
+    const peek = await peekKeepaSnapshot(asin);
+    return { asin, snapshot: peek };
+  });
+
+  fastify.post('/oms/keepa/:asin/refresh', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const asin = String(req.params?.asin || '').trim().toUpperCase();
+    if (!asin) return reply.code(400).send({ error: 'asin required' });
+    try {
+      const snap = await getKeepaSnapshot(asin, { force: true });
+      return { asin, snapshot: snap };
+    } catch (err: any) {
+      return reply.code(502).send({ error: err?.message || 'Keepa refresh failed' });
+    }
+  });
+
 }

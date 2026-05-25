@@ -58,6 +58,7 @@
     "src/routes/sql-mode.routes.ts",
     "src/services/address-validation.service.ts",
     "src/services/cortex-orchestration.ts",
+    "src/services/keepa.ts",
     "src/services/oms-production.service.ts",
     "src/services/oms-production.types.ts",
     "src/services/oms-intelligence.service.ts",

@@ -1,3 +1,4 @@
+import { getKeepaSnapshot } from "./keepa";
 import { randomUUID } from 'crypto';
 import { FastifyBaseLogger } from 'fastify';
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
@@ -495,16 +496,55 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     [userId, `%${item.sku}%`],
   );
   const facilities = await getFacilities(userId);
+  // (paste-replace) Keepa enrichment: best-effort, never fails the response.
+  const asin = (item.asin || '').trim().toUpperCase() || null;
+  let keepa: any = null;
+  if (asin) {
+    try {
+      const snap = await getKeepaSnapshot(asin);
+      if (snap && snap.ok) {
+        keepa = {
+          asin: snap.asin,
+          title: snap.title,
+          brand: snap.brand,
+          category: snap.category,
+          buyboxPrice: snap.buybox_price_cents != null ? snap.buybox_price_cents / 100 : null,
+          salesRank: snap.sales_rank,
+          rating: snap.rating,
+          reviewCount: snap.review_count,
+          dimensions: {
+            lengthIn: snap.length_in,
+            widthIn: snap.width_in,
+            heightIn: snap.height_in,
+          },
+          weightLb: snap.weight_lb,
+          fetchedAt: snap.fetched_at,
+          expiresAt: snap.expires_at,
+        };
+      }
+    } catch {
+      // ignore; UI shows local fields only when Keepa is unreachable
+    }
+  }
+  // Fallbacks for missing local dims/weight when Keepa has them
+  const dimsLocal = itemDimensions(item);
+  const dims = {
+    length: dimsLocal?.length || keepa?.dimensions?.lengthIn || null,
+    width: dimsLocal?.width || keepa?.dimensions?.widthIn || null,
+    height: dimsLocal?.height || keepa?.dimensions?.heightIn || null,
+  };
+  const weight = (item.weight && Number(item.weight) > 0) ? Number(item.weight) : (keepa?.weightLb || null);
   return {
     id: item.id,
     sku: item.sku,
     title: item.title,
-    asin: item.asin || null,
+    asin,
     image: item.image || null,
     supplierId: item.supplier_id || null,
-    dimensions: itemDimensions(item),
-    weight: item.weight || null,
+    dimensions: dims,
+    weight,
     intelligence,
+    keepa,    // NEW field — null when ASIN absent or cache empty
     nextShipments: activityPlans.slice(0, 6).map((plan, i) => ({
       id: plan.internal_shipment_id || String(plan.id),
       date: iso(plan.estimated_arrival_date || plan.order_date || plan.created_at),

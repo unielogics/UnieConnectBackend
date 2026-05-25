@@ -16,8 +16,10 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1053.0",
     "@aws-sdk/client-s3": "^3.1048.0",
     "@aws-sdk/client-secrets-manager": "^3.1053.0",
+    "@aws-sdk/lib-dynamodb": "^3.1053.0",
     "@fastify/cors": "^11.2.0",
     "@types/jsonwebtoken": "^9.0.10",
     "amqplib": "^0.10.9",
