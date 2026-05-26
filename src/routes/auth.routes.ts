@@ -5,6 +5,8 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
 import { pgQuery } from '../db/postgres';
 import { isValidRole, normalizeRole } from '../lib/roles';
+import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
+import { seedDemoDataForUser, shouldAutoSeed } from '../services/demo-seed.service';
 import {
   changeSqlUserPassword,
   findSqlUserById,
@@ -158,6 +160,17 @@ export async function authRoutes(fastify: FastifyInstance) {
     if (!user) return reply.code(500).send({ error: 'User created but could not be loaded' });
     const authToken = signUser(user);
     setAuthCookie(reply, req, authToken);
+    // Fire-and-forget: provision Cortex credential + engagement so the AI loop
+    // is ready when the user first lands on the BusinessDouble screen.
+    void ensureCortexCredentialForUser(userId).catch((err: any) => {
+      req.log?.warn({ err, userId }, 'cortex credential auto-provision failed during signup');
+    });
+    // Optional demo data seed for stage/demo accounts.
+    if (shouldAutoSeed(normalizedEmail)) {
+      void seedDemoDataForUser(userId).catch((err: any) => {
+        req.log?.warn({ err, userId }, 'demo auto-seed failed during signup');
+      });
+    }
     return { token: authToken, user };
   });
 
