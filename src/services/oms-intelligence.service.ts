@@ -1120,12 +1120,60 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
     );
   }
 
-  const summary = (result.summary || {}) as Record<string, any>;
-  const bd = (result.business_double || {}) as Record<string, any>;
-  const monthlySavings =
-    number(summary.monthlySavings) ||
-    Math.max(0, number(bd?.currentMetrics?.monthlyCost) - number(bd?.optimizedMetrics?.monthlyCost));
-  const confidence = number(summary.confidence, 0.85);
+  // Cortex bundle shape:
+  //   result.synthesis.ai_recommendations.items[]
+  //   result.synthesis.ai_recommendations.executive_summary{verdict, top_findings, immediate_actions}
+  //   result.planning.scenario_integrated_fbm.network_fulfillment_economics
+  //   result.planning.scenario_integrated_fbm.warehouse_network.order_velocity_enrichment.estimated_monthly_demand_units_for_planning
+  const synthesis = (result as any)?.synthesis || {};
+  const aiRecs = synthesis?.ai_recommendations || {};
+  const aiItems: any[] = Array.isArray(aiRecs?.items) ? aiRecs.items : [];
+  const execSummary = aiRecs?.executive_summary || {};
+
+  const planning = (result as any)?.planning || {};
+  const fbm = planning?.scenario_integrated_fbm || {};
+  const econ = fbm?.network_fulfillment_economics || {};
+  const demand = number(
+    fbm?.warehouse_network?.order_velocity_enrichment?.estimated_monthly_demand_units_for_planning ||
+      fbm?.warehouse_network?.monthly_total_demand_units ||
+      0,
+  );
+  const singleCostPU = number(econ?.single_warehouse_fulfillment_cost_usd_per_unit);
+  const multiCostPU = number(econ?.multi_warehouse_fulfillment_cost_usd_per_unit);
+  const perUnitSavings = Math.max(0, singleCostPU - multiCostPU);
+  const monthlyCurrentCost = singleCostPU * demand;
+  const monthlyOptimizedCost = multiCostPU * demand;
+  const monthlySavings = perUnitSavings * demand;
+  const savingsPct = number(econ?.savings_pct_multi_warehouse_vs_single_warehouse);
+  const confidence = number(
+    synthesis?.competitive_kpis?.confidence ?? execSummary?.confidence ?? 0.85,
+    0.85,
+  );
+
+  const haveBusinessDouble = monthlySavings > 0 && demand > 0;
+  const haveAIRecs = aiItems.length > 0;
+
+  if (!haveBusinessDouble && !haveAIRecs) {
+    // Nothing actionable in this bundle; leave existing recs in place so the UI
+    // does not appear to regress between cycles.
+    if (run?.id) {
+      await completeRun({
+        userId,
+        runId: run.id,
+        status: 'completed',
+        output: {
+          from_cortex: true,
+          cortexRunId,
+          monthlySavings: 0,
+          note: 'No extractable recs or economics in Cortex bundle',
+        },
+        confidence,
+        cortexStatus: 'ok',
+        cortexResponse: { schema_version: (result as any)?.schema_version, engagement_id: engagementId },
+      });
+    }
+    return { ok: true, runId: run?.id || null, cortexRunId, recommendationCount: 0, skipped: 'empty_bundle' };
+  }
 
   const stored = await one(
     `INSERT INTO oms_seller_optimization_runs
@@ -1135,62 +1183,94 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
     [
       userId,
       run?.id || null,
-      JSON.stringify({ ...summary, from_cortex: true, engagementId, cortexRunId, monthlySavings, annualizedSavings: monthlySavings * 12 }),
-      JSON.stringify(bd),
-      JSON.stringify(result.planning || {}),
-      JSON.stringify({ source: 'cortex_webhook', cortexRunId, engagementId }),
+      JSON.stringify({
+        title: 'Cortex Seller Optimization',
+        from_cortex: true,
+        cortexRunId,
+        engagementId,
+        monthlySavings,
+        annualizedSavings: monthlySavings * 12,
+        currentMonthlyCost: monthlyCurrentCost,
+        optimizedMonthlyCost: monthlyOptimizedCost,
+        demandUnitsMonthly: demand,
+        savingsPct,
+        verdict: execSummary?.verdict || null,
+      }),
+      JSON.stringify({
+        currentMetrics: { monthlyCost: monthlyCurrentCost, costPerUnit: singleCostPU, warehouseNodes: 1 },
+        optimizedMetrics: {
+          monthlyCost: monthlyOptimizedCost,
+          costPerUnit: multiCostPU,
+          warehouseNodes:
+            number(fbm?.warehouse_network?.network_selection_meta?.selected_warehouse_count) || 2,
+        },
+        savings: { perUnit: perUnitSavings, monthly: monthlySavings, annualized: monthlySavings * 12, pct: savingsPct },
+        recommendationVerdict: fbm?.recommendation || null,
+      }),
+      JSON.stringify({
+        scenario_integrated_fbm_snapshot: {
+          recommendation: fbm?.recommendation,
+          savings_pct: savingsPct,
+          demand,
+        },
+      }),
+      JSON.stringify({ source: 'cortex_webhook', cortexRunId, engagementId, schema_version: (result as any)?.schema_version }),
       Math.min(0.98, Math.max(0.5, confidence)),
     ],
   );
 
-  const cortexRecs = Array.isArray(result.recommendations) ? result.recommendations : [];
+  await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
   let created = 0;
-  const haveReplacements = cortexRecs.length > 0 || monthlySavings > 0;
-  if (haveReplacements) {
-    await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
-  }
 
-  if (cortexRecs.length === 0 && monthlySavings > 0) {
+  if (haveBusinessDouble) {
     await createRecommendation(userId, {
       runId: run?.id || null,
       recommendationType: 'business_double',
       entityType: 'business_double',
       entityId: stored?.id,
-      title: 'Approve Cortex-optimized operating model',
-      summary: `Cortex projects $${Math.round(monthlySavings).toLocaleString()}/mo savings from the optimized plan.`,
-      currentValue: bd?.currentMetrics || {},
-      optimizedValue: bd?.optimizedMetrics || {},
-      estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12 },
+      title: 'Approve Cortex-optimized multi-warehouse plan',
+      summary: `Cortex AI projects $${Math.round(monthlySavings).toLocaleString()}/mo savings (~${Math.round(savingsPct)}%) by moving from a single warehouse to the recommended multi-node layout. Monthly demand: ${Math.round(demand).toLocaleString()} units.`,
+      currentValue: { monthlyCost: monthlyCurrentCost, costPerUnit: singleCostPU, warehouseNodes: 1 },
+      optimizedValue: {
+        monthlyCost: monthlyOptimizedCost,
+        costPerUnit: multiCostPU,
+        warehouseNodes:
+          number(fbm?.warehouse_network?.network_selection_meta?.selected_warehouse_count) || 2,
+      },
+      estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12, savingsPct },
       requiredAction: 'approve_business_double',
       approvalState: 'waiting_approval',
       wmsTruthState: 'forecast_only',
       confidence,
-      sourceSummary: { from_cortex: true, cortexRunId },
+      sourceSummary: { from_cortex: true, cortexRunId, verdict: execSummary?.verdict || null },
     });
-    created = 1;
-  } else {
-    for (const rec of cortexRecs) {
-      const recommendationType = pick(rec.recommendationType, rec.recommendation_type) || 'business_double';
-      const entityType = pick(rec.entityType, rec.entity_type) || 'business_double';
-      const entityId = pick(rec.entityId, rec.entity_id) || stored?.id || null;
-      await createRecommendation(userId, {
-        runId: run?.id || null,
-        recommendationType,
-        entityType,
-        entityId: entityId ? String(entityId) : null,
-        title: rec.title || 'Cortex recommendation',
-        summary: rec.summary || '',
-        currentValue: (pick(rec.currentValue, rec.current_value) as Record<string, unknown>) || {},
-        optimizedValue: (pick(rec.optimizedValue, rec.optimized_value) as Record<string, unknown>) || {},
-        estimatedImpact: (pick(rec.estimatedImpact, rec.estimated_impact) as Record<string, unknown>) || {},
-        requiredAction: pick(rec.requiredAction, rec.required_action) || 'review',
-        approvalState: 'waiting_approval',
-        wmsTruthState: 'wms_confirmed',
-        confidence: rec.confidence ?? confidence,
-        sourceSummary: { from_cortex: true, cortexRunId },
-      });
-      created += 1;
-    }
+    created += 1;
+  }
+
+  for (const item of aiItems.slice(0, 8)) {
+    await createRecommendation(userId, {
+      runId: run?.id || null,
+      recommendationType: String(item?.category || 'data_readiness'),
+      entityType: 'account',
+      entityId: userId,
+      title: String(item?.title || 'Cortex AI recommendation'),
+      summary: String(item?.why || item?.action || ''),
+      currentValue: { evidencePath: item?.evidence_path || null },
+      optimizedValue: { action: item?.action || null },
+      estimatedImpact: { priority: String(item?.priority || 'medium') },
+      requiredAction: String(item?.action || 'review'),
+      approvalState: 'waiting_approval',
+      wmsTruthState: 'forecast_only',
+      confidence,
+      sourceSummary: {
+        from_cortex: true,
+        cortexRunId,
+        item_id: item?.id || null,
+        priority: item?.priority || null,
+        category: item?.category || null,
+      },
+    });
+    created += 1;
   }
 
   if (run?.id) {
@@ -1198,10 +1278,20 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
       userId,
       runId: run.id,
       status: 'completed',
-      output: { summary, recommendationCount: created, cortexRunId, from_cortex: true },
+      output: {
+        from_cortex: true,
+        cortexRunId,
+        monthlySavings,
+        recommendationCount: created,
+        verdict: execSummary?.verdict || null,
+      },
       confidence,
       cortexStatus: 'ok',
-      cortexResponse: result as Record<string, unknown>,
+      cortexResponse: {
+        schema_version: (result as any)?.schema_version,
+        engagement_id: engagementId,
+        recommendation_count: created,
+      },
     });
   }
 
@@ -1211,8 +1301,8 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
     entityId: stored?.id || run?.id || null,
     eventType: 'cortex_callback_ingested',
     sourceSystem: 'cortex',
-    summary: `Cortex completed seller-optimization run; ${created} recommendations.`,
-    payload: { cortexRunId, engagementId, recommendationCount: created, monthlySavings },
+    summary: `Cortex completed seller-optimization. ${created} recommendations ingested. Monthly savings: $${Math.round(monthlySavings).toLocaleString()}.`,
+    payload: { cortexRunId, engagementId, recommendationCount: created, monthlySavings, verdict: execSummary?.verdict || null },
     confidence,
   });
 
