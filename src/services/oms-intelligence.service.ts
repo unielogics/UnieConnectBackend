@@ -619,14 +619,35 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
   const [business, inventory] = await Promise.all([getBusinessDouble(userId), getInventoryPlan(userId, input?.horizon || '6m')]);
   const run = await createRun(userId, 'seller_optimization', input, readiness);
   await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
-  const cortex = await postCortex('/v1/assessment/seller-optimization/runs', {
-    userId,
-    tenant_id: userId,
-    source_priority: readiness.sourcePriority,
-    readiness,
-    businessDouble: business.plan,
-    inventoryPlan: inventory,
-  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+
+  // Resolve the Cortex engagement bound to this user. Without it the seller
+  // optimization endpoint 422s on the missing engagement_id field.
+  const credRow = await one(
+    `SELECT cortex_engagement_id FROM oms_cortex_credentials WHERE user_id = $1 LIMIT 1`,
+    [userId],
+  );
+  const engagementId = (credRow as any)?.cortex_engagement_id || null;
+
+  // Send the minimal body Cortex's pydantic model accepts. The scheduler uses
+  // this exact shape and gets 200; richer fields (seller_context, etc.) caused
+  // 422 in earlier attempts.
+  const cortex = engagementId
+    ? await postCortex('/v1/assessment/seller-optimization/runs', {
+        engagement_id: engagementId,
+        with_ai_recommendations: true,
+        input_summary: `OMS user-triggered run (readiness ${readiness.score}, ${readiness.posture}).`,
+      }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }))
+    : ({ ok: false, status: 412, data: { error: 'Cortex engagement not yet provisioned for this user' } } as const);
+
+  // Persist Cortex's run_id on the local run row so the webhook can match the
+  // async result back to this row.
+  const cortexRunId = (cortex.ok && (cortex.data as any)?.id) || null;
+  if (run?.id && cortexRunId) {
+    await pgQuery(
+      `UPDATE oms_intelligence_runs SET cortex_run_id = $2, status = 'pending_cortex', updated_at = now() WHERE id = $1`,
+      [run.id, cortexRunId],
+    ).catch(() => null);
+  }
 
   const currentMonthlyCost = number(business.plan?.currentMetrics?.monthlyCost) || number(inventory.current?.estimatedMonthlyCost);
   const optimizedMonthlyCost = number(business.plan?.optimizedMetrics?.monthlyCost) || number(inventory.proposed?.estimatedMonthlyCost);
