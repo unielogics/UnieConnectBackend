@@ -827,6 +827,36 @@ export async function getRecommendations(userId: string, query: any = {}) {
   return { recommendations: data.map(mapRecommendation).filter(Boolean) };
 }
 
+function closedLoopNumber(...values: any[]): number | null {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function buildRecommendationExecutionTruth(rec: Row) {
+  const current = rec.current_value || {};
+  const optimized = rec.optimized_value || {};
+  const impact = rec.estimated_impact || {};
+  const planned = closedLoopNumber(
+    optimized.planned_quantity,
+    optimized.quantity,
+    optimized.recommended_quantity,
+    current.planned_quantity,
+    current.quantity,
+    impact.quantity,
+  );
+  return {
+    planned_quantity: planned,
+    approved_quantity: planned,
+    service_tier: optimized.service_tier || current.service_tier || impact.service_tier || null,
+    expected_savings: closedLoopNumber(impact.expected_savings, impact.savings, impact.savingsUsd, impact.monthlySavings, impact.annualSavings),
+    expected_service_impact: impact.serviceImpact || impact.service_impact || optimized.serviceImpact || null,
+    confidence_before: closedLoopNumber(rec.confidence),
+  };
+}
+
 function screenEntityType(screen: string) {
   const key = screen.toLowerCase();
   if (key.includes('sku') || key.includes('inventory')) return 'sku';
@@ -855,12 +885,17 @@ export async function approveRecommendation(userId: string, recommendationId: st
      VALUES ($1, $2, $3, 'approved', $4::jsonb, true)`,
     [userId, recommendationId, rec.required_action || 'approved_recommendation', JSON.stringify(body || {})],
   ).catch(() => null);
-  const cortex = await postCortex('/v1/orchestration/oms/recommendation/approved', {
+  const cortexDecisionId = `oms-rec-${recommendationId}`;
+  const cortex = await postCortex(`/v1/orchestration/oms/recommendations/${recommendationId}/decision`, {
     userId,
     tenant_id: userId,
-    recommendation: mapRecommendation(updated),
+    decision_id: cortexDecisionId,
+    lifecycle_state: 'approved',
+    recommendation: mapRecommendation(updated || rec),
     approval: body,
-  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+    execution_truth: buildRecommendationExecutionTruth(updated || rec),
+    source_quality: rec.source_summary?.primarySource || rec.source_summary?.quality || 'oms',
+  }, { userId, idempotencyKey: `oms-rec-approve-${recommendationId}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   await writeOmsLedgerEvent({
     userId,
     entityType: rec.entity_type || rec.recommendation_type,
@@ -868,7 +903,7 @@ export async function approveRecommendation(userId: string, recommendationId: st
     eventType: 'recommendation_approved',
     sourceSystem: 'oms',
     summary: `Approved recommendation: ${rec.title}`,
-    payload: { recommendationId, cortex },
+    payload: { recommendationId, cortexDecisionId: `oms-rec-${recommendationId}`, cortex, lifecycleState: cortex?.data?.lifecycle_state || 'approved' },
     confidence: rec.confidence,
   });
   return { recommendation: mapRecommendation(updated), cortex };

@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import fetch from 'node-fetch';
 import { config } from '../config/env';
+import { getCortexCredentialHeaders } from './cortex-credentials.service';
 
 // ─── Resilience layer ──────────────────────────────────────────────────────
 // Every call to Cortex goes through retryWithBackoff + circuit breaker.
@@ -11,6 +12,23 @@ const CONNECT_TIMEOUT_MS = 5_000;
 const READ_TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = [250, 1_000, 4_000] as const;
+
+type CortexPostOptions = {
+  userId?: string | null;
+  idempotencyKey?: string;
+  extraHeaders?: Record<string, string>;
+};
+
+function deriveCortexUserId(payload: any, options?: CortexPostOptions): string | null {
+  return String(
+    options?.userId ||
+      payload?.userId ||
+      payload?.user_id ||
+      payload?.tenant_id ||
+      payload?.tenantId ||
+      ''
+  ).trim() || null;
+}
 
 // Circuit breaker state (per-process, not per-tenant; tenancy is in the
 // payload, not in connection identity).
@@ -78,14 +96,20 @@ async function fetchWithTimeout(url: string, init: any): Promise<{ res: any; tex
 
 // ─── postCortex (resilient) ───────────────────────────────────────────────
 
-export async function postCortex(path: string, payload: any) {
-  if (!config.cortex.apiKey) {
+export async function postCortex(path: string, payload: any, options: CortexPostOptions = {}) {
+  const userId = deriveCortexUserId(payload, options);
+  const credentialHeaders = userId
+    ? await getCortexCredentialHeaders(userId).catch(() => null)
+    : null;
+
+  if (!credentialHeaders && !config.cortex.apiKey) {
     return {
       ok: false,
       status: 503,
       data: {
-        error: 'CORTEX_API_KEY is not configured on UnieConnect',
+        error: 'No tenant Cortex credential or CORTEX_API_KEY is configured on UnieConnect',
         path,
+        userId,
       },
     };
   }
@@ -104,11 +128,13 @@ export async function postCortex(path: string, payload: any) {
   }
 
   // Idempotency-Key persists across retries so Cortex can dedupe.
-  const idempotencyKey = `unieconnect-${randomUUID()}`;
+  const idempotencyKey = options.idempotencyKey || `unieconnect-${randomUUID()}`;
   const url = `${config.cortex.apiUrl}${path}`;
+  const authHeaders = credentialHeaders || { 'X-API-Key': config.cortex.apiKey };
   const headers = {
     'Content-Type': 'application/json',
-    'X-API-Key': config.cortex.apiKey,
+    ...authHeaders,
+    ...(options.extraHeaders || {}),
     'Idempotency-Key': idempotencyKey,
   };
   const body = JSON.stringify(payload);
