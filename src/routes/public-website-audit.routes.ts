@@ -29,13 +29,30 @@ async function forwardToCortex(method: 'GET' | 'POST', path: string, body?: unkn
   return { status: res.status, data: parseJson(text) };
 }
 
+function normalizeAuditBody(input: any) {
+  const body = { ...(input || {}) };
+  const originInput = body.origins ?? body.origin_zips ?? body.originZips ?? body.zips ?? body.zip;
+  const origins = Array.isArray(originInput) ? originInput : originInput ? String(originInput).split(',') : [];
+  body.origins = origins
+    .map((value: unknown) => String(value || '').trim())
+    .filter(Boolean);
+  delete body.origin_zips;
+  delete body.originZips;
+
+  const monthlyOrders = body.monthly_orders ?? body.monthlyOrders ?? body.orders;
+  if (monthlyOrders !== undefined && monthlyOrders !== null && String(monthlyOrders).trim() !== '') {
+    body.monthly_orders = monthlyOrders;
+  }
+  delete body.monthlyOrders;
+
+  body.source = body.source || 'unieconnect_public_audit';
+  return body;
+}
+
 export async function publicWebsiteAuditRoutes(app: FastifyInstance) {
   app.post('/public/website-catalog-audit', async (req: any, reply) => {
     try {
-      const body = {
-        ...(req.body || {}),
-        source: 'unieconnect_public_audit',
-      };
+      const body = normalizeAuditBody(req.body);
       const result = await forwardToCortex('POST', CORTEX_PUBLIC_AUDIT_PATH, body);
       return reply.code(result.status).send(result.data);
     } catch (err: any) {
