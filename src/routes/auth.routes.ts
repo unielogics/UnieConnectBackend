@@ -98,12 +98,12 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/invite/validate', async (req: any) => {
     const token = String(req.query?.token || '').trim();
     if (!token) return { valid: false };
-    const res = await pgQuery<{ role: string }>(
-      'SELECT role FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
+    const res = await pgQuery<{ role: string; metadata: any }>(
+      'SELECT role, metadata FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
       [token],
     );
     const invite = res?.rows[0];
-    return invite ? { valid: true, role: normalizeRole(invite.role) } : { valid: false };
+    return invite ? { valid: true, role: normalizeRole(invite.role), metadata: invite.metadata || {} } : { valid: false };
   });
 
   fastify.post('/auth/invite/signup', async (req: any, reply) => {
@@ -114,8 +114,8 @@ export async function authRoutes(fastify: FastifyInstance) {
       return reply.code(400).send({ error: 'token, email and password required' });
     }
 
-    const inviteRes = await pgQuery<{ id: string; role: string }>(
-      'SELECT id, role FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
+    const inviteRes = await pgQuery<{ id: string; role: string; metadata: any }>(
+      'SELECT id, role, metadata FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
       [inviteToken],
     );
     const invite = inviteRes?.rows[0];
@@ -153,8 +153,20 @@ export async function authRoutes(fastify: FastifyInstance) {
     await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
       userId,
       'invite_signup',
-      JSON.stringify({ inviteId: invite.id }),
+      JSON.stringify({ inviteId: invite.id, inviteMetadata: invite.metadata || {} }),
     ]);
+    if (invite.metadata?.source === 'unieconnect_public_audit' && invite.metadata?.audit_reference) {
+      await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
+        userId,
+        'audit_signup_completed',
+        JSON.stringify({
+          auditReference: invite.metadata.audit_reference,
+          website: invite.metadata.website || null,
+          company: invite.metadata.company || null,
+          source: invite.metadata.source,
+        }),
+      ]);
+    }
 
     const user = await findSqlUserById(userId);
     if (!user) return reply.code(500).send({ error: 'User created but could not be loaded' });
@@ -171,7 +183,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         req.log?.warn({ err, userId }, 'demo auto-seed failed during signup');
       });
     }
-    return { token: authToken, user };
+    return { token: authToken, user, auditReference: invite.metadata?.audit_reference || null };
   });
 
   fastify.post('/auth/request-reset', async (req: any) => {
