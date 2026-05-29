@@ -10,6 +10,7 @@ import { sqlModeRoutes } from './sql-mode.routes';
 import { wmsIntegrationRoutes } from './wms-integration.routes';
 import { supportRoutes } from './support.routes';
 import { uploadRoutes } from './upload.routes';
+import { publicWebsiteAuditRoutes } from './public-website-audit.routes';
 
 export async function registerRoutes(app: FastifyInstance) {
   await healthRoutes(app);
@@ -19,6 +20,7 @@ export async function registerRoutes(app: FastifyInstance) {
   await omsCustomizationRoutes(app);
   await supportRoutes(app);
   await uploadRoutes(app);
+  await publicWebsiteAuditRoutes(app);
   await cortexRoutes(app);
   await cortexIngestRoutes(app);
   await wmsIntegrationRoutes(app);
