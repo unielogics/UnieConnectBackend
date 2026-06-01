@@ -202,6 +202,127 @@ function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
   };
 }
 
+function mapAmazonProfile(row: AnyRow) {
+  const blockers = Array.isArray(row.blockers) ? row.blockers : [];
+  const listingStatus = row.listing_status || 'needs_listing';
+  const fulfillmentChannel = row.fulfillment_channel || 'UNKNOWN';
+  const fbaEligible = ['listed', 'active'].includes(listingStatus)
+    && ['AMAZON', 'FBA'].includes(fulfillmentChannel)
+    && blockers.length === 0;
+  const hasFbaInventorySignal =
+    number(row.available_fba_qty) > 0 ||
+    number(row.inbound_working_qty) > 0 ||
+    number(row.inbound_shipped_qty) > 0 ||
+    number(row.inbound_receiving_qty) > 0 ||
+    number(row.reserved_qty) > 0 ||
+    String(row.sync_status || '').includes('inventory');
+  const identityState = fbaEligible
+    ? 'FBA shipment eligible'
+    : hasFbaInventorySignal
+      ? 'Amazon FBA inventory synced'
+      : row.asin
+        ? 'Amazon listing mapped'
+        : 'Needs Amazon listing setup';
+  return {
+    id: row.id,
+    itemId: row.item_id,
+    channelConnectionId: row.channel_connection_id,
+    marketplaceId: row.marketplace_id || 'ATVPDKIKX0DER',
+    sellerSku: row.seller_sku,
+    asin: row.asin,
+    title: row.title,
+    listingStatus,
+    fulfillmentChannel,
+    availableFbaQty: number(row.available_fba_qty),
+    inboundWorkingQty: number(row.inbound_working_qty),
+    inboundShippedQty: number(row.inbound_shipped_qty),
+    inboundReceivingQty: number(row.inbound_receiving_qty),
+    reservedQty: number(row.reserved_qty),
+    syncStatus: row.sync_status || 'manual',
+    lastAmazonSyncAt: iso(row.last_amazon_sync_at),
+    blockers,
+    raw: json(row.raw, {}),
+    fbaEligible,
+    identityState,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function amazonBlockersForItem(item: AnyRow, profile: AnyRow = {}) {
+  const dims = json(item.dimensions, {});
+  const blockers: string[] = [];
+  if (!trim(profile.sellerSku || profile.seller_sku || item.sku)) blockers.push('Missing Amazon seller SKU');
+  if (!trim(profile.asin || item.asin)) blockers.push('Missing ASIN or Amazon listing mapping');
+  if (!trim(item.title)) blockers.push('Missing product title');
+  if (!trim(item.upc || item.ean || profile.asin || item.asin)) blockers.push('Missing product identifier');
+  if (!number(item.weight)) blockers.push('Missing item weight');
+  if (!number(dims.length) || !number(dims.width) || !number(dims.height)) blockers.push('Missing item dimensions');
+  if ((profile.fulfillmentChannel || profile.fulfillment_channel || '').toUpperCase() === 'AMAZON' && !trim(profile.asin || item.asin)) {
+    blockers.push('FBA requires an Amazon listing before shipment planning');
+  }
+  return blockers;
+}
+
+function listingDraftPayload(item: AnyRow, body: AnyRow = {}) {
+  const dims = json(item.dimensions, {});
+  const metadata = json(item.metadata, {});
+  const images = json(item.images, []);
+  return {
+    marketplaceId: body.marketplaceId || 'ATVPDKIKX0DER',
+    sellerSku: trim(body.sellerSku || item.sku),
+    asin: trim(body.asin || item.asin) || null,
+    productType: body.productType || metadata.productType || item.category || 'PRODUCT',
+    title: body.title || item.title,
+    brand: body.brand || metadata.brand || metadata.manufacturer || '',
+    description: body.description || item.description || '',
+    price: body.price ?? metadata.price ?? null,
+    condition: body.condition || 'new_new',
+    fulfillmentChannel: body.fulfillmentChannel || 'AMAZON',
+    identifiers: {
+      upc: body.upc || item.upc || null,
+      ean: body.ean || item.ean || null,
+      asin: body.asin || item.asin || null,
+    },
+    dimensions: {
+      length: number(body.length ?? dims.length),
+      width: number(body.width ?? dims.width),
+      height: number(body.height ?? dims.height),
+    },
+    weight: number(body.weight ?? item.weight),
+    images: Array.isArray(body.images) ? body.images : (Array.isArray(images) ? images : []).filter(Boolean),
+  };
+}
+
+function validateListingPayload(payload: AnyRow) {
+  const required = [
+    { key: 'sellerSku', label: 'Seller SKU' },
+    { key: 'productType', label: 'Amazon product type' },
+    { key: 'title', label: 'Title' },
+    { key: 'brand', label: 'Brand' },
+    { key: 'price', label: 'Price' },
+    { key: 'condition', label: 'Condition' },
+    { key: 'weight', label: 'Weight' },
+    { key: 'dimensions.length', label: 'Length' },
+    { key: 'dimensions.width', label: 'Width' },
+    { key: 'dimensions.height', label: 'Height' },
+  ];
+  const errors = required
+    .filter(({ key }) => {
+      const value = key.split('.').reduce((acc: any, part) => acc?.[part], payload);
+      return value === undefined || value === null || value === '' || (typeof value === 'number' && value <= 0);
+    })
+    .map(({ label }) => `${label} is required before publishing to Amazon`);
+  if (!payload.identifiers?.upc && !payload.identifiers?.ean && !payload.identifiers?.asin) {
+    errors.push('UPC, EAN, or ASIN is required before publishing to Amazon');
+  }
+  const warnings: string[] = [];
+  if (!Array.isArray(payload.images) || payload.images.length === 0) {
+    warnings.push('Add at least one product image before publishing for stronger Amazon listing quality');
+  }
+  return { required, errors, warnings };
+}
+
 function mapSupplier(row: AnyRow) {
   const metadata = json(row.metadata, {});
   const pickupProfile = supplierPickupProfile(row);
@@ -2188,6 +2309,465 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   });
 
   app.post('/shopify/inventory', async (_req: any, reply) => reply.code(202).send({ accepted: true, source: 'aurora_postgres' }));
+
+  app.get('/amazon/items', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const { limit, offset } = pagination(req.query);
+    const filter = trim(req.query?.filter).toLowerCase();
+    const q = trim(req.query?.q).toLowerCase();
+    const values: unknown[] = [userId];
+    const clauses = ['p.user_id = $1'];
+    if (q) {
+      values.push(`%${q}%`);
+      clauses.push(`(LOWER(p.seller_sku) LIKE $${values.length} OR LOWER(COALESCE(p.asin, '')) LIKE $${values.length} OR LOWER(COALESCE(p.title, i.title, '')) LIKE $${values.length})`);
+    }
+    if (filter === 'listed') clauses.push("p.listing_status IN ('listed', 'active', 'publish_pending')");
+    if (filter === 'needs_listing') clauses.push("p.listing_status = 'needs_listing'");
+    if (filter === 'sync_error') clauses.push("p.sync_status = 'sync_error'");
+    if (filter === 'fba') clauses.push("p.fulfillment_channel IN ('AMAZON', 'FBA')");
+    values.push(limit, offset);
+    const data = await rows(
+      `SELECT p.*, i.sku AS catalog_sku, i.title AS catalog_title, i.image AS catalog_image, i.dimensions, i.weight, i.metadata AS item_metadata,
+              c.display_name AS account_name, c.channel AS account_channel
+       FROM amazon_item_profiles p
+       LEFT JOIN catalog_items i ON i.id = p.item_id AND i.user_id = p.user_id
+       LEFT JOIN marketplace_connections c ON c.id = p.channel_connection_id AND c.user_id = p.user_id
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY COALESCE(p.last_amazon_sync_at, p.updated_at, p.created_at) DESC
+       LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values,
+    );
+    return {
+      items: data.map((row) => ({
+        ...mapAmazonProfile(row),
+        catalogSku: row.catalog_sku,
+        catalogTitle: row.catalog_title,
+        catalogImage: row.catalog_image,
+        accountName: row.account_name,
+        accountChannel: row.account_channel,
+      })),
+    };
+  });
+
+  app.post('/amazon/items/sync', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const connection = await one(
+      "SELECT * FROM marketplace_connections WHERE user_id = $1 AND channel = 'amazon' AND status <> 'archived' ORDER BY updated_at DESC LIMIT 1",
+      [userId],
+    );
+    const amazonMappings = await rows(
+      `SELECT *
+       FROM item_channel_mappings
+       WHERE user_id = $1 AND channel = 'amazon'
+       ORDER BY updated_at DESC`,
+      [userId],
+    );
+    const mappingByItem = new Map<string, AnyRow>();
+    for (const mapping of amazonMappings) {
+      const key = String(mapping.item_id || '');
+      if (key && !mappingByItem.has(key)) mappingByItem.set(key, mapping);
+    }
+    const items = await rows(
+      `SELECT * FROM catalog_items
+       WHERE user_id = $1 AND archived = false
+       ORDER BY updated_at DESC LIMIT 500`,
+      [userId],
+    );
+    const synced: AnyRow[] = [];
+    for (const item of items) {
+      const metadata = json(item.metadata, {});
+      const mapping = mappingByItem.get(String(item.id));
+      const mappingPayload = json(mapping?.payload, {});
+      const fbaInventory = json(mappingPayload.fbaInventory || mappingPayload.inventory || {}, {});
+      const fulfillmentChannel = trim(
+        mappingPayload.fulfillmentChannel ||
+        mappingPayload.fulfillment_channel ||
+        metadata.amazonFulfillmentChannel ||
+        metadata.fulfillmentChannel ||
+        (item.asin || mappingPayload.asin ? 'AMAZON' : 'UNKNOWN'),
+      ).toUpperCase();
+      const profile = {
+        sellerSku: mappingPayload.sellerSku || mappingPayload.seller_sku || mapping?.sku || metadata.amazonSellerSku || item.sku,
+        asin: mappingPayload.asin || metadata.amazonAsin || item.asin || (/^B0[A-Z0-9]{8}$/i.test(String(mapping?.channel_item_id || '')) ? mapping?.channel_item_id : null),
+        fulfillmentChannel,
+      };
+      const blockers = amazonBlockersForItem(item, profile).filter((blocker) => {
+        if (fulfillmentChannel !== 'AMAZON' && fulfillmentChannel !== 'FBA') return blocker !== 'FBA requires an Amazon listing before shipment planning';
+        return true;
+      });
+      const listingStatus = mappingPayload.listingStatus || mappingPayload.listing_status || (mapping?.status === 'active' ? 'listed' : profile.asin ? 'listed' : 'needs_listing');
+      const id = randomUUID();
+      const row = await one(
+        `INSERT INTO amazon_item_profiles (
+          id, user_id, item_id, channel_connection_id, marketplace_id, seller_sku, asin, title,
+          listing_status, fulfillment_channel, available_fba_qty, inbound_working_qty,
+          inbound_shipped_qty, inbound_receiving_qty, reserved_qty, sync_status, last_amazon_sync_at, blockers, raw
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'profiled_from_catalog', now(), $16::text[], $17::jsonb)
+        ON CONFLICT (user_id, marketplace_id, seller_sku)
+        DO UPDATE SET item_id = EXCLUDED.item_id,
+          channel_connection_id = COALESCE(EXCLUDED.channel_connection_id, amazon_item_profiles.channel_connection_id),
+          asin = COALESCE(EXCLUDED.asin, amazon_item_profiles.asin),
+          title = EXCLUDED.title,
+          listing_status = EXCLUDED.listing_status,
+          fulfillment_channel = EXCLUDED.fulfillment_channel,
+          blockers = EXCLUDED.blockers,
+          raw = amazon_item_profiles.raw || EXCLUDED.raw,
+          sync_status = EXCLUDED.sync_status,
+          last_amazon_sync_at = now(),
+          updated_at = now()
+        RETURNING *`,
+        [
+          id,
+          userId,
+          item.id,
+          mapping?.channel_connection_id || connection?.id || null,
+          req.body?.marketplaceId || mappingPayload.marketplaceId || mappingPayload.marketplace_id || connection?.marketplace_id || 'ATVPDKIKX0DER',
+          profile.sellerSku,
+          profile.asin,
+          item.title,
+          listingStatus,
+          fulfillmentChannel,
+          number(fbaInventory.available ?? metadata.availableFbaQty),
+          number(fbaInventory.inboundWorking ?? metadata.inboundWorkingQty),
+          number(fbaInventory.inboundShipped ?? metadata.inboundShippedQty),
+          number(fbaInventory.inboundReceiving ?? metadata.inboundReceivingQty),
+          number(fbaInventory.reserved ?? metadata.reservedQty),
+          blockers,
+          JSON.stringify({
+            source: mapping ? 'amazon_channel_mapping_sync' : 'catalog_profile_sync',
+            mappingId: mapping?.id || null,
+            connectionStatus: connection?.status || 'not_connected',
+          }),
+        ],
+      );
+      if (row) synced.push(row);
+    }
+    return {
+      synced: synced.length,
+      providerStatus: connection ? 'profiled_from_catalog_until_sp_api_sync' : 'profiled_without_amazon_connection',
+      items: synced.slice(0, 100).map(mapAmazonProfile),
+    };
+  });
+
+  app.post('/amazon/items/:itemId/refresh', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const item = await one('SELECT * FROM catalog_items WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, req.params.itemId]);
+    if (!item) return reply.code(404).send({ error: 'Item not found' });
+    const metadata = json(item.metadata, {});
+    const fulfillmentChannel = trim(req.body?.fulfillmentChannel || metadata.amazonFulfillmentChannel || metadata.fulfillmentChannel || (item.asin ? 'AMAZON' : 'UNKNOWN')).toUpperCase();
+    const profile = {
+      sellerSku: trim(req.body?.sellerSku || metadata.amazonSellerSku || item.sku),
+      asin: trim(req.body?.asin || metadata.amazonAsin || item.asin) || null,
+      fulfillmentChannel,
+    };
+    const blockers = amazonBlockersForItem(item, profile);
+    const row = await one(
+      `INSERT INTO amazon_item_profiles (
+        id, user_id, item_id, marketplace_id, seller_sku, asin, title, listing_status, fulfillment_channel,
+        sync_status, last_amazon_sync_at, blockers, raw
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'manual_refresh', now(), $10::text[], $11::jsonb)
+      ON CONFLICT (user_id, marketplace_id, seller_sku)
+      DO UPDATE SET item_id = EXCLUDED.item_id,
+        asin = EXCLUDED.asin,
+        title = EXCLUDED.title,
+        listing_status = EXCLUDED.listing_status,
+        fulfillment_channel = EXCLUDED.fulfillment_channel,
+        blockers = EXCLUDED.blockers,
+        raw = amazon_item_profiles.raw || EXCLUDED.raw,
+        sync_status = 'manual_refresh',
+        last_amazon_sync_at = now(),
+        updated_at = now()
+      RETURNING *`,
+      [
+        randomUUID(),
+        userId,
+        item.id,
+        req.body?.marketplaceId || 'ATVPDKIKX0DER',
+        profile.sellerSku,
+        profile.asin,
+        item.title,
+        profile.asin ? 'listed' : 'needs_listing',
+        fulfillmentChannel,
+        blockers,
+        JSON.stringify({ source: 'manual_refresh' }),
+      ],
+    );
+    if (row) {
+      await pgQuery(
+        `INSERT INTO item_channel_mappings (user_id, item_id, channel_connection_id, channel, channel_item_id, channel_variant_id, sku, status, payload)
+         VALUES ($1, $2, NULL, 'amazon', $3, $4, $5, $6, $7::jsonb)
+         ON CONFLICT (user_id, channel, channel_item_id, (COALESCE(channel_variant_id, '')))
+         DO UPDATE SET item_id = EXCLUDED.item_id, sku = EXCLUDED.sku, status = EXCLUDED.status, payload = item_channel_mappings.payload || EXCLUDED.payload, updated_at = now()`,
+        [
+          userId,
+          item.id,
+          profile.asin || profile.sellerSku,
+          profile.sellerSku,
+          profile.sellerSku,
+          profile.asin ? 'active' : 'needs_listing',
+          JSON.stringify({
+            source: 'amazon_item_refresh',
+            asin: profile.asin,
+            sellerSku: profile.sellerSku,
+            fulfillmentChannel,
+          }),
+        ],
+      );
+    }
+    return { item: row ? mapAmazonProfile(row) : null };
+  });
+
+  app.post('/amazon/listings/drafts', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const item = await one('SELECT * FROM catalog_items WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, req.body?.itemId]);
+    if (!item) return reply.code(404).send({ error: 'Item not found' });
+    const payload = listingDraftPayload(item, req.body || {});
+    const validation = validateListingPayload(payload);
+    const status = validation.errors.length ? 'needs_input' : 'ready_to_publish';
+    const row = await one(
+      `INSERT INTO amazon_listing_drafts (
+        id, user_id, item_id, channel_connection_id, marketplace_id, seller_sku, asin, product_type,
+        fulfillment_channel, status, required_fields, payload, validation_errors, warnings
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb)
+      RETURNING *`,
+      [
+        randomUUID(),
+        userId,
+        item.id,
+        req.body?.channelConnectionId || null,
+        payload.marketplaceId,
+        payload.sellerSku,
+        payload.asin,
+        payload.productType,
+        payload.fulfillmentChannel,
+        status,
+        JSON.stringify(validation.required),
+        JSON.stringify(payload),
+        JSON.stringify(validation.errors),
+        JSON.stringify(validation.warnings),
+      ],
+    );
+    return { draft: row, validation };
+  });
+
+  app.post('/amazon/listings/drafts/:draftId/validate', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const draft = await one('SELECT * FROM amazon_listing_drafts WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, req.params.draftId]);
+    if (!draft) return reply.code(404).send({ error: 'Listing draft not found' });
+    const payload = { ...json(draft.payload, {}), ...(req.body?.payload || {}) };
+    const validation = validateListingPayload(payload);
+    const status = validation.errors.length ? 'needs_input' : 'ready_to_publish';
+    const row = await one(
+      `UPDATE amazon_listing_drafts
+       SET payload = $3::jsonb, validation_errors = $4::jsonb, warnings = $5::jsonb, status = $6, updated_at = now()
+       WHERE user_id = $1 AND id = $2 RETURNING *`,
+      [userId, req.params.draftId, JSON.stringify(payload), JSON.stringify(validation.errors), JSON.stringify(validation.warnings), status],
+    );
+    return { draft: row, validation };
+  });
+
+  app.post('/amazon/listings/drafts/:draftId/publish', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const draft = await one('SELECT * FROM amazon_listing_drafts WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, req.params.draftId]);
+    if (!draft) return reply.code(404).send({ error: 'Listing draft not found' });
+    const payload = { ...json(draft.payload, {}), ...(req.body?.payload || {}) };
+    const validation = validateListingPayload(payload);
+    if (validation.errors.length) {
+      await pgQuery(
+        `UPDATE amazon_listing_drafts
+         SET payload = $3::jsonb, validation_errors = $4::jsonb, warnings = $5::jsonb, status = 'needs_input', updated_at = now()
+         WHERE user_id = $1 AND id = $2`,
+        [userId, req.params.draftId, JSON.stringify(payload), JSON.stringify(validation.errors), JSON.stringify(validation.warnings)],
+      );
+      return reply.code(400).send({ error: 'Listing draft is missing Amazon-required fields', validation });
+    }
+    const submissionResult = {
+      provider: 'amazon_listings_items',
+      status: 'pending_provider_integration',
+      message: 'Draft is validated and ready for Amazon SP-API Listings Items submission.',
+      requestedAt: new Date().toISOString(),
+    };
+    const row = await one(
+      `UPDATE amazon_listing_drafts
+       SET payload = $3::jsonb, validation_errors = '[]'::jsonb, warnings = $4::jsonb,
+           submission_result = $5::jsonb, status = 'pending_provider_integration', updated_at = now()
+       WHERE user_id = $1 AND id = $2 RETURNING *`,
+      [userId, req.params.draftId, JSON.stringify(payload), JSON.stringify(validation.warnings), JSON.stringify(submissionResult)],
+    );
+    await pgQuery(
+      `INSERT INTO amazon_item_profiles (
+        id, user_id, item_id, channel_connection_id, marketplace_id, seller_sku, asin, title,
+        listing_status, fulfillment_channel, sync_status, blockers, raw
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'publish_pending', $9, 'listing_draft_validated', ARRAY[]::text[], $10::jsonb)
+      ON CONFLICT (user_id, marketplace_id, seller_sku)
+      DO UPDATE SET item_id = EXCLUDED.item_id,
+        asin = COALESCE(EXCLUDED.asin, amazon_item_profiles.asin),
+        title = EXCLUDED.title,
+        listing_status = 'publish_pending',
+        fulfillment_channel = EXCLUDED.fulfillment_channel,
+        blockers = ARRAY[]::text[],
+        raw = amazon_item_profiles.raw || EXCLUDED.raw,
+        sync_status = 'listing_draft_validated',
+        updated_at = now()`,
+      [
+        randomUUID(),
+        userId,
+        draft.item_id,
+        draft.channel_connection_id || null,
+        payload.marketplaceId,
+        payload.sellerSku,
+        payload.asin || null,
+        payload.title,
+        payload.fulfillmentChannel,
+        JSON.stringify({ submissionResult }),
+      ],
+    );
+    await pgQuery(
+      `INSERT INTO item_channel_mappings (user_id, item_id, channel_connection_id, channel, channel_item_id, channel_variant_id, sku, status, payload)
+       VALUES ($1, $2, $3, 'amazon', $4, $5, $6, 'publish_pending', $7::jsonb)
+       ON CONFLICT (user_id, channel, channel_item_id, (COALESCE(channel_variant_id, '')))
+       DO UPDATE SET item_id = EXCLUDED.item_id,
+         channel_connection_id = COALESCE(EXCLUDED.channel_connection_id, item_channel_mappings.channel_connection_id),
+         sku = EXCLUDED.sku,
+         status = EXCLUDED.status,
+         payload = item_channel_mappings.payload || EXCLUDED.payload,
+         updated_at = now()`,
+      [
+        userId,
+        draft.item_id,
+        draft.channel_connection_id || null,
+        payload.asin || payload.sellerSku,
+        payload.sellerSku,
+        payload.sellerSku,
+        JSON.stringify({
+          source: 'amazon_listing_draft',
+          draftId: draft.id,
+          productType: payload.productType,
+          asin: payload.asin || null,
+          sellerSku: payload.sellerSku,
+          fulfillmentChannel: payload.fulfillmentChannel,
+          submissionResult,
+        }),
+      ],
+    );
+    return reply.code(202).send({ draft: row, submissionResult });
+  });
+
+  app.post('/amazon/fba/workflows', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const itemIds: string[] = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(String) : [];
+    if (!itemIds.length) return reply.code(400).send({ error: 'At least one item is required for an Amazon FBA workflow' });
+    const profiles = await rows(
+      `SELECT p.*, i.sku AS catalog_sku, i.title AS catalog_title, i.supplier_id
+       FROM amazon_item_profiles p
+       LEFT JOIN catalog_items i ON i.id = p.item_id AND i.user_id = p.user_id
+       WHERE p.user_id = $1 AND p.item_id = ANY($2::text[])`,
+      [userId, itemIds],
+    );
+    const byItem = new Map(profiles.map((profile) => [String(profile.item_id), profile]));
+    const invalid = itemIds
+      .map((itemId) => {
+        const profile = byItem.get(itemId);
+        if (!profile) return { itemId, blockers: ['Item is not mapped to an Amazon profile'] };
+        const mapped = mapAmazonProfile(profile);
+        return mapped.fbaEligible ? null : { itemId, sellerSku: mapped.sellerSku, blockers: mapped.blockers.length ? mapped.blockers : ['Item is not eligible for FBA shipment planning'] };
+      })
+      .filter(Boolean);
+    if (invalid.length) {
+      return reply.code(400).send({ error: 'Some items are not Amazon FBA eligible', invalid });
+    }
+    const accountIds = Array.from(new Set(profiles.map((profile) => String(profile.channel_connection_id || '')).filter(Boolean)));
+    const requestedAccountId = trim(req.body?.channelConnectionId);
+    if (accountIds.length > 1 && (!requestedAccountId || !accountIds.includes(requestedAccountId))) {
+      return reply.code(400).send({
+        error: 'Selected FBA items belong to multiple Amazon accounts',
+        invalid: accountIds.map((accountId) => ({
+          channelConnectionId: accountId,
+          blockers: ['Choose one Amazon account before creating an FBA inbound workflow'],
+        })),
+      });
+    }
+    const channelConnectionId = requestedAccountId || accountIds[0] || null;
+    const selectedItems = profiles.map((profile) => ({
+      itemId: profile.item_id,
+      sku: profile.catalog_sku || profile.seller_sku,
+      title: profile.catalog_title || profile.title,
+      sellerSku: profile.seller_sku,
+      asin: profile.asin,
+      channelConnectionId: profile.channel_connection_id || null,
+      marketplaceId: profile.marketplace_id,
+      quantity: number(req.body?.quantities?.[profile.item_id], 0),
+    }));
+    const quantityInvalid = selectedItems
+      .filter((item) => item.quantity <= 0)
+      .map((item) => ({ itemId: item.itemId, sellerSku: item.sellerSku, blockers: ['FBA quantity must be greater than zero'] }));
+    if (quantityInvalid.length) {
+      return reply.code(400).send({ error: 'Some items need valid FBA quantities', invalid: quantityInvalid });
+    }
+    const packagePlan = {
+      channel: 'amazon',
+      workflowType: 'fba_inbound',
+      channelConnectionId,
+      marketplaceId: req.body?.marketplaceId || profiles[0]?.marketplace_id || 'ATVPDKIKX0DER',
+      prepOwner: req.body?.prepOwner || 'SELLER',
+      labelOwner: req.body?.labelOwner || 'SELLER',
+      packingMode: req.body?.packingMode || 'case_pack',
+      cartonContentSource: req.body?.cartonContentSource || 'provided_by_seller',
+      sourceDraftId: req.body?.sourceDraftId || null,
+      shipmentPlanId: req.body?.shipmentPlanId || null,
+      asnId: req.body?.asnId || null,
+    };
+    if (req.body?.sourceDraftId) {
+      const updated = await one(
+        `UPDATE oms_shipment_wizard_drafts
+         SET selected_items = $3::jsonb,
+             package_plan = package_plan || $4::jsonb,
+             cortex_routing = cortex_routing || $5::jsonb,
+             updated_at = now()
+         WHERE id = $1 AND user_id = $2
+         RETURNING *`,
+        [
+          req.body.sourceDraftId,
+          userId,
+          JSON.stringify(selectedItems),
+          JSON.stringify(packagePlan),
+          JSON.stringify({ amazonFba: true, mode: 'amazon_fba_guarded', requiresProviderSubmission: true }),
+        ],
+      );
+      if (!updated) return reply.code(404).send({ error: 'Source shipment wizard draft not found' });
+      await writeLedger(userId, {
+        entityType: 'shipment_wizard',
+        entityId: updated.id,
+        eventType: 'amazon_fba_branch_added',
+        summary: 'Amazon FBA shipment branch attached to the OMS shipment wizard draft.',
+        payload: { selectedItems, packagePlan },
+      });
+      return { workflowId: updated.id, workflow: updated, selectedItems };
+    }
+    const draft = await one(
+      `INSERT INTO oms_shipment_wizard_drafts (user_id, supplier_id, selected_items, package_plan, cortex_routing)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb) RETURNING *`,
+      [
+        userId,
+        req.body?.supplierId || profiles[0]?.supplier_id || null,
+        JSON.stringify(selectedItems),
+        JSON.stringify(packagePlan),
+        JSON.stringify({ mode: 'amazon_fba_guarded', requiresProviderSubmission: true }),
+      ],
+    );
+    return { workflowId: draft?.id, workflow: draft, selectedItems };
+  });
 
   app.get('/amazon/send-to-amazon/workflows', async (req: any, reply) => {
     const userId = requireUser(req, reply);

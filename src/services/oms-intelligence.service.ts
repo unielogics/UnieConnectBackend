@@ -104,9 +104,14 @@ export async function getDataReadiness(userId: string) {
   const [counts] = await rows(
     `SELECT
        (SELECT COUNT(*) FROM marketplace_connections WHERE user_id = $1 AND status IN ('connected','active','synced'))::int AS marketplace_connections,
+       (SELECT COUNT(*) FROM marketplace_connections WHERE user_id = $1 AND channel = 'amazon' AND status IN ('connected','active','synced'))::int AS amazon_connections,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1)::int AS catalog_items,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND LOWER(COALESCE(metadata->>'source', metadata->>'importSource', '')) LIKE '%csv%')::int AS csv_items,
        (SELECT COUNT(*) FROM item_channel_mappings WHERE user_id = $1)::int AS marketplace_mapped_items,
+       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1)::int AS amazon_profiles,
+       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND asin IS NOT NULL AND asin <> '')::int AS amazon_listed_items,
+       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND listing_status IN ('listed','active') AND fulfillment_channel IN ('AMAZON','FBA') AND cardinality(blockers) = 0)::int AS amazon_fba_eligible_items,
+       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND (listing_status = 'needs_listing' OR cardinality(blockers) > 0))::int AS amazon_blocked_items,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1)::int AS orders,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1 AND channel_connection_id IS NOT NULL)::int AS marketplace_orders,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1 AND LOWER(COALESCE(metadata->>'source', '')) LIKE '%csv%')::int AS csv_orders,
@@ -132,6 +137,12 @@ export async function getDataReadiness(userId: string) {
   const blockers = [
     number(counts?.marketplace_connections) === 0 && number(counts?.csv_items) === 0 && number(counts?.orders) === 0
       ? 'Connect a marketplace or import CSV sales/product data.'
+      : null,
+    number(counts?.amazon_connections) > 0 && number(counts?.amazon_profiles) === 0
+      ? 'Run Amazon item sync to identify listed, FBA, FBM, and needs-listing SKUs.'
+      : null,
+    number(counts?.amazon_blocked_items) > 0
+      ? `${number(counts?.amazon_blocked_items)} Amazon SKUs need listing or FBA readiness cleanup.`
       : null,
     number(counts?.catalog_items) === 0 ? 'Create or import SKUs before running Product Research or Seller Optimization.' : null,
     number(counts?.missing_dimensions) > 0 ? `${number(counts?.missing_dimensions)} SKUs are missing dimensions or weight.` : null,
@@ -160,7 +171,12 @@ export async function getDataReadiness(userId: string) {
     primarySource: number(counts?.marketplace_connections) > 0 ? 'marketplace_connections' : sourceMode === 'csv_fallback' ? 'csv_upload' : 'manual_data',
     counts: {
       marketplaceConnections: number(counts?.marketplace_connections),
+      amazonConnections: number(counts?.amazon_connections),
       marketplaceMappedItems: number(counts?.marketplace_mapped_items),
+      amazonProfiles: number(counts?.amazon_profiles),
+      amazonListedItems: number(counts?.amazon_listed_items),
+      amazonFbaEligibleItems: number(counts?.amazon_fba_eligible_items),
+      amazonBlockedItems: number(counts?.amazon_blocked_items),
       catalogItems: number(counts?.catalog_items),
       csvItems: number(counts?.csv_items),
       orders: number(counts?.orders),
@@ -220,6 +236,7 @@ function productResearchResult(input: any, item: Row | null, readiness: Awaited<
   const cost = number(input?.cost ?? item?.attributes?.cost ?? item?.metadata?.cost);
   const price = number(input?.price ?? item?.attributes?.price ?? item?.metadata?.price);
   const hasMarketplace = readiness.counts.marketplaceConnections > 0 || readiness.counts.marketplaceMappedItems > 0;
+  const hasAmazonProfile = readiness.counts.amazonProfiles > 0;
   const hasDims = cubeFt > 0 && weight > 0;
   const marginPct = price > 0 && cost > 0 ? (price - cost) / price : null;
   const missing: string[] = [];
@@ -248,6 +265,20 @@ function productResearchResult(input: any, item: Row | null, readiness: Awaited<
     opportunityScore: Math.round(score),
     productRisk: missing.length ? 'needs_data' : score >= 75 ? 'strong_candidate' : score >= 55 ? 'watch' : 'weak_candidate',
     marketplaceReadiness: hasMarketplace ? 'marketplace_enriched' : readiness.sourceMode === 'csv_fallback' ? 'csv_mode' : 'needs_marketplace_or_csv',
+    amazonReadiness: {
+      accountConnected: readiness.counts.amazonConnections > 0,
+      profilesSynced: hasAmazonProfile,
+      listedItems: readiness.counts.amazonListedItems,
+      fbaEligibleItems: readiness.counts.amazonFbaEligibleItems,
+      blockedItems: readiness.counts.amazonBlockedItems,
+      status: readiness.counts.amazonFbaEligibleItems > 0
+        ? 'fba_ready_catalog'
+        : hasAmazonProfile
+          ? 'amazon_profiles_need_cleanup'
+          : readiness.counts.amazonConnections > 0
+            ? 'amazon_sync_needed'
+            : 'amazon_not_connected',
+    },
     margin: {
       cost,
       price,
@@ -540,6 +571,41 @@ async function createSellerContextRecommendations(params: {
       optimizedValue: { sourceMode: readiness.sourceMode, expectedRoutingMode: readiness.counts.wmsLinks > 0 ? 'wms_truth_gated' : 'forecast_only' },
       estimatedImpact: { annualizedSavings: monthlySavings * 12 },
       requiredAction: readiness.counts.marketplaceOrders > 0 ? 'review_order_optimization' : 'connect_marketplace_order_feed',
+      approvalState: 'not_required',
+      wmsTruthState,
+      confidence,
+      sourceSummary,
+    }));
+  }
+
+  if (readiness.counts.amazonConnections > 0 || readiness.counts.amazonProfiles > 0) {
+    const missingProfiles = readiness.counts.amazonConnections > 0 && readiness.counts.amazonProfiles === 0;
+    const blockedAmazonItems = readiness.counts.amazonBlockedItems > 0;
+    recommendations.push(await createRecommendation(userId, {
+      runId: scopedRunId,
+      recommendationType: blockedAmazonItems || missingProfiles ? 'data_readiness' : 'sku_placement',
+      entityType: 'amazon_channel',
+      entityId: userId,
+      title: missingProfiles ? 'Sync Amazon item profiles' : blockedAmazonItems ? 'Complete Amazon listing readiness' : 'Use FBA-ready SKUs in shipment planning',
+      summary: missingProfiles
+        ? 'Amazon is connected, but SKUs have not been normalized into UnieConnect item profiles yet.'
+        : blockedAmazonItems
+          ? `${readiness.counts.amazonBlockedItems} Amazon SKUs need listing, mapping, or FBA readiness cleanup before inbound planning.`
+          : `${readiness.counts.amazonFbaEligibleItems} Amazon SKUs are eligible for the FBA branch in the OMS shipment wizard.`,
+      currentValue: {
+        amazonConnections: readiness.counts.amazonConnections,
+        amazonProfiles: readiness.counts.amazonProfiles,
+        amazonListedItems: readiness.counts.amazonListedItems,
+        amazonFbaEligibleItems: readiness.counts.amazonFbaEligibleItems,
+        amazonBlockedItems: readiness.counts.amazonBlockedItems,
+      },
+      optimizedValue: {
+        amazonProfilesSynced: true,
+        blockedItems: 0,
+        fbaShipmentBranchEnabled: readiness.counts.amazonFbaEligibleItems > 0,
+      },
+      estimatedImpact: { confidenceGain: missingProfiles ? 12 : blockedAmazonItems ? 8 : 4 },
+      requiredAction: missingProfiles ? 'sync_amazon_items' : blockedAmazonItems ? 'complete_amazon_listing_setup' : 'review_fba_shipment_candidates',
       approvalState: 'not_required',
       wmsTruthState,
       confidence,

@@ -247,6 +247,62 @@ function itemDimensions(item: Row) {
   return json(item.dimensions, {});
 }
 
+function mapAmazonProfile(row: Row | null) {
+  if (!row) return null;
+  const blockers = Array.isArray(row.blockers) ? row.blockers : [];
+  const listingStatus = row.listing_status || 'needs_listing';
+  const fulfillmentChannel = row.fulfillment_channel || 'UNKNOWN';
+  const fbaEligible = ['listed', 'active'].includes(listingStatus)
+    && ['AMAZON', 'FBA'].includes(fulfillmentChannel)
+    && blockers.length === 0;
+  const hasFbaInventorySignal =
+    number(row.available_fba_qty) > 0 ||
+    number(row.inbound_working_qty) > 0 ||
+    number(row.inbound_shipped_qty) > 0 ||
+    number(row.inbound_receiving_qty) > 0 ||
+    number(row.reserved_qty) > 0 ||
+    String(row.sync_status || '').includes('inventory');
+  const identityState = fbaEligible
+    ? 'FBA shipment eligible'
+    : hasFbaInventorySignal
+      ? 'Amazon FBA inventory synced'
+      : row.asin
+        ? 'Amazon listing mapped'
+        : 'Needs Amazon listing setup';
+  return {
+    id: row.id,
+    itemId: row.item_id,
+    marketplaceId: row.marketplace_id || 'ATVPDKIKX0DER',
+    sellerSku: row.seller_sku,
+    asin: row.asin,
+    title: row.title,
+    listingStatus,
+    fulfillmentChannel,
+    availableFbaQty: number(row.available_fba_qty),
+    inboundWorkingQty: number(row.inbound_working_qty),
+    inboundShippedQty: number(row.inbound_shipped_qty),
+    inboundReceivingQty: number(row.inbound_receiving_qty),
+    reservedQty: number(row.reserved_qty),
+    syncStatus: row.sync_status || 'manual',
+    lastAmazonSyncAt: iso(row.last_amazon_sync_at),
+    blockers,
+    fbaEligible,
+    identityState,
+  };
+}
+
+async function getAmazonProfilesForItems(userId: string, itemIds: string[]) {
+  if (!itemIds.length) return new Map<string, ReturnType<typeof mapAmazonProfile>>();
+  const profiles = await rows(
+    `SELECT DISTINCT ON (item_id) *
+     FROM amazon_item_profiles
+     WHERE user_id = $1 AND item_id = ANY($2::text[])
+     ORDER BY item_id, COALESCE(last_amazon_sync_at, updated_at, created_at) DESC`,
+    [userId, itemIds],
+  );
+  return new Map(profiles.map((profile) => [String(profile.item_id), mapAmazonProfile(profile)]));
+}
+
 function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>, facilitiesCount: number) {
   const inv = itemInventory(item);
   const available = number(inv.available);
@@ -479,7 +535,12 @@ export async function getInventoryPlan(userId: string, horizon = '6m') {
 
 export async function getOmsSkus(userId: string) {
   const plan = await getInventoryPlan(userId);
-  return { skus: plan.skus, total: plan.skus.length };
+  const amazonProfiles = await getAmazonProfilesForItems(userId, plan.skus.map((sku: any) => String(sku.id)).filter(Boolean));
+  const skus = plan.skus.map((sku: any) => ({
+    ...sku,
+    amazon: amazonProfiles.get(String(sku.id)) || null,
+  }));
+  return { skus, total: skus.length };
 }
 
 export async function getOmsSkuDetail(userId: string, skuOrId: string) {
@@ -496,6 +557,13 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     [userId, `%${item.sku}%`],
   );
   const facilities = await getFacilities(userId);
+  const amazonProfile = await one(
+    `SELECT *
+     FROM amazon_item_profiles
+     WHERE user_id = $1 AND item_id = $2
+     ORDER BY COALESCE(last_amazon_sync_at, updated_at, created_at) DESC LIMIT 1`,
+    [userId, item.id],
+  );
   // (paste-replace) Keepa enrichment: best-effort, never fails the response.
   const asin = (item.asin || '').trim().toUpperCase() || null;
   let keepa: any = null;
@@ -544,6 +612,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     dimensions: dims,
     weight,
     intelligence,
+    amazon: mapAmazonProfile(amazonProfile),
     keepa,    // NEW field — null when ASIN absent or cache empty
     nextShipments: activityPlans.slice(0, 6).map((plan, i) => ({
       id: plan.internal_shipment_id || String(plan.id),

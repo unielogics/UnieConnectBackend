@@ -39,6 +39,8 @@ function pick<T>(arr: T[]): T {
 export async function wipeDemoDataForUser(userId: string): Promise<void> {
   if (!isPostgresConfigured()) return;
   await pgQuery(`DELETE FROM orders WHERE user_id=$1 AND metadata->>'source'='demo'`, [userId]);
+  await pgQuery(`DELETE FROM amazon_listing_drafts WHERE user_id=$1 AND payload->>'source'='demo'`, [userId]);
+  await pgQuery(`DELETE FROM amazon_item_profiles WHERE user_id=$1 AND raw->>'source'='demo'`, [userId]);
   await pgQuery(`DELETE FROM item_channel_mappings WHERE user_id=$1 AND payload->>'source'='demo'`, [userId]);
   await pgQuery(`DELETE FROM catalog_items WHERE user_id=$1 AND metadata->>'source'='demo'`, [userId]);
   await pgQuery(`DELETE FROM marketplace_connections WHERE user_id=$1 AND metadata->>'source'='demo'`, [userId]);
@@ -64,11 +66,23 @@ export async function seedDemoDataForUser(userId: string): Promise<DemoSeedResul
   if (!isPostgresConfigured()) return null;
 
   const mcId = randomUUID();
+  const amazonConnectionId = randomUUID();
   await pgQuery(
     `INSERT INTO marketplace_connections (id, user_id, channel, status, display_name, shop_domain, marketplace_id, scopes, metadata, last_sync_at)
      VALUES ($1,$2,'shopify','connected','Demo Shopify Storefront','demo-store.myshopify.com','demo-shopify',$3,$4::jsonb, now())
      ON CONFLICT (id) DO NOTHING`,
     [mcId, userId, ['read_orders', 'read_products'], JSON.stringify({ source: 'demo', display_provider: 'shopify' })],
+  );
+  await pgQuery(
+    `INSERT INTO marketplace_connections (id, user_id, channel, status, display_name, selling_partner_id, marketplace_id, scopes, metadata, last_sync_at)
+     VALUES ($1,$2,'amazon','connected','Demo Amazon Seller Central','A1DEMOSELLER','ATVPDKIKX0DER',$3,$4::jsonb, now())
+     ON CONFLICT (id) DO NOTHING`,
+    [
+      amazonConnectionId,
+      userId,
+      ['sellingpartnerapi::listings', 'sellingpartnerapi::fba_inventory', 'sellingpartnerapi::fulfillment_inbound'],
+      JSON.stringify({ source: 'demo', display_provider: 'amazon', mode: 'profile_seed' }),
+    ],
   );
 
   for (const f of FACILITIES) {
@@ -178,6 +192,82 @@ export async function seedDemoDataForUser(userId: string): Promise<DemoSeedResul
         `gid://shopify/ProductVariant/demo${i + 1}-v1`,
         sku,
         JSON.stringify({ source: 'demo' }),
+      ],
+    );
+    const sellerSku = `AMZ-${sku}`;
+    const amazonAsin = i % 9 === 0 ? null : `B0DEMO${String(i + 1).padStart(4, '0')}`;
+    const amazonStatus = amazonAsin ? 'active' : 'needs_listing';
+    const amazonBlockers = amazonAsin ? [] : ['Create or map the Amazon listing before FBA shipment planning'];
+    await pgQuery(
+      `INSERT INTO item_channel_mappings (id, user_id, item_id, channel_connection_id, channel, channel_item_id, channel_variant_id, sku, status, payload)
+       VALUES ($1,$2,$3,$4,'amazon',$5,$6,$7,$8,$9::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        randomUUID(),
+        userId,
+        id,
+        amazonConnectionId,
+        amazonAsin || sellerSku,
+        sellerSku,
+        sellerSku,
+        amazonStatus,
+        JSON.stringify({
+          source: 'demo',
+          asin: amazonAsin,
+          sellerSku,
+          fulfillmentChannel: amazonAsin ? 'AMAZON' : 'UNKNOWN',
+          listingStatus: amazonStatus,
+          inventory: {
+            available: amazonAsin ? Math.round(velocity30d * 0.8) : 0,
+            inboundWorking: amazonAsin ? Math.round(velocity30d * 0.2) : 0,
+            inboundShipped: amazonAsin ? Math.round(velocity30d * 0.1) : 0,
+            inboundReceiving: amazonAsin ? Math.round(velocity30d * 0.05) : 0,
+            reserved: amazonAsin ? Math.round(velocity30d * 0.1) : 0,
+          },
+        }),
+      ],
+    );
+    await pgQuery(
+      `INSERT INTO amazon_item_profiles (
+        id, user_id, item_id, channel_connection_id, marketplace_id, seller_sku, asin, title,
+        listing_status, fulfillment_channel, available_fba_qty, inbound_working_qty,
+        inbound_shipped_qty, inbound_receiving_qty, reserved_qty, sync_status, last_amazon_sync_at, blockers, raw
+      )
+      VALUES ($1,$2,$3,$4,'ATVPDKIKX0DER',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'inventory_synced',now(),$15::text[],$16::jsonb)
+      ON CONFLICT (user_id, marketplace_id, seller_sku)
+      DO UPDATE SET item_id = EXCLUDED.item_id,
+        channel_connection_id = EXCLUDED.channel_connection_id,
+        asin = EXCLUDED.asin,
+        title = EXCLUDED.title,
+        listing_status = EXCLUDED.listing_status,
+        fulfillment_channel = EXCLUDED.fulfillment_channel,
+        available_fba_qty = EXCLUDED.available_fba_qty,
+        inbound_working_qty = EXCLUDED.inbound_working_qty,
+        inbound_shipped_qty = EXCLUDED.inbound_shipped_qty,
+        inbound_receiving_qty = EXCLUDED.inbound_receiving_qty,
+        reserved_qty = EXCLUDED.reserved_qty,
+        sync_status = EXCLUDED.sync_status,
+        last_amazon_sync_at = now(),
+        blockers = EXCLUDED.blockers,
+        raw = EXCLUDED.raw,
+        updated_at = now()`,
+      [
+        randomUUID(),
+        userId,
+        id,
+        amazonConnectionId,
+        sellerSku,
+        amazonAsin,
+        `${tpl.cat} ${tpl.sub} item ${i + 1}`,
+        amazonStatus,
+        amazonAsin ? 'AMAZON' : 'UNKNOWN',
+        amazonAsin ? Math.round(velocity30d * 0.8) : 0,
+        amazonAsin ? Math.round(velocity30d * 0.2) : 0,
+        amazonAsin ? Math.round(velocity30d * 0.1) : 0,
+        amazonAsin ? Math.round(velocity30d * 0.05) : 0,
+        amazonAsin ? Math.round(velocity30d * 0.1) : 0,
+        amazonBlockers,
+        JSON.stringify({ source: 'demo', provider: 'amazon', syncMode: 'profile_seed' }),
       ],
     );
   }
