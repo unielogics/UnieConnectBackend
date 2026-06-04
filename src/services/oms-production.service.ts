@@ -18,7 +18,10 @@ const number = (value: unknown, fallback = 0) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
-const money = (value: unknown) => Math.round(number(value) * 100) / 100;
+const money = (value: unknown) => {
+  const cleaned = typeof value === 'string' ? value.replace(/[$,\s]/g, '') : value;
+  return Math.round(number(cleaned) * 100) / 100;
+};
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 
@@ -1537,6 +1540,88 @@ function valueFrom(row: Row, keys: string[]) {
   return '';
 }
 
+const normalizedKey = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+function valueLike(row: Row, patterns: RegExp[]) {
+  const key = Object.keys(row).find((k) => {
+    const normalized = normalizedKey(k);
+    return patterns.some((pattern) => pattern.test(normalized));
+  });
+  if (!key) return '';
+  const value = row[key];
+  return value == null ? '' : String(value).trim();
+}
+
+function inferCarrier(row: Row, trackingNumber: string, service: string) {
+  const explicit = valueFrom(row, [
+    'carrier',
+    'carrierName',
+    'carrier_name',
+    'shippingCarrier',
+    'shipping_carrier',
+    'shipCarrier',
+    'ship_carrier',
+    'shipVia',
+    'ship_via',
+    'provider',
+    'providerName',
+    'scac',
+  ]);
+  if (explicit) return explicit;
+  const haystack = `${trackingNumber} ${service}`.toLowerCase();
+  if (/\b1z[0-9a-z]+/i.test(trackingNumber) || haystack.includes('ups')) return 'UPS';
+  if (/^(94|92|93|95)\d{18,}/.test(trackingNumber) || haystack.includes('usps') || haystack.includes('postal')) return 'USPS';
+  if (/^(\d{12}|\d{15}|\d{20,22})$/.test(trackingNumber.replace(/\D/g, '')) || haystack.includes('fedex')) return 'FedEx';
+  if (haystack.includes('dhl')) return 'DHL';
+  return 'Unknown carrier';
+}
+
+function dimensionValue(row: Row) {
+  const explicit = valueFrom(row, ['dim', 'dims', 'dimensions', 'packageDimensions', 'parcelDimensions']);
+  if (explicit) return explicit;
+  const length = valueFrom(row, ['length', 'packageLength', 'dimLength', 'l']);
+  const width = valueFrom(row, ['width', 'packageWidth', 'dimWidth', 'w']);
+  const height = valueFrom(row, ['height', 'packageHeight', 'dimHeight', 'h']);
+  return length || width || height ? [length || '?', width || '?', height || '?'].join('x') : '';
+}
+
+async function getLabelAuditCortexGate(userId: string) {
+  const feature = await one(
+    `SELECT f.id, f.name, f.status, uf.status AS user_status
+       FROM features f
+       LEFT JOIN user_features uf ON uf.feature_id = f.id AND uf.user_id = $1
+      WHERE f.id IN ('label-audit','carrier-label-audit')
+         OR f.payload->>'slug' IN ('label-audit','carrier-label-audit')
+      LIMIT 1`,
+    [userId],
+  );
+  const featureEnabled =
+    !feature ||
+    (String(feature.status || '').toLowerCase() === 'active' &&
+      !['disabled', 'removed', 'uninstalled'].includes(String(feature.user_status || 'enabled').toLowerCase()));
+  const credential = await one(
+    `SELECT status, cortex_credential_id, cortex_tenant_key, secret_enc, provisioning_error
+       FROM oms_cortex_credentials
+      WHERE user_id = $1
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+      LIMIT 1`,
+    [userId],
+  );
+  const credentialActive =
+    Boolean(credential) &&
+    ['active', 'enabled', 'provisioned'].includes(String(credential?.status || '').toLowerCase()) &&
+    Boolean(credential?.secret_enc || credential?.cortex_credential_id || credential?.cortex_tenant_key);
+  const configured = Boolean(cortexConfigStatus().configured);
+  return {
+    ok: featureEnabled && credentialActive && configured,
+    featureEnabled,
+    credentialActive,
+    configured,
+    status: credential?.status || 'missing',
+    error: credential?.provisioning_error || null,
+  };
+}
+
 function parseDateValue(value: string) {
   if (!value) return null;
   const d = new Date(value);
@@ -1544,22 +1629,28 @@ function parseDateValue(value: string) {
 }
 
 function normalizeLabelCsvRow(raw: Row, index: number) {
-  const order = valueFrom(raw, ['order', 'orderId', 'orderNumber', 'order_no']);
-  const trackingNumber = valueFrom(raw, ['trackingNumber', 'tracking', 'tracking_no']);
-  const carrier = valueFrom(raw, ['carrier', 'carrierName']);
-  const service = valueFrom(raw, ['service', 'serviceLevel', 'shippingService']);
-  const shipped = valueFrom(raw, ['shipped', 'shippedDate', 'shipDate']);
-  const delivered = valueFrom(raw, ['delivered', 'deliveredDate', 'deliveryDate']);
-  const promised = valueFrom(raw, ['promised', 'promisedDate', 'promiseDate', 'estimatedDeliveryDate']);
-  const cost = money(valueFrom(raw, ['cost', 'labelCost', 'shippingCost', 'postage']));
-  const zone = number(valueFrom(raw, ['zone', 'shippingZone']), NaN);
-  const weight = number(valueFrom(raw, ['weight', 'weightLb', 'weightLbs']), NaN);
-  const dim = valueFrom(raw, ['dim', 'dims', 'dimensions']);
-  const state = valueFrom(raw, ['state', 'shipToState', 'ship_state']);
-  const zip = valueFrom(raw, ['zip', 'shipToZip', 'postalCode']);
-  const errors = [];
-  if (!order && !trackingNumber) errors.push(`Row ${index + 1}: order or tracking number is required.`);
-  if (!carrier) errors.push(`Row ${index + 1}: carrier is required.`);
+  const order =
+    valueFrom(raw, ['order', 'orderId', 'orderNumber', 'order_no', 'orderNo', 'orderNum', 'orderReference', 'orderRef', 'reference', 'referenceNumber']) ||
+    valueLike(raw, [/^order/, /ordernumber/, /orderid/, /orderref/, /reference/]);
+  const trackingNumber =
+    valueFrom(raw, ['trackingNumber', 'tracking', 'tracking_no', 'trackingNo', 'trackingId', 'trackingCode', 'tracking #', 'tracking number']) ||
+    valueLike(raw, [/tracking/, /waybill/, /airbill/, /labelid/, /shipmentid/]);
+  const service =
+    valueFrom(raw, ['service', 'serviceLevel', 'shippingService', 'shipping_service', 'carrierService', 'mailClass', 'serviceType', 'shipMethod', 'shipmentMethod']) ||
+    valueLike(raw, [/service/, /shipmethod/, /mailclass/, /method/]);
+  const carrier = inferCarrier(raw, trackingNumber, service);
+  const shipped = valueFrom(raw, ['shipped', 'shippedDate', 'shipDate', 'shipmentDate', 'labelDate', 'createdDate', 'dateShipped']) || valueLike(raw, [/ship.*date/, /label.*date/]);
+  const delivered = valueFrom(raw, ['delivered', 'deliveredDate', 'deliveryDate', 'actualDeliveryDate', 'dateDelivered']) || valueLike(raw, [/deliver.*date/, /actualdelivery/]);
+  const promised =
+    valueFrom(raw, ['promised', 'promisedDate', 'promiseDate', 'estimatedDeliveryDate', 'expectedDeliveryDate', 'commitmentDate', 'guaranteedDeliveryDate']) ||
+    valueLike(raw, [/promise/, /estimateddelivery/, /expecteddelivery/, /commitment/, /guarantee/]);
+  const cost = money(valueFrom(raw, ['cost', 'labelCost', 'shippingCost', 'postage', 'charge', 'amount', 'netCharge', 'totalCharge', 'transportationCharge', 'shipmentCost']) || valueLike(raw, [/cost/, /charge/, /postage/, /amount/]));
+  const zone = number(valueFrom(raw, ['zone', 'shippingZone', 'destinationZone', 'carrierZone']) || valueLike(raw, [/zone/]), NaN);
+  const weight = number(valueFrom(raw, ['weight', 'weightLb', 'weightLbs', 'actualWeight', 'billableWeight', 'packageWeight']) || valueLike(raw, [/weight/]), NaN);
+  const dim = dimensionValue(raw);
+  const state = valueFrom(raw, ['state', 'shipToState', 'ship_state', 'recipientState', 'destinationState']) || valueLike(raw, [/shipto.*state/, /recipient.*state/, /destination.*state/]);
+  const zip = valueFrom(raw, ['zip', 'shipToZip', 'postalCode', 'postcode', 'recipientZip', 'destinationZip']) || valueLike(raw, [/zip/, /postal/, /postcode/]);
+  const errors: string[] = [];
   return {
     rowNumber: index + 1,
     order,
@@ -1588,7 +1679,7 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
   const late = Boolean(deliveredAt && promisedAt && deliveredAt.getTime() > promisedAt.getTime());
   const highCost = row.cost >= 18 || (row.zone != null && row.zone >= 6 && row.cost >= 12);
   const heavyParcel = row.weight != null && row.weight >= 12 && /ground|priority|advantage|parcel/i.test(row.service || '');
-  const missingEvidence = !row.delivered || !row.promised || !row.cost;
+  const missingEvidence = !row.trackingNumber || !row.carrier || row.carrier === 'Unknown carrier' || !row.delivered || !row.promised || !row.cost;
   type GeneratedLabelFinding = { type: string; severity: string; refund: number; recommendation: string; optimizedCarrier?: string | undefined; optimizedCost?: number | undefined; auditStatus: string };
   const findings: GeneratedLabelFinding[] = [];
   if (late) {
@@ -1677,7 +1768,8 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
   }));
 }
 
-export async function getLabelAudit(userId: string): Promise<{ findings: LabelAuditFinding[]; summary: Record<string, number> }> {
+export async function getLabelAudit(userId: string): Promise<{ findings: LabelAuditFinding[]; summary: Record<string, number>; cortex: Record<string, unknown> }> {
+  const cortex = await getLabelAuditCortexGate(userId);
   const stored = await rows(
     'SELECT * FROM oms_label_audit_findings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100',
     [userId],
@@ -1713,11 +1805,28 @@ export async function getLabelAudit(userId: string): Promise<{ findings: LabelAu
       estimatedRefunds: money(findings.reduce((sum, f) => sum + f.refundAmount, 0)),
       optimizedServiceSavings: money(findings.length * 14.25),
     },
+    cortex: {
+      available: cortex.ok,
+      status: cortex.status,
+      featureEnabled: cortex.featureEnabled,
+      credentialActive: cortex.credentialActive,
+      configured: cortex.configured,
+      message: cortex.ok ? 'Cortex shipment label audit is available.' : 'Cortex Intelligence is not available for this account. Contact support or your account manager to enable Cortex shipment label audit.',
+    },
   };
 }
 
 export async function createLabelAuditRun(userId: string, body: any) {
-  const rowsInput: Row[] = Array.isArray(body?.rows) ? body.rows : [];
+  const gate = await getLabelAuditCortexGate(userId);
+  if (!gate.ok) {
+    const err: any = new Error('Cortex Intelligence is not available for this account. Contact support or your account manager to enable Cortex shipment label audit.');
+    err.statusCode = 403;
+    err.details = { cortex: gate };
+    throw err;
+  }
+  const rowsInput: Row[] = Array.isArray(body?.rows)
+    ? body.rows.filter((row: Row) => Object.values(row || {}).some((value) => value != null && String(value).trim() !== ''))
+    : [];
   const filename = String(body?.filename || 'label-audit.csv').slice(0, 240);
   if (!rowsInput.length) {
     const err: any = new Error('CSV must include at least one row.');
@@ -1732,7 +1841,7 @@ export async function createLabelAuditRun(userId: string, body: any) {
   const normalized: Array<ReturnType<typeof normalizeLabelCsvRow>> = rowsInput.map((row: Row, index: number) => normalizeLabelCsvRow(row, index));
   const errors = normalized.flatMap((row) => row.errors);
   if (errors.length) {
-    const err: any = new Error(errors.slice(0, 8).join(' '));
+    const err: any = new Error(`CSV mapping failed: ${errors.slice(0, 8).join(' ')}`);
     err.statusCode = 400;
     err.details = { errors };
     throw err;
