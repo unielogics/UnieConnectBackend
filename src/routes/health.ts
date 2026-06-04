@@ -38,6 +38,11 @@ export async function healthRoutes(fastify: FastifyInstance) {
       appBaseUrl,
       corsOrigins: config.corsOrigins,
       amazonRedirectUri: amazonRedirectUri || undefined,
+      amazonAppIdKind: config.amazon.appId
+        ? config.amazon.appId.startsWith('amzn1.sellerapps.app.')
+          ? 'seller_app'
+          : 'nonstandard'
+        : 'missing',
     };
   });
 

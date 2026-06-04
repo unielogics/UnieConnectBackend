@@ -9,6 +9,7 @@ import { publicEntityId } from '../lib/public-id';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
+import { exchangeCodeForTokens as exchangeAmazonCodeForTokens } from '../services/amazon-auth';
 import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
 import { markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
 
@@ -169,6 +170,22 @@ function wantsJson(req: any) {
 function redirectOrJson(req: any, reply: any, url: string, extra: Record<string, unknown> = {}) {
   if (wantsJson(req)) return reply.send({ url, ...extra });
   return reply.redirect(url);
+}
+
+function amazonSellerCentralBase(region?: string) {
+  const r = trim(region || config.amazon.region).toLowerCase();
+  if (r === 'eu') return 'https://sellercentral-europe.amazon.com';
+  if (r === 'fe') return 'https://sellercentral.amazon.co.jp';
+  return 'https://sellercentral.amazon.com';
+}
+
+function buildAmazonAuthUrl(state: string) {
+  const params = new URLSearchParams({
+    application_id: config.amazon.appId,
+    state,
+    redirect_uri: config.amazon.redirectUri,
+  });
+  return `${amazonSellerCentralBase()}/apps/authorize/consent?${params.toString()}`;
 }
 
 function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
@@ -912,25 +929,40 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         });
       }
 
-      await one(
-        `INSERT INTO marketplace_connections (user_id, channel, status, display_name, metadata)
-         VALUES ($1, $2, 'needs_authorization', $3, $4::jsonb)
-         RETURNING *`,
-        [userId, channel, `${channel.toUpperCase()} pending authorization`, JSON.stringify({ state, note: 'Provider token exchange is stored in Aurora when callback completes.' })],
-      );
-      return reply.code(202).send({
-        status: 'needs_provider_authorization',
-        channel,
-        state,
-        message: `${channel} OAuth state was created in Aurora. Complete provider app configuration before token exchange is enabled.`,
-      });
+      if (channel === 'amazon') {
+        if (!config.amazon.clientId || !config.amazon.clientSecret || !config.amazon.appId || !config.amazon.redirectUri) {
+          await one(
+            `INSERT INTO marketplace_connections (user_id, channel, status, display_name, metadata)
+             VALUES ($1, 'amazon', 'needs_configuration', 'Amazon pending configuration', $2::jsonb)
+             RETURNING *`,
+            [userId, JSON.stringify({ state, reason: 'missing_amazon_oauth_env' })],
+          );
+          return reply.code(503).send({ error: 'Amazon OAuth is missing server configuration', state });
+        }
+        await one(
+          `INSERT INTO marketplace_connections (user_id, channel, status, display_name, metadata)
+           VALUES ($1, 'amazon', 'needs_authorization', 'Amazon pending authorization', $2::jsonb)
+           RETURNING *`,
+          [userId, JSON.stringify({
+            state,
+            provider: 'amazon',
+            appIdKind: config.amazon.appId.startsWith('amzn1.sellerapps.app.') ? 'seller_app' : 'nonstandard',
+            redirectUri: config.amazon.redirectUri,
+          })],
+        );
+        return redirectOrJson(req, reply, buildAmazonAuthUrl(state), {
+          status: 'authorization_url_created',
+          channel,
+          state,
+          appIdKind: config.amazon.appId.startsWith('amzn1.sellerapps.app.') ? 'seller_app' : 'nonstandard',
+        });
+      }
     });
 
     app.get(`/auth/${channel}/callback`, async (req: any, reply) => {
       const state = trim(req.query?.state);
       const saved = await one('SELECT * FROM oauth_states WHERE state = $1 AND channel = $2 AND used_at IS NULL AND expires_at > now()', [state, channel]);
       if (!saved) return reply.code(400).send({ error: `Invalid ${channel} OAuth state` });
-      await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
 
       if (channel === 'ebay' && trim(req.query?.code)) {
         try {
@@ -997,9 +1029,91 @@ export async function sqlModeRoutes(app: FastifyInstance) {
             eventType: 'connected',
             summary: 'eBay marketplace connected through OAuth.',
           });
+          await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
           return reply.redirect(`${config.frontendOrigin.replace(/\/+$/, '')}/oms?view=connections&connected=ebay`);
         } catch (err: any) {
           return reply.code(400).send({ error: err?.message || 'eBay token exchange failed' });
+        }
+      }
+
+      if (channel === 'amazon') {
+        const code = trim(req.query?.spapi_oauth_code || req.query?.code);
+        const sellingPartnerId = trim(req.query?.selling_partner_id);
+        if (!code) return reply.code(400).send({ error: 'Amazon callback is missing spapi_oauth_code' });
+        try {
+          const token = await exchangeAmazonCodeForTokens(code, config.amazon.redirectUri);
+          const expiresAt = token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null;
+          const scopes = ['sellingpartnerapi::orders', 'sellingpartnerapi::listings', 'sellingpartnerapi::fba_inventory', 'sellingpartnerapi::fulfillment_inbound'];
+          const metadata = {
+            state,
+            callbackReceivedAt: new Date().toISOString(),
+            tokenSource: 'oauth_callback',
+            query: req.query || {},
+            appIdKind: config.amazon.appId.startsWith('amzn1.sellerapps.app.') ? 'seller_app' : 'nonstandard',
+          };
+          let account = await one(
+            `UPDATE marketplace_connections
+             SET status = 'connected',
+                 display_name = COALESCE(display_name, 'Amazon Seller Central'),
+                 selling_partner_id = COALESCE($3, selling_partner_id),
+                 marketplace_id = COALESCE(marketplace_id, $4),
+                 access_token_enc = $5,
+                 refresh_token_enc = COALESCE($6, refresh_token_enc),
+                 token_expires_at = $7,
+                 scopes = $8,
+                 updated_at = now(),
+                 metadata = metadata || $9::jsonb
+             WHERE user_id = $1 AND channel = 'amazon' AND metadata->>'state' = $2
+             RETURNING *`,
+            [
+              saved.user_id,
+              state,
+              sellingPartnerId || null,
+              trim(req.query?.marketplace_id) || 'ATVPDKIKX0DER',
+              token.access_token,
+              token.refresh_token || null,
+              expiresAt,
+              scopes,
+              JSON.stringify(metadata),
+            ],
+          );
+          if (!account) {
+            account = await one(
+              `INSERT INTO marketplace_connections
+                (user_id, channel, status, display_name, selling_partner_id, marketplace_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, metadata)
+               VALUES ($1, 'amazon', 'connected', 'Amazon Seller Central', $2, $3, $4, $5, $6, $7, $8::jsonb)
+               RETURNING *`,
+              [
+                saved.user_id,
+                sellingPartnerId || null,
+                trim(req.query?.marketplace_id) || 'ATVPDKIKX0DER',
+                token.access_token,
+                token.refresh_token || null,
+                expiresAt,
+                scopes,
+                JSON.stringify(metadata),
+              ],
+            );
+          }
+          if (account?.id) {
+            await Promise.all([
+              setSyncStatus(account.id, 'products', 'pending'),
+              setSyncStatus(account.id, 'orders', 'pending'),
+              setSyncStatus(account.id, 'customers', 'pending'),
+              setSyncStatus(account.id, 'inventory', 'pending'),
+            ]);
+          }
+          await writeLedger(saved.user_id, {
+            entityType: 'marketplace_connection',
+            entityId: account?.id || null,
+            eventType: 'connected',
+            summary: 'Amazon marketplace connected through OAuth.',
+            payload: { sellingPartnerId: sellingPartnerId || null },
+          });
+          await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
+          return reply.redirect(`${config.frontendOrigin.replace(/\/+$/, '')}/oms?view=connections&connected=amazon`);
+        } catch (err: any) {
+          return reply.code(400).send({ error: err?.message || 'Amazon token exchange failed' });
         }
       }
 
@@ -1009,6 +1123,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
          WHERE user_id = $1 AND channel = $2 AND status = 'needs_authorization'`,
         [saved.user_id, channel, JSON.stringify({ callbackReceivedAt: new Date().toISOString(), query: req.query || {} })],
       );
+      await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
       return reply.redirect(`${config.frontendOrigin.replace(/\/+$/, '')}/dashboard?connected=${channel}&status=pending-token-exchange`);
     });
   }
