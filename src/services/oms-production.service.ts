@@ -1358,7 +1358,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
 }
 
 export async function getHeatmap(userId: string) {
-  const [facilities, plan, stateRows] = await Promise.all([
+  const [facilities, plan, stateRows, itemStateRows] = await Promise.all([
     getFacilities(userId),
     getInventoryPlan(userId),
     rows<{ state: string; orders: string; revenue: string }>(
@@ -1382,6 +1382,33 @@ export async function getHeatmap(userId: string) {
        LIMIT 50`,
       [userId],
     ),
+    rows<{ item_id: string; sku: string; title: string; state: string; orders: string; units: string; revenue: string }>(
+      `SELECT
+         COALESCE(ol.item_id, '') AS item_id,
+         COALESCE(ci.sku, ol.sku, 'unmapped') AS sku,
+         COALESCE(ci.title, ol.title, COALESCE(ci.sku, ol.sku, 'Unmapped item')) AS title,
+         UPPER(COALESCE(
+           NULLIF(o.shipping_address->>'stateOrProvinceCode', ''),
+           NULLIF(o.shipping_address->>'state', ''),
+           NULLIF(o.shipping_address->>'province', '')
+         )) AS state,
+         COUNT(DISTINCT o.id)::text AS orders,
+         COALESCE(SUM(COALESCE(ol.quantity, 0)), 0)::text AS units,
+         COALESCE(SUM(COALESCE(ol.total_price, ol.unit_price * ol.quantity, 0)), 0)::text AS revenue
+       FROM order_lines ol
+       INNER JOIN orders o ON o.id = ol.order_id AND o.user_id = ol.user_id
+       LEFT JOIN catalog_items ci ON ci.id = ol.item_id AND ci.user_id = ol.user_id
+       WHERE ol.user_id = $1
+       GROUP BY item_id, sku, title, state
+       HAVING UPPER(COALESCE(
+         NULLIF(o.shipping_address->>'stateOrProvinceCode', ''),
+         NULLIF(o.shipping_address->>'state', ''),
+         NULLIF(o.shipping_address->>'province', '')
+       )) IS NOT NULL
+       ORDER BY COUNT(DISTINCT o.id) DESC, COALESCE(SUM(COALESCE(ol.quantity, 0)), 0) DESC
+       LIMIT 1000`,
+      [userId],
+    ),
   ]);
   const totalInventory = plan.skus.reduce((sum, sku) => sum + number(sku.available), 0);
   const inventoryPerFacility = facilities.length ? Math.round(totalInventory / facilities.length) : 0;
@@ -1397,8 +1424,23 @@ export async function getHeatmap(userId: string) {
       name: f.name,
       code: f.code,
       state: f.address?.stateOrProvinceCode || f.address?.state || null,
+      city: f.address?.city || null,
+      latitude: f.latitude == null ? null : number(f.latitude),
+      longitude: f.longitude == null ? null : number(f.longitude),
       inventoryUnits: inventoryPerFacility,
       activeSkus: plan.skus.length ? Math.max(1, Math.floor(plan.skus.length / Math.max(1, facilities.length || 1))) : 0,
+      capacity: facilities.length ? Math.min(0.95, Math.max(0.15, inventoryPerFacility / Math.max(1, totalInventory || inventoryPerFacility || 1))) : 0,
+      region: f.address?.region || f.address?.stateOrProvinceCode || f.address?.state || null,
+      status: f.status || 'active',
+    })),
+    itemStates: itemStateRows.map((row) => ({
+      itemId: row.item_id || null,
+      sku: row.sku,
+      title: row.title,
+      state: row.state,
+      orders: number(row.orders),
+      units: number(row.units),
+      revenue: money(row.revenue),
     })),
   };
 }
