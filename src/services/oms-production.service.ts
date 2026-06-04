@@ -685,15 +685,33 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     height: dimsLocal?.height || keepa?.dimensions?.heightIn || null,
   };
   const weight = (item.weight && Number(item.weight) > 0) ? Number(item.weight) : (keepa?.weightLb || null);
+  const metadata = json(item.metadata, {});
+  const attributes = json(item.attributes, {});
+  const images = Array.isArray(item.images) ? item.images : Array.isArray(metadata.images) ? metadata.images : [];
+  const description = item.description || metadata.description || attributes.description || keepa?.description || '';
+  const brand = metadata.brand || metadata.manufacturer || attributes.brand || keepa?.brand || '';
+  const subtitle = metadata.subtitle || metadata.subTitle || attributes.subtitle || item.sub_category || item.category || '';
   return {
     id: item.id,
     sku: item.sku,
     title: item.title,
+    subtitle,
+    description,
     asin,
+    upc: item.upc || metadata.upc || attributes.upc || null,
+    ean: item.ean || metadata.ean || attributes.ean || null,
+    brand,
+    category: item.category || metadata.category || keepa?.category || null,
+    subCategory: item.sub_category || metadata.subCategory || metadata.sub_category || null,
     image: item.image || null,
+    images: images.filter(Boolean),
     supplierId: item.supplier_id || null,
     dimensions: dims,
     weight,
+    price: item.price ?? metadata.price ?? metadata.shopifyPrice ?? keepa?.buyboxPrice ?? null,
+    margin: metadata.margin ?? attributes.margin ?? null,
+    attributes,
+    metadata,
     intelligence,
     amazon: mapAmazonProfile(amazonProfile),
     keepa,    // NEW field — null when ASIN absent or cache empty
