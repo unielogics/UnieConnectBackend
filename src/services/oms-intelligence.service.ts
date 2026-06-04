@@ -1402,6 +1402,28 @@ async function getAccountOmsContextBundle(userId: string, screen: string) {
   };
 }
 
+function chatCount(value: any) {
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function chatPlural(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function compactTaskLine(task: any, index: number) {
+  const action = task?.actionLabel || 'Open task';
+  const detail = task?.detail ? ` - ${task.detail}` : '';
+  return `${index}. ${task?.title || 'Cortex task'} (${action})${detail}`;
+}
+
+function scrubVendorLanguage(text: string) {
+  return String(text || '')
+    .replace(/\bNVIDIA\s*NIM\b/gi, 'Cortex')
+    .replace(/\bNIM\b/g, 'Cortex')
+    .replace(/\bNVIDIA\b/gi, 'Cortex')
+    .replace(/\bdrivers?\b/gi, 'runtime');
+}
+
 function buildLocalCortexChatFallback(message: string, context: any): {
   answer: string;
   sources: any[];
@@ -1415,63 +1437,72 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
   const recommendations = Array.isArray(context?.recommendations) ? context.recommendations : [];
   const samples = context?.samples || {};
-  const skuCount = Array.isArray(samples.skus) ? samples.skus.length : 0;
-  const orderCount = Array.isArray(samples.orders) ? samples.orders.length : 0;
-  const warehouseCount = Array.isArray(samples.warehouses) ? samples.warehouses.length : 0;
-  const supplierCount = Array.isArray(samples.suppliers) ? samples.suppliers.length : 0;
+  const skuCount = chatCount(counts.catalogItems);
+  const orderCount = chatCount(counts.orders);
+  const warehouseCount = chatCount(counts.wmsLinks);
+  const supplierCount = chatCount(counts.suppliers);
   const labelRunCount = Array.isArray(samples.labelAuditRuns) ? samples.labelAuditRuns.length : 0;
-  const highTasks = tasks.filter((task: any) => String(task?.priority || '').toLowerCase() === 'high');
+  const sortedTasks = [...tasks].sort((a: any, b: any) => {
+    const rank: Record<string, number> = { high: 0, normal: 1, low: 2 };
+    return (rank[String(a?.priority || '').toLowerCase()] ?? 3) - (rank[String(b?.priority || '').toLowerCase()] ?? 3);
+  });
+  const highTasks = sortedTasks.filter((task: any) => String(task?.priority || '').toLowerCase() === 'high');
   const missingSkuTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('missing dimensions') || String(task?.title || '').toLowerCase().includes('missing cost'));
   const wmsTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('wms'));
   const topRecommendation = recommendations[0];
   const lines: string[] = [];
-  const accountLine = `I checked this account's OMS data: readiness is ${readiness.score || 0}% (${String(readiness.posture || 'unknown').replace(/_/g, ' ')}), with ${tasks.length} open tasks and ${recommendations.length} active Cortex signals.`;
-  const dataLine = `Current context includes ${skuCount} recent SKUs, ${orderCount} recent orders, ${warehouseCount} warehouse links, ${supplierCount} suppliers, and ${labelRunCount} label audit runs.`;
+  const readinessLine = `Account readiness is ${readiness.score || 0}% with a ${String(readiness.posture || 'unknown').replace(/_/g, ' ')} posture.`;
+  const dataLine = `Data connected: ${chatPlural(skuCount, 'SKU')}, ${chatPlural(orderCount, 'order')}, ${chatPlural(chatCount(counts.marketplaceConnections), 'marketplace connection')}, ${chatPlural(warehouseCount, 'warehouse link')}, ${chatPlural(supplierCount, 'supplier')}, and ${chatPlural(labelRunCount, 'label audit run')}.`;
+  const gaps = [
+    chatCount(counts.missingDimensions) ? `${chatPlural(chatCount(counts.missingDimensions), 'SKU')} missing dimensions or weight` : null,
+    chatCount(counts.missingCost) ? `${chatPlural(chatCount(counts.missingCost), 'SKU')} missing cost data` : null,
+    !warehouseCount ? 'no connected warehouse or WMS truth' : null,
+    chatCount(counts.amazonBlockedItems) ? `${chatPlural(chatCount(counts.amazonBlockedItems), 'Amazon SKU')} blocked for listing/FBA readiness` : null,
+  ].filter(Boolean);
+  const gapLine = gaps.length ? `Main gaps: ${gaps.join('; ')}.` : 'Main gaps: none blocking the core intelligence path right now.';
+  const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
 
   if (q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next')) {
-    lines.push(accountLine);
-    if (wmsTask) lines.push('First, connect WMS or warehouse truth so Cortex can move from forecast-only suggestions into executable inventory and shipment actions.');
-    if (missingSkuTask) lines.push('Second, complete SKU enrichment for missing cost, dimensions, and weight. That unlocks margin, pallet, FBA/FBM, and warehouse-fit intelligence.');
-    if (counts.marketplaceConnections > 0) lines.push('Your marketplace feed is connected, so the next lift is operational data quality rather than another store connection.');
-    if (topRecommendation) lines.push(`Then review the top Cortex signal: ${topRecommendation.title}.`);
-    if (!lines.length) lines.push('Start by connecting a marketplace or uploading product/order CSV data, then complete SKU weight, dimensions, cost, and selling price.');
+    lines.push(`Here is the fastest path to get the account moving.\n\n${readinessLine}\n${gapLine}`);
+    if (nextSteps.length) lines.push(`Do these next:\n${nextSteps.join('\n')}`);
+    else lines.push('Do this next:\n1. Connect a marketplace or upload product/order CSV data.\n2. Enrich SKU weight, dimensions, cost, and selling price.\n3. Connect warehouse/WMS truth before physical execution.');
+    if (chatCount(counts.marketplaceConnections) > 0) lines.push('The marketplace feed is already present, so the next lift is operational quality: SKU enrichment, warehouse truth, and cost evidence.');
+    if (topRecommendation) lines.push(`Most relevant Cortex signal: ${topRecommendation.title}.`);
   } else if (q.includes('blocking') || q.includes('confidence') || q.includes('missing')) {
-    lines.push(accountLine);
-    lines.push(`The biggest readiness blockers are ${highTasks.length || tasks.length} open ${highTasks.length ? 'high-priority' : 'readiness'} item${(highTasks.length || tasks.length) === 1 ? '' : 's'}.`);
-    tasks.slice(0, 3).forEach((task: any, idx: number) => lines.push(`${idx + 1}. ${task.title}${task.detail ? ` — ${task.detail}` : ''}`));
-    lines.push('Completing those fields raises Cortex confidence because recommendations become traceable to real inventory, cost, demand, and warehouse data.');
+    lines.push(`${readinessLine}\n${gapLine}`);
+    lines.push(`The biggest blockers are ${highTasks.length || sortedTasks.length} open ${highTasks.length ? 'high-priority' : 'readiness'} item${(highTasks.length || sortedTasks.length) === 1 ? '' : 's'}.`);
+    if (nextSteps.length) lines.push(`Work queue:\n${nextSteps.join('\n')}`);
+    lines.push('Why it matters: Cortex can only approve or automate concrete changes when the recommendation is traceable to real inventory, cost, demand, warehouse, and service data.');
   } else if (q.includes('opportunity') || q.includes('optimized') || q.includes('optimization')) {
-    lines.push(accountLine);
+    lines.push(readinessLine);
     if (topRecommendation) {
-      lines.push(`The clearest current Cortex opportunity is: ${topRecommendation.title}.`);
+      lines.push(`The clearest current Cortex opportunity is ${topRecommendation.title}.`);
       if (topRecommendation.summary) lines.push(topRecommendation.summary);
-      lines.push('Treat this as a decision only when it has a measurable inventory, cost, revenue, service, or fulfillment impact. Otherwise it should remain a readiness task.');
+      lines.push('Decision rule: show Accept/Deny only for measurable inventory, cost, revenue, service, or fulfillment impact. Readiness gaps should remain tasks, not approval decisions.');
     } else {
       lines.push('I do not see a concrete current-vs-optimized decision yet. Finish the readiness blockers first so Cortex can produce traceable financial or inventory impact.');
     }
   } else if (q.includes('summarize') || q.includes('happening') || q.includes('account') || q.includes('status')) {
-    lines.push(accountLine);
-    lines.push(dataLine);
-    if (tasks[0]) lines.push(`The next best action is ${tasks[0].title}${tasks[0].detail ? `: ${tasks[0].detail}` : '.'}`);
-    if (recommendations[0]) lines.push(`The latest Cortex signal is ${recommendations[0].title}.`);
-    if (!warehouseCount && wmsTask) lines.push('Warehouse execution truth is still the main missing operational layer.');
+    lines.push(`Here is what is happening in this account.\n\n${readinessLine}\n${dataLine}\n${gapLine}`);
+    if (nextSteps.length) lines.push(`Next best actions:\n${nextSteps.join('\n')}`);
+    if (recommendations[0]) lines.push(`Latest Cortex signal: ${recommendations[0].title}.`);
+    if (!warehouseCount && wmsTask) lines.push('The main operational layer still missing is warehouse/WMS truth, so physical execution should stay gated until that is connected.');
   } else {
-    lines.push(accountLine);
-    lines.push(dataLine);
-    if (tasks[0]) lines.push(`The next useful action is ${tasks[0].title}.`);
-    if (recommendations[0]) lines.push(`The latest Cortex signal is ${recommendations[0].title}.`);
+    lines.push(`${readinessLine}\n${dataLine}\n${gapLine}`);
+    if (nextSteps.length) lines.push(`Suggested next actions:\n${nextSteps.join('\n')}`);
+    if (recommendations[0]) lines.push(`Latest Cortex signal: ${recommendations[0].title}.`);
   }
 
   return {
-    answer: lines.join('\n\n'),
+    answer: scrubVendorLanguage(lines.join('\n\n')),
     sources: [
       { source: 'oms_data_readiness', readinessScore: readiness.score, posture: readiness.posture },
       { source: 'oms_cortex_tasks', count: tasks.length },
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
     ],
-    tasks: tasks.slice(0, 5).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget })),
-    confidence: readiness.score != null ? Math.max(0.35, Math.min(0.82, Number(readiness.score) / 100)) : 0.45,
+    tasks: sortedTasks.slice(0, 5).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel })),
+    confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
     readinessNotes: 'Answer generated from this account’s scoped OMS data.',
   };
 }
@@ -1484,7 +1515,13 @@ function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof bu
   const tasks = data.suggested_actions || data.suggestedActions || data.tasks || data.response?.tasks || [];
   const confidence = closedLoopNumber(data.confidence, data.response?.confidence, data.result?.confidence);
   const readinessNotes = data.readiness_notes || data.readinessNotes || data.blocked_reason || data.missing_data || null;
-  return { answer: String(answer || fallback.answer), sources: Array.isArray(sources) ? sources : fallback.sources, tasks: Array.isArray(tasks) ? tasks : [], confidence, readinessNotes };
+  return {
+    answer: scrubVendorLanguage(String(answer || fallback.answer)),
+    sources: Array.isArray(sources) && sources.length ? sources : fallback.sources,
+    tasks: Array.isArray(tasks) ? tasks : [],
+    confidence,
+    readinessNotes: readinessNotes ? scrubVendorLanguage(String(readinessNotes)) : readinessNotes,
+  };
 }
 
 export async function createCortexChatMessage(userId: string, body: any = {}) {
