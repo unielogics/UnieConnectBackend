@@ -25,8 +25,23 @@ function num(value: unknown, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function json(value: unknown, fallback: any) {
+  return value == null ? fallback : value;
+}
+
 function plainText(html: unknown) {
   return typeof html === 'string' ? html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000) : null;
+}
+
+function shopifyVariantSku(product: any, variant: any) {
+  const explicit = trim(variant?.sku);
+  if (explicit) return explicit;
+  const handle = trim(product?.handle || product?.title)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32);
+  return `SHOPIFY-${handle || 'VARIANT'}-${trim(variant?.id || variant?.inventory_item_id || 'NOID')}`;
 }
 
 function parseNextPageInfo(linkHeader: string | null): string | null {
@@ -44,6 +59,11 @@ function normalizeNext(next?: string): string | undefined {
 async function one<T extends QueryResultRow = QueryResultRow>(sql: string, values: unknown[] = []): Promise<T | null> {
   const res = await pgQuery<T>(sql, values);
   return res?.rows?.[0] || null;
+}
+
+async function rows<T extends QueryResultRow = QueryResultRow>(sql: string, values: unknown[] = []): Promise<T[]> {
+  const res = await pgQuery<T>(sql, values);
+  return res?.rows || [];
 }
 
 async function upsertCatalogItem(params: {
@@ -114,6 +134,34 @@ async function upsertMapping(params: {
       JSON.stringify(params.payload || {}),
     ],
   );
+}
+
+async function updateShopifyInventoryFromVariant(ctx: SyncContext, itemId: string, variant: any, source: string) {
+  if (variant?.inventory_quantity === undefined || variant?.inventory_quantity === null) return false;
+  const qty = num(variant.inventory_quantity);
+  const inventoryPayload = {
+    available: qty,
+    inventoryItemId: trim(variant?.inventory_item_id) || null,
+    source,
+    channelAccountId: ctx.channelAccountId,
+  };
+  await pgQuery(
+    `UPDATE catalog_items
+     SET wms_inventory = wms_inventory || $3::jsonb || jsonb_build_object('shopifyStores', COALESCE(wms_inventory->'shopifyStores', '{}'::jsonb) || $5::jsonb),
+         metadata = metadata || $4::jsonb,
+         updated_at = now()
+     WHERE id = $1 AND user_id = $2`,
+    [
+      itemId,
+      ctx.userId,
+      JSON.stringify({
+        shopify: inventoryPayload,
+      }),
+      JSON.stringify({ shopifyInventorySyncedAt: new Date().toISOString(), shopifyInventorySource: source }),
+      JSON.stringify({ [ctx.channelAccountId]: inventoryPayload }),
+    ],
+  );
+  return true;
 }
 
 async function ensureCustomer(ctx: SyncContext, channel: string, externalCustomerId: string | null, raw: any) {
@@ -299,8 +347,7 @@ export async function applyShopifyWebhook(params: {
     const images = Array.isArray(payload?.images) ? payload.images.map((image: any) => image?.src || image?.url).filter(Boolean) : [];
     let count = 0;
     for (const variant of Array.isArray(payload?.variants) ? payload.variants : []) {
-      const sku = trim(variant?.sku);
-      if (!sku) continue;
+      const sku = shopifyVariantSku(payload, variant);
       const item: any = await upsertCatalogItem({
         userId: account.user_id,
         sku,
@@ -320,8 +367,9 @@ export async function applyShopifyWebhook(params: {
           channelVariantId: trim(variant?.id) || null,
           sku,
           status: payload?.status === 'active' ? 'active' : 'inactive',
-          payload: { ...metadata, product: payload, variant, inventory_item_id: variant?.inventory_item_id },
+          payload: { ...metadata, product: payload, variant, inventory_item_id: variant?.inventory_item_id, originalSku: trim(variant?.sku) || null },
         });
+        await updateShopifyInventoryFromVariant({ userId: account.user_id, channelAccountId: account.id }, item.id, variant, 'product_webhook_variant');
         count++;
       }
     }
@@ -384,8 +432,7 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
       for (const product of Array.isArray(body?.products) ? body.products : []) {
         const images = Array.isArray(product?.images) ? product.images.map((image: any) => image?.src || image?.url).filter(Boolean) : [];
         for (const variant of Array.isArray(product?.variants) ? product.variants : []) {
-          const sku = trim(variant?.sku);
-          if (!sku) continue;
+          const sku = shopifyVariantSku(product, variant);
           const item: any = await upsertCatalogItem({
             userId: ctx.userId,
             sku,
@@ -405,8 +452,9 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
               channelVariantId: trim(variant?.id) || null,
               sku,
               status: product?.status === 'active' ? 'active' : 'inactive',
-              payload: { product, variant, inventory_item_id: variant?.inventory_item_id },
+              payload: { product, variant, inventory_item_id: variant?.inventory_item_id, originalSku: trim(variant?.sku) || null },
             });
+            await updateShopifyInventoryFromVariant(ctx, item.id, variant, 'product_variant');
             count++;
           }
         }
@@ -496,7 +544,14 @@ async function syncShopifyCustomers(ctx: SyncContext, base: string, headers: Rec
 
 async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Record<string, string>) {
   const locationsRes = await fetch(`${base}/locations.json`, { headers });
-  if (!locationsRes.ok) throw new Error(locationsRes.status === 401 || locationsRes.status === 403 ? 'Locations access denied. Reconnect Shopify with read_locations scope.' : `HTTP ${locationsRes.status}`);
+  if (!locationsRes.ok) {
+    if (locationsRes.status === 401 || locationsRes.status === 403) {
+      const fallback = await syncShopifyInventoryFromMappedVariants(ctx);
+      if (fallback > 0) return fallback;
+      throw new Error('Locations access denied. Reconnect Shopify with read_locations scope.');
+    }
+    throw new Error(`HTTP ${locationsRes.status}`);
+  }
   const locationsBody: any = await locationsRes.json();
   const location = Array.isArray(locationsBody?.locations) ? locationsBody.locations[0] : null;
   if (!location?.id) return 0;
@@ -516,18 +571,35 @@ async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Rec
     if (!mapping?.item_id) continue;
     await pgQuery(
       `UPDATE catalog_items
-       SET wms_inventory = wms_inventory || $3::jsonb,
+       SET wms_inventory = wms_inventory || $3::jsonb || jsonb_build_object('shopifyStores', COALESCE(wms_inventory->'shopifyStores', '{}'::jsonb) || $5::jsonb),
            metadata = metadata || $4::jsonb,
            updated_at = now()
        WHERE id = $1 AND user_id = $2`,
       [
         mapping.item_id,
         ctx.userId,
-        JSON.stringify({ shopify: { locationId: String(level.location_id), available: num(level.available) } }),
+        JSON.stringify({ shopify: { locationId: String(level.location_id), available: num(level.available), channelAccountId: ctx.channelAccountId } }),
         JSON.stringify({ shopifyInventorySyncedAt: new Date().toISOString() }),
+        JSON.stringify({ [ctx.channelAccountId]: { locationId: String(level.location_id), available: num(level.available), channelAccountId: ctx.channelAccountId, source: 'inventory_levels' } }),
       ],
     );
     count++;
+  }
+  return count;
+}
+
+async function syncShopifyInventoryFromMappedVariants(ctx: SyncContext) {
+  const mappings = await rows(
+    `SELECT m.item_id, m.payload
+     FROM item_channel_mappings m
+     WHERE m.user_id = $1 AND m.channel_connection_id = $2 AND m.channel = 'shopify'`,
+    [ctx.userId, ctx.channelAccountId],
+  );
+  let count = 0;
+  for (const mapping of mappings) {
+    const payload = json(mapping.payload, {});
+    const variant = payload.variant || {};
+    if (await updateShopifyInventoryFromVariant(ctx, mapping.item_id, variant, 'mapped_variant_fallback')) count++;
   }
   return count;
 }

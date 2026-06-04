@@ -273,8 +273,28 @@ export async function writeOmsLedgerEvent(params: {
   }
 }
 
-function itemInventory(item: Row) {
-  return json(item.wms_inventory, item.wmsInventory || {});
+function itemInventory(item: Row, filter: MarketplaceFilter = {}) {
+  const inv = json(item.wms_inventory, item.wmsInventory || {});
+  const stores = inv.shopifyStores && typeof inv.shopifyStores === 'object' ? inv.shopifyStores : {};
+  let marketplaceAvailable: number | null = null;
+  if (filter.channelAccountId && stores[filter.channelAccountId]) {
+    marketplaceAvailable = number(stores[filter.channelAccountId]?.available);
+  } else if (filter.channel === 'shopify') {
+    const values = Object.values(stores);
+    marketplaceAvailable = values.length
+      ? values.reduce((sum: number, row: any) => sum + number(row?.available), 0)
+      : number(inv.shopify?.available, NaN);
+  } else if (filter.channel === 'amazon') {
+    marketplaceAvailable = number(inv.amazon?.available ?? inv.amazon?.availableFbaQty, NaN);
+  } else if (filter.channel === 'ebay') {
+    marketplaceAvailable = number(inv.ebay?.available, NaN);
+  }
+  const available = marketplaceAvailable != null && Number.isFinite(marketplaceAvailable)
+    ? marketplaceAvailable
+    : Number.isFinite(Number(inv.available))
+      ? number(inv.available)
+      : number(inv.shopify?.available ?? inv.ebay?.available ?? inv.amazon?.available ?? 0);
+  return { ...inv, available };
 }
 
 function itemDimensions(item: Row) {
@@ -337,8 +357,8 @@ async function getAmazonProfilesForItems(userId: string, itemIds: string[]) {
   return new Map(profiles.map((profile) => [String(profile.item_id), mapAmazonProfile(profile)]));
 }
 
-function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>, facilitiesCount: number) {
-  const inv = itemInventory(item);
+function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>, facilitiesCount: number, filter: MarketplaceFilter = {}) {
+  const inv = itemInventory(item, filter);
   const available = number(inv.available);
   const velocity = Math.max(0, number(velocityBySku.get(item.sku)));
   const daysOfCover = velocity > 0 ? Math.round((available / velocity) * 30) : 0;
@@ -540,7 +560,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
     ),
   ]);
   const velocityBySku = new Map(velocityRows.map((row) => [String(row.sku || ''), number(row.units)]));
-  const planSkus = items.map((item, index) => mapSkuPlan(item, index, velocityBySku, facilities.length));
+  const planSkus = items.map((item, index) => mapSkuPlan(item, index, velocityBySku, facilities.length, filter));
   const months = Array.from({ length: horizon === '6m' ? 6 : 3 }, (_, i) => {
     const date = new Date();
     date.setMonth(date.getMonth() + i);
