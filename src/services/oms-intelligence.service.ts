@@ -366,13 +366,15 @@ export async function createProductResearchRun(userId: string, input: any) {
     recommendationType: 'product_research',
     entityType: 'sku',
     entityId: item?.id || input?.itemId || result.sku,
-    title: `${result.sku}: ${result.productRisk === 'strong_candidate' ? 'strong optimization candidate' : 'product intelligence ready'}`,
+    title: result.missingData.length
+      ? `${result.sku}: enrichment baseline incomplete`
+      : `${result.sku}: ${result.productRisk === 'strong_candidate' ? 'strong optimization candidate' : 'product intelligence ready'}`,
     summary: result.recommendedAction,
-    currentValue: { dataCompleteness: 100 - result.missingData.length * 20, marketplaceReadiness: result.marketplaceReadiness },
+    currentValue: { dataCompleteness: Math.max(0, 100 - result.missingData.length * 20), marketplaceReadiness: result.marketplaceReadiness },
     optimizedValue: { opportunityScore: result.opportunityScore, warehouseFit: result.fulfillment.warehouseFit },
     estimatedImpact: { confidence, palletUnits: result.fulfillment.estimatedUnitsPerPallet },
     requiredAction: result.missingData.length ? 'complete_missing_product_data' : 'feed_optimize_suite',
-    approvalState: 'not_required',
+    approvalState: result.missingData.length ? 'blocked' : 'waiting_approval',
     wmsTruthState: readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only',
     confidence,
     sourceSummary: readiness,
