@@ -1,10 +1,40 @@
 export type LabelAuditFinding = {
   id: string;
   carrier: string;
-  trackingNumber: string;
+  trackingNumber?: string | undefined;
   findingType: string;
   severity: string;
   refundAmount: number;
   status: string;
   recommendation: string;
+  source?: string | undefined;
+  runId?: string | undefined;
+  order?: string | undefined;
+  service?: string | undefined;
+  cost?: number | undefined;
+  optimizedCarrier?: string | undefined;
+  optimizedCost?: number | undefined;
+  shipped?: string | undefined;
+  delivered?: string | undefined;
+  promised?: string | undefined;
+  zone?: number | undefined;
+  weight?: number | string | undefined;
+  dim?: string | undefined;
+  auditStatus?: string | undefined;
+};
+
+export type LabelAuditRun = {
+  id: string;
+  publicId: string;
+  filename?: string | null | undefined;
+  status: string;
+  rowCount: number;
+  findingsCount: number;
+  estimatedRefunds: number;
+  optimizedServiceSavings: number;
+  missingEvidenceCount: number;
+  inputSummary: Record<string, unknown>;
+  resultSummary: Record<string, unknown>;
+  createdAt?: string | undefined;
+  updatedAt?: string | undefined;
 };

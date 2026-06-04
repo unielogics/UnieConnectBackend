@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import {
   approveBusinessDouble,
   confirmShipmentWizardDraft,
+  createLabelAuditRun,
   createShipmentWizardDraft,
   getBillingProfit,
   getBusinessDouble,
@@ -10,6 +11,8 @@ import {
   getHeatmap,
   getInventoryPlan,
   getLabelAudit,
+  getLabelAuditRun,
+  getLabelAuditRuns,
   getLedger,
   getOmsAsns,
   getOmsCustomers,
@@ -18,6 +21,8 @@ import {
   getOmsSkus,
   getOmsSupplierActivity,
   getOmsSuppliers,
+  getWarehouseDetail,
+  getWarehouseOverview,
 } from '../services/oms-production.service';
 import { getKeepaSnapshot, peekKeepaSnapshot } from '../services/keepa';
 
@@ -126,10 +131,48 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     return getHeatmap(userId);
   });
 
+  fastify.get('/oms/warehouses/overview', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getWarehouseOverview(userId);
+  });
+
+  fastify.get('/oms/warehouses/:warehouseCode/detail', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const detail = await getWarehouseDetail(userId, String(req.params?.warehouseCode || ''));
+    if (!detail) return reply.code(404).send({ error: 'Warehouse not found' });
+    return detail;
+  });
+
   fastify.get('/oms/label-audit', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getLabelAudit(userId);
+  });
+
+  fastify.post('/oms/label-audit/runs', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    try {
+      return await createLabelAuditRun(userId, req.body || {});
+    } catch (err: any) {
+      return reply.code(err?.statusCode || 500).send({ error: err?.message || 'Label audit run failed', details: err?.details || undefined });
+    }
+  });
+
+  fastify.get('/oms/label-audit/runs', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getLabelAuditRuns(userId);
+  });
+
+  fastify.get('/oms/label-audit/runs/:id', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const detail = await getLabelAuditRun(userId, String(req.params?.id || ''));
+    if (!detail) return reply.code(404).send({ error: 'Label audit run not found' });
+    return detail;
   });
 
   fastify.get('/oms/billing-profit', async (req: any, reply) => {

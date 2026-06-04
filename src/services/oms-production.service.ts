@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { FastifyBaseLogger } from 'fastify';
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
-import { LabelAuditFinding } from './oms-production.types';
+import { LabelAuditFinding, LabelAuditRun } from './oms-production.types';
 import { postCortex, cortexConfigStatus } from './cortex-orchestration';
 
 type RangeKey = 'today' | '7d' | '30d';
@@ -1261,6 +1261,422 @@ export async function getHeatmap(userId: string) {
   };
 }
 
+function mapWarehouseLink(row: Row) {
+  const address = json(row.address, {});
+  const metadata = json(row.metadata, {});
+  return {
+    id: String(row.id),
+    warehouseCode: String(row.warehouse_code || row.code || ''),
+    code: String(row.warehouse_code || row.code || ''),
+    name: row.name || row.warehouse_code,
+    status: row.status || 'connected',
+    connectionCode: row.connection_code || null,
+    facilityId: row.facility_id || null,
+    facilityCode: row.facility_code || row.code || null,
+    facilityName: row.facility_name || row.name || null,
+    city: address.city || null,
+    state: address.stateOrProvinceCode || address.state || null,
+    region: address.stateOrProvinceCode || address.state || address.city || null,
+    connectedAt: iso(row.connected_at),
+    metadata,
+  };
+}
+
+async function warehouseLinks(userId: string) {
+  return rows(
+    `SELECT l.*, f.code AS facility_code, f.name AS facility_name, f.name, f.address
+     FROM oms_warehouse_links l
+     LEFT JOIN facilities f ON f.id = l.facility_id
+     WHERE l.user_id = $1
+       AND l.status = 'connected'
+       AND COALESCE(l.metadata->>'source', '') <> 'demo'
+       AND COALESCE(f.metadata->>'source', '') NOT IN ('sql_default','demo')
+     ORDER BY l.connected_at DESC`,
+    [userId],
+  );
+}
+
+function snapshotForWarehouse(item: Row, warehouseCode: string) {
+  const inv = json(item.wms_inventory, {});
+  const snap = inv?.[warehouseCode] || inv?.[warehouseCode.toUpperCase()] || inv?.[warehouseCode.toLowerCase()] || null;
+  return snap && typeof snap === 'object' ? snap : null;
+}
+
+export async function getWarehouseOverview(userId: string) {
+  const links = await warehouseLinks(userId);
+  const warehouses = await Promise.all(
+    links.map(async (link) => {
+      const warehouseCode = String(link.warehouse_code || '');
+      const [inventoryRows, orderRows, asnRows, eventRows, ledgerRows] = await Promise.all([
+        rows(
+          `SELECT id, sku, title, wms_inventory, updated_at
+           FROM catalog_items
+           WHERE user_id = $1 AND wms_inventory ? $2
+           ORDER BY updated_at DESC LIMIT 500`,
+          [userId, warehouseCode],
+        ),
+        rows<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+           FROM orders
+           WHERE user_id = $1
+             AND (metadata::text ILIKE $2 OR id IN (
+               SELECT entity_id FROM oms_wms_events
+               WHERE user_id = $1 AND warehouse_code = $3 AND entity_type IN ('order','orders')
+             ))`,
+          [userId, `%${warehouseCode}%`, warehouseCode],
+        ),
+        rows<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+           FROM asns a
+           LEFT JOIN shipment_plans sp ON sp.id = a.shipment_plan_id AND sp.user_id = a.user_id
+           WHERE a.user_id = $1 AND (sp.facility_id = $2 OR sp.metadata::text ILIKE $3 OR sp.items::text ILIKE $3)`,
+          [userId, link.facility_id || null, `%${warehouseCode}%`],
+        ),
+        rows(
+          `SELECT * FROM oms_wms_events
+           WHERE user_id = $1 AND warehouse_code = $2
+           ORDER BY received_at DESC LIMIT 1`,
+          [userId, warehouseCode],
+        ),
+        rows<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+           FROM oms_execution_ledger
+           WHERE user_id = $1 AND (entity_id = $2 OR payload::text ILIKE $3)`,
+          [userId, warehouseCode, `%${warehouseCode}%`],
+        ),
+      ]);
+      const inventoryUnits = inventoryRows.reduce((sum, item) => {
+        const snap = snapshotForWarehouse(item, warehouseCode);
+        return sum + number(snap?.available ?? snap?.onHand ?? snap?.quantity);
+      }, 0);
+      return {
+        ...mapWarehouseLink(link),
+        inventoryUnits,
+        activeSkus: inventoryRows.length,
+        orders: number(orderRows[0]?.count),
+        asns: number(asnRows[0]?.count),
+        activityCount: number(ledgerRows[0]?.count),
+        lastWmsEventAt: iso(eventRows[0]?.received_at),
+        lastWmsEventType: eventRows[0]?.event_type || null,
+      };
+    }),
+  );
+  return { warehouses, total: warehouses.length };
+}
+
+export async function getWarehouseDetail(userId: string, warehouseCode: string) {
+  const code = String(warehouseCode || '').trim();
+  if (!code) return null;
+  const link = (await warehouseLinks(userId)).find((row) => String(row.warehouse_code || '').toLowerCase() === code.toLowerCase());
+  if (!link) return null;
+  const [inventoryRows, orders, asns, shipmentPlans, events, ledger] = await Promise.all([
+    rows(
+      `SELECT id, sku, title, weight, dimensions, wms_inventory, updated_at
+       FROM catalog_items
+       WHERE user_id = $1 AND wms_inventory ? $2
+       ORDER BY updated_at DESC LIMIT 500`,
+      [userId, String(link.warehouse_code)],
+    ),
+    rows(
+      `SELECT o.*, c.email AS customer_email, c.name AS customer_name
+       FROM orders o
+       LEFT JOIN customers c ON c.id = o.customer_id
+       WHERE o.user_id = $1
+         AND (o.metadata::text ILIKE $2 OR o.id IN (
+           SELECT entity_id FROM oms_wms_events
+           WHERE user_id = $1 AND warehouse_code = $3 AND entity_type IN ('order','orders')
+         ))
+       ORDER BY COALESCE(o.placed_at, o.created_at) DESC LIMIT 100`,
+      [userId, `%${link.warehouse_code}%`, link.warehouse_code],
+    ),
+    rows(
+      `SELECT a.*, sp.internal_shipment_id, sp.shipment_title, sp.facility_id, sp.items
+       FROM asns a
+       LEFT JOIN shipment_plans sp ON sp.id = a.shipment_plan_id AND sp.user_id = a.user_id
+       WHERE a.user_id = $1 AND (sp.facility_id = $2 OR sp.metadata::text ILIKE $3 OR sp.items::text ILIKE $3)
+       ORDER BY COALESCE(a.updated_at, a.created_at) DESC LIMIT 100`,
+      [userId, link.facility_id || null, `%${link.warehouse_code}%`],
+    ),
+    rows(
+      `SELECT * FROM shipment_plans
+       WHERE user_id = $1 AND (facility_id = $2 OR metadata::text ILIKE $3 OR items::text ILIKE $3)
+       ORDER BY updated_at DESC LIMIT 100`,
+      [userId, link.facility_id || null, `%${link.warehouse_code}%`],
+    ),
+    rows(
+      `SELECT * FROM oms_wms_events
+       WHERE user_id = $1 AND warehouse_code = $2
+       ORDER BY received_at DESC LIMIT 100`,
+      [userId, link.warehouse_code],
+    ),
+    rows(
+      `SELECT id, entity_type, entity_id, event_type, source_system, summary, payload, confidence, created_at
+       FROM oms_execution_ledger
+       WHERE user_id = $1 AND (entity_id = $2 OR payload::text ILIKE $3)
+       ORDER BY created_at DESC LIMIT 100`,
+      [userId, link.warehouse_code, `%${link.warehouse_code}%`],
+    ),
+  ]);
+  const inventory = inventoryRows.map((item) => {
+    const snap = snapshotForWarehouse(item, String(link.warehouse_code)) || {};
+    return {
+      id: item.id,
+      sku: item.sku,
+      title: item.title,
+      available: number(snap.available ?? snap.onHand ?? snap.quantity),
+      inbound: number(snap.inbound),
+      received: number(snap.received),
+      orders: number(snap.orders ?? snap.allocated),
+      shippedToday: number(snap.shippedToday ?? snap.shipped_today),
+      openAsnsCount: number(snap.openAsnsCount ?? snap.open_asns_count),
+      receiving: number(snap.receiving),
+      updatedAt: snap.updatedAt || iso(item.updated_at),
+    };
+  });
+  const inventoryUnits = inventory.reduce((sum, item) => sum + item.available, 0);
+  const orderRows = orders.map((order) => {
+    const totals = json(order.totals, {});
+    return {
+      id: order.id,
+      publicId: publicEntityId('OR', order.id),
+      orderNumber: order.order_number,
+      customer: order.customer_name || order.customer_email || null,
+      channel: order.channel || 'manual',
+      status: order.status,
+      total: money(totals.total || totals.subtotal || 0),
+      placedAt: iso(order.placed_at),
+      createdAt: iso(order.created_at),
+    };
+  });
+  const asnRows = asns.map((asn) => ({
+    id: asn.id,
+    publicId: publicEntityId('AS', asn.id),
+    asnNumber: asn.asn_number,
+    status: asn.status,
+    shipmentPlanId: asn.shipment_plan_id,
+    shipmentTitle: asn.shipment_title || asn.internal_shipment_id || 'Inbound shipment',
+    units: itemLines(asn.items).reduce((sum, item) => sum + lineQuantity(item), 0),
+    createdAt: iso(asn.created_at),
+    updatedAt: iso(asn.updated_at),
+  }));
+  const shipmentRows = shipmentPlans.map((plan) => ({
+    id: plan.id,
+    publicId: publicEntityId('SH', plan.id),
+    title: plan.shipment_title || plan.internal_shipment_id || 'Shipment plan',
+    status: plan.status,
+    units: itemLines(plan.items).reduce((sum, item) => sum + lineQuantity(item), 0),
+    estimatedArrivalDate: iso(plan.estimated_arrival_date),
+    updatedAt: iso(plan.updated_at),
+  }));
+  return {
+    warehouse: {
+      ...mapWarehouseLink(link),
+      inventoryUnits,
+      activeSkus: inventory.length,
+      orders: orderRows.length,
+      asns: asnRows.length,
+      activityCount: ledger.length,
+      lastWmsEventAt: iso(events[0]?.received_at),
+      lastWmsEventType: events[0]?.event_type || null,
+    },
+    inventory,
+    orders: orderRows,
+    asns: asnRows,
+    shipmentPlans: shipmentRows,
+    wmsEvents: events.map((event) => ({
+      id: event.id,
+      eventType: event.event_type,
+      entityType: event.entity_type,
+      entityId: event.entity_id,
+      status: event.status,
+      payload: json(event.payload, {}),
+      receivedAt: iso(event.received_at),
+    })),
+    ledger: ledger.map((event) => ({ ...event, payload: json(event.payload, {}), createdAt: iso(event.created_at) })),
+    cortex: {
+      readiness: inventory.length > 0 ? 'wms_truth_available' : 'waiting_for_inventory_snapshot',
+      signals: [
+        inventory.length ? `${inventory.length} SKUs have warehouse inventory snapshots.` : 'No inventory snapshots received for this warehouse yet.',
+        events.length ? `${events.length} WMS events available for operational traceability.` : 'No WMS events received yet.',
+        asnRows.length ? `${asnRows.length} ASNs or inbound records are tied to this warehouse.` : 'No inbound ASNs tied to this warehouse yet.',
+      ],
+      recommendations: [
+        inventory.length ? 'Review slow-moving and allocated units before the next replenishment plan.' : 'Send an inventory_snapshot event from WMS to unlock warehouse-level intelligence.',
+        'Use Cortex plan approval before changing WMS execution work.',
+      ],
+    },
+  };
+}
+
+function mapLabelRun(row: Row | null): LabelAuditRun | null {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    publicId: publicEntityId('LA', row.id),
+    filename: row.filename || null,
+    status: row.status || 'completed',
+    rowCount: number(row.row_count),
+    findingsCount: number(row.findings_count),
+    estimatedRefunds: money(row.estimated_refunds),
+    optimizedServiceSavings: money(row.optimized_service_savings),
+    missingEvidenceCount: number(row.missing_evidence_count),
+    inputSummary: json(row.input_summary, {}),
+    resultSummary: json(row.result_summary, {}),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function valueFrom(row: Row, keys: string[]) {
+  for (const key of keys) {
+    const direct = row[key];
+    if (direct != null && String(direct).trim() !== '') return String(direct).trim();
+    const foundKey = Object.keys(row).find((k) => k.toLowerCase().replace(/[^a-z0-9]/g, '') === key.toLowerCase().replace(/[^a-z0-9]/g, ''));
+    if (foundKey && row[foundKey] != null && String(row[foundKey]).trim() !== '') return String(row[foundKey]).trim();
+  }
+  return '';
+}
+
+function parseDateValue(value: string) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function normalizeLabelCsvRow(raw: Row, index: number) {
+  const order = valueFrom(raw, ['order', 'orderId', 'orderNumber', 'order_no']);
+  const trackingNumber = valueFrom(raw, ['trackingNumber', 'tracking', 'tracking_no']);
+  const carrier = valueFrom(raw, ['carrier', 'carrierName']);
+  const service = valueFrom(raw, ['service', 'serviceLevel', 'shippingService']);
+  const shipped = valueFrom(raw, ['shipped', 'shippedDate', 'shipDate']);
+  const delivered = valueFrom(raw, ['delivered', 'deliveredDate', 'deliveryDate']);
+  const promised = valueFrom(raw, ['promised', 'promisedDate', 'promiseDate', 'estimatedDeliveryDate']);
+  const cost = money(valueFrom(raw, ['cost', 'labelCost', 'shippingCost', 'postage']));
+  const zone = number(valueFrom(raw, ['zone', 'shippingZone']), NaN);
+  const weight = number(valueFrom(raw, ['weight', 'weightLb', 'weightLbs']), NaN);
+  const dim = valueFrom(raw, ['dim', 'dims', 'dimensions']);
+  const state = valueFrom(raw, ['state', 'shipToState', 'ship_state']);
+  const zip = valueFrom(raw, ['zip', 'shipToZip', 'postalCode']);
+  const errors = [];
+  if (!order && !trackingNumber) errors.push(`Row ${index + 1}: order or tracking number is required.`);
+  if (!carrier) errors.push(`Row ${index + 1}: carrier is required.`);
+  return {
+    rowNumber: index + 1,
+    order,
+    trackingNumber,
+    carrier,
+    service,
+    shipped,
+    delivered,
+    promised,
+    cost,
+    zone: Number.isFinite(zone) ? zone : null,
+    weight: Number.isFinite(weight) ? weight : null,
+    dim,
+    state,
+    zip,
+    errors,
+    raw,
+  };
+}
+
+function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId: string) {
+  const deliveredAt = parseDateValue(row.delivered);
+  const promisedAt = parseDateValue(row.promised);
+  const shippedAt = parseDateValue(row.shipped);
+  const daysInTransit = deliveredAt && shippedAt ? Math.max(0, Math.round((deliveredAt.getTime() - shippedAt.getTime()) / 86400000)) : null;
+  const late = Boolean(deliveredAt && promisedAt && deliveredAt.getTime() > promisedAt.getTime());
+  const highCost = row.cost >= 18 || (row.zone != null && row.zone >= 6 && row.cost >= 12);
+  const heavyParcel = row.weight != null && row.weight >= 12 && /ground|priority|advantage|parcel/i.test(row.service || '');
+  const missingEvidence = !row.delivered || !row.promised || !row.cost;
+  type GeneratedLabelFinding = { type: string; severity: string; refund: number; recommendation: string; optimizedCarrier?: string | undefined; optimizedCost?: number | undefined; auditStatus: string };
+  const findings: GeneratedLabelFinding[] = [];
+  if (late) {
+    findings.push({
+      type: 'late_delivery_refund',
+      severity: 'high',
+      refund: money(Math.min(Math.max(row.cost * 0.8, 4), 35)),
+      recommendation: 'Cortex found a late-delivery refund candidate. Attach carrier tracking proof before filing.',
+      optimizedCarrier: row.carrier,
+      optimizedCost: row.cost,
+      auditStatus: 'claim_ready',
+    });
+  }
+  if (highCost) {
+    findings.push({
+      type: 'optimized_service_swap',
+      severity: 'medium',
+      refund: 0,
+      recommendation: 'Cortex recommends reviewing carrier/service selection for this zone and shipment profile.',
+      optimizedCarrier: /ups/i.test(row.carrier) ? 'USPS Ground Advantage' : 'UPS Ground',
+      optimizedCost: money(row.cost * 0.82),
+      auditStatus: 'optimization',
+    });
+  }
+  if (heavyParcel) {
+    findings.push({
+      type: 'dim_weight_or_ltl_review',
+      severity: 'medium',
+      refund: 0,
+      recommendation: 'Cortex flagged this parcel for dim-weight or LTL consolidation review.',
+      optimizedCarrier: 'Cortex LTL / consolidated parcel',
+      optimizedCost: money(row.cost * 0.76),
+      auditStatus: 'review',
+    });
+  }
+  if (missingEvidence) {
+    findings.push({
+      type: 'missing_carrier_evidence',
+      severity: 'low',
+      refund: 0,
+      recommendation: 'Upload delivered/promised dates and label cost to raise claim confidence.',
+      optimizedCost: row.cost || 0,
+      auditStatus: 'needs_evidence',
+    });
+  }
+  if (!findings.length) {
+    findings.push({
+      type: 'on_time_benchmark',
+      severity: 'low',
+      refund: 0,
+      recommendation: 'No refund issue found. Keep this label as a benchmark for carrier/service performance.',
+      optimizedCarrier: row.carrier,
+      optimizedCost: row.cost,
+      auditStatus: 'no_claim',
+    });
+  }
+  return findings.map((finding) => ({
+    id: randomUUID(),
+    carrier: row.carrier,
+    trackingNumber: row.trackingNumber,
+    findingType: finding.type,
+    severity: finding.severity,
+    refundAmount: finding.refund,
+    status: finding.auditStatus === 'claim_ready' ? 'open' : 'reviewed',
+    recommendation: finding.recommendation,
+    evidence: {
+      runId,
+      source: 'csv_upload',
+      order: row.order,
+      service: row.service,
+      shipped: row.shipped,
+      delivered: row.delivered,
+      promised: row.promised,
+      cost: row.cost,
+      zone: row.zone,
+      weight: row.weight,
+      dim: row.dim,
+      state: row.state,
+      zip: row.zip,
+      daysInTransit,
+      optimizedCarrier: finding.optimizedCarrier,
+      optimizedCost: finding.optimizedCost,
+      auditStatus: finding.auditStatus,
+      raw: row.raw,
+    },
+  }));
+}
+
 export async function getLabelAudit(userId: string): Promise<{ findings: LabelAuditFinding[]; summary: Record<string, number> }> {
   const stored = await rows(
     'SELECT * FROM oms_label_audit_findings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100',
@@ -1275,6 +1691,20 @@ export async function getLabelAudit(userId: string): Promise<{ findings: LabelAu
         refundAmount: money(row.refund_amount),
         status: row.status,
         recommendation: row.evidence?.recommendation || 'Review carrier evidence and file claim when confidence is sufficient.',
+        source: row.evidence?.source,
+        runId: row.evidence?.runId,
+        order: row.evidence?.order,
+        service: row.evidence?.service,
+        cost: money(row.evidence?.cost),
+        optimizedCarrier: row.evidence?.optimizedCarrier,
+        optimizedCost: row.evidence?.optimizedCost == null ? undefined : money(row.evidence?.optimizedCost),
+        shipped: row.evidence?.shipped,
+        delivered: row.evidence?.delivered,
+        promised: row.evidence?.promised,
+        zone: row.evidence?.zone == null ? undefined : number(row.evidence?.zone),
+        weight: row.evidence?.weight,
+        dim: row.evidence?.dim,
+        auditStatus: row.evidence?.auditStatus || row.status,
       }));
   return {
     findings,
@@ -1283,6 +1713,152 @@ export async function getLabelAudit(userId: string): Promise<{ findings: LabelAu
       estimatedRefunds: money(findings.reduce((sum, f) => sum + f.refundAmount, 0)),
       optimizedServiceSavings: money(findings.length * 14.25),
     },
+  };
+}
+
+export async function createLabelAuditRun(userId: string, body: any) {
+  const rowsInput: Row[] = Array.isArray(body?.rows) ? body.rows : [];
+  const filename = String(body?.filename || 'label-audit.csv').slice(0, 240);
+  if (!rowsInput.length) {
+    const err: any = new Error('CSV must include at least one row.');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (rowsInput.length > 5000) {
+    const err: any = new Error('CSV upload is limited to 5,000 rows per run.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const normalized: Array<ReturnType<typeof normalizeLabelCsvRow>> = rowsInput.map((row: Row, index: number) => normalizeLabelCsvRow(row, index));
+  const errors = normalized.flatMap((row) => row.errors);
+  if (errors.length) {
+    const err: any = new Error(errors.slice(0, 8).join(' '));
+    err.statusCode = 400;
+    err.details = { errors };
+    throw err;
+  }
+  const runId = randomUUID();
+  const generated = normalized.flatMap((row) => labelFindingsForRow(row, runId));
+  const estimatedRefunds = money(generated.reduce((sum, finding) => sum + finding.refundAmount, 0));
+  const optimizedServiceSavings = money(
+    generated.reduce((sum, finding) => sum + Math.max(0, number(finding.evidence.cost) - number(finding.evidence.optimizedCost)), 0),
+  );
+  const missingEvidenceCount = generated.filter((finding) => finding.findingType === 'missing_carrier_evidence').length;
+  const run = await one(
+    `INSERT INTO oms_label_audit_runs
+      (id, user_id, filename, status, row_count, findings_count, estimated_refunds, optimized_service_savings, missing_evidence_count, input_summary, result_summary)
+     VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb)
+     RETURNING *`,
+    [
+      runId,
+      userId,
+      filename,
+      normalized.length,
+      generated.length,
+      estimatedRefunds,
+      optimizedServiceSavings,
+      missingEvidenceCount,
+      JSON.stringify({ filename, acceptedColumns: Object.keys(rowsInput[0] || {}) }),
+      JSON.stringify({
+        cortexTool: 'shipment_label_audit_simulation',
+        refunds: estimatedRefunds,
+        optimizedServiceSavings,
+        missingEvidenceCount,
+      }),
+    ],
+  );
+  for (const finding of generated) {
+    await pgQuery(
+      `INSERT INTO oms_label_audit_findings
+        (id, user_id, carrier, tracking_number, finding_type, severity, refund_amount, evidence, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
+      [
+        finding.id,
+        userId,
+        finding.carrier,
+        finding.trackingNumber || null,
+        finding.findingType,
+        finding.severity,
+        finding.refundAmount,
+        JSON.stringify({ ...finding.evidence, recommendation: finding.recommendation }),
+        finding.status,
+      ],
+    );
+  }
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'carrier_audit',
+    entityId: runId,
+    eventType: 'label_audit_csv_uploaded',
+    sourceSystem: 'cortex',
+    summary: `Carrier Label Audit CSV run completed for ${filename}: ${generated.length} findings from ${normalized.length} rows.`,
+    payload: { runId, filename, rowCount: normalized.length, findingsCount: generated.length, estimatedRefunds, optimizedServiceSavings },
+    confidence: missingEvidenceCount ? 0.66 : 0.84,
+  });
+  return {
+    run: mapLabelRun(run),
+    findings: generated.map((finding) => ({
+      id: finding.id,
+      carrier: finding.carrier,
+      trackingNumber: finding.trackingNumber,
+      findingType: finding.findingType,
+      severity: finding.severity,
+      refundAmount: finding.refundAmount,
+      status: finding.status,
+      recommendation: finding.recommendation,
+      source: finding.evidence.source,
+      runId: finding.evidence.runId,
+      order: finding.evidence.order,
+      service: finding.evidence.service,
+      cost: finding.evidence.cost,
+      optimizedCarrier: finding.evidence.optimizedCarrier,
+      optimizedCost: finding.evidence.optimizedCost,
+      shipped: finding.evidence.shipped,
+      delivered: finding.evidence.delivered,
+      promised: finding.evidence.promised,
+      zone: finding.evidence.zone,
+      weight: finding.evidence.weight,
+      dim: finding.evidence.dim,
+      auditStatus: finding.evidence.auditStatus,
+    })),
+  };
+}
+
+export async function getLabelAuditRuns(userId: string) {
+  const data = await rows('SELECT * FROM oms_label_audit_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId]);
+  return { runs: data.map(mapLabelRun).filter(Boolean) };
+}
+
+export async function getLabelAuditRun(userId: string, runId: string) {
+  const run = await one('SELECT * FROM oms_label_audit_runs WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, runId]);
+  if (!run) return null;
+  const findings = await rows('SELECT * FROM oms_label_audit_findings WHERE user_id = $1 AND evidence->>\'runId\' = $2 ORDER BY created_at DESC', [userId, runId]);
+  return {
+    run: mapLabelRun(run),
+    findings: findings.map((row) => ({
+      id: row.id,
+      carrier: row.carrier,
+      trackingNumber: row.tracking_number,
+      findingType: row.finding_type,
+      severity: row.severity,
+      refundAmount: money(row.refund_amount),
+      status: row.status,
+      recommendation: row.evidence?.recommendation || 'Review carrier evidence and file claim when confidence is sufficient.',
+      source: row.evidence?.source,
+      runId: row.evidence?.runId,
+      order: row.evidence?.order,
+      service: row.evidence?.service,
+      cost: money(row.evidence?.cost),
+      optimizedCarrier: row.evidence?.optimizedCarrier,
+      optimizedCost: row.evidence?.optimizedCost == null ? undefined : money(row.evidence?.optimizedCost),
+      shipped: row.evidence?.shipped,
+      delivered: row.evidence?.delivered,
+      promised: row.evidence?.promised,
+      zone: row.evidence?.zone == null ? undefined : number(row.evidence?.zone),
+      weight: row.evidence?.weight,
+      dim: row.evidence?.dim,
+      auditStatus: row.evidence?.auditStatus || row.status,
+    })),
   };
 }
 
