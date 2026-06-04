@@ -2281,8 +2281,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const featureRow = await one('SELECT * FROM features WHERE id = $1 OR payload->>\'slug\' = $1 LIMIT 1', [target]);
     if (!featureRow) return reply.code(404).send({ error: 'Feature not found' });
     const payload = json(featureRow.payload, {}) || {};
-    if (payload.isCore || featureRow.id === 'app-studio') {
-      return reply.code(400).send({ error: 'Core features cannot be disabled' });
+    const systemFeatureIds = new Set(['app-studio', 'cortex-intelligence', 'carrier-rates', 'carrier-label-audit']);
+    if (payload.isCore || payload.isStandard || payload.systemManaged || featureRow.is_standard || systemFeatureIds.has(featureRow.id)) {
+      return reply.code(400).send({ error: 'Managed UnieConnect features can only be disabled by an admin' });
     }
     await pgQuery(
       `INSERT INTO user_features (user_id, feature_id, status)
