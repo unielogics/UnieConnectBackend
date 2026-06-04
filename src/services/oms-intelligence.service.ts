@@ -1550,6 +1550,44 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   };
 }
 
+export async function getCortexChatHealth(userId: string, screen = 'command') {
+  const context = await getAccountOmsContextBundle(userId, String(screen || 'command').slice(0, 80)).catch(() => null);
+  if (context?.readiness?.cortex?.configured === false) {
+    return {
+      ok: false,
+      status: 503,
+      health: {
+        available: false,
+        chatIntegrated: false,
+        status: 503,
+        reason: 'cortex_not_configured',
+      },
+    };
+  }
+  const cortex = await postCortex('/v1/orchestration/oms/chat', {
+    tenant_id: userId,
+    userId,
+    screen: String(screen || 'command').slice(0, 80),
+    message: 'health_check',
+    context: {
+      healthCheck: true,
+      readiness: context?.readiness || null,
+    },
+    response_contract: { health: 'boolean' },
+  }, { userId, idempotencyKey: `oms-cortex-chat-health-${userId}-${String(screen || 'command').slice(0, 40)}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex health check failed' } }));
+  const health = {
+    available: Boolean(cortex?.ok),
+    chatIntegrated: Boolean(cortex?.ok),
+    status: cortex?.status || 503,
+    reason: cortex?.ok
+      ? 'live_chat_available'
+      : cortex?.status === 404
+        ? 'cortex_chat_route_not_available'
+        : cortex?.data?.error || 'cortex_chat_unavailable',
+  };
+  return { ok: health.chatIntegrated, status: health.status, health };
+}
+
 export async function getCortexChatThreads(userId: string, query: any = {}) {
   await ensureCortexWorkspaceTables();
   const filters = ['user_id = $1'];

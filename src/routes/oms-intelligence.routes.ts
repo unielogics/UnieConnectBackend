@@ -19,6 +19,7 @@ import {
   completeCortexTask,
   createCortexChatMessage,
   dismissCortexTask,
+  getCortexChatHealth,
   getCortexChatThread,
   getCortexChatThreads,
   getCortexTasks,
@@ -138,6 +139,12 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
     } catch (err: any) {
       return reply.code(400).send({ error: err?.message || 'Cortex chat failed' });
     }
+  });
+
+  fastify.get('/oms/intelligence/cortex/health', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getCortexChatHealth(userId, String(req.query?.screen || 'command'));
   });
 
   fastify.get('/oms/intelligence/cortex/chat/threads', async (req: any, reply) => {
