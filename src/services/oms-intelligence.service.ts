@@ -1431,7 +1431,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   }
 
   return {
-    answer: `${lines.join('\n\n')}\n\nNote: live Cortex/NVIDIA NIM did not respond, so this answer was generated from this account's scoped OMS data only.`,
+    answer: lines.join('\n\n'),
     sources: [
       { source: 'oms_data_readiness', readinessScore: readiness.score, posture: readiness.posture },
       { source: 'oms_cortex_tasks', count: tasks.length },
@@ -1439,7 +1439,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
     ],
     tasks: [],
     confidence: readiness.score != null ? Math.max(0.35, Math.min(0.82, Number(readiness.score) / 100)) : 0.45,
-    readinessNotes: 'Live Cortex response unavailable; used scoped OMS fallback.',
+    readinessNotes: 'Live Cortex chat unavailable; using scoped OMS account data.',
   };
 }
 
@@ -1506,6 +1506,16 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback);
+  const cortexHealth = {
+    available: Boolean(cortex?.ok),
+    chatIntegrated: Boolean(cortex?.ok),
+    status: cortex?.status || 503,
+    reason: cortex?.ok
+      ? 'live_chat_available'
+      : cortex?.status === 404
+        ? 'cortex_chat_route_not_available'
+        : cortex?.data?.error || 'cortex_chat_unavailable',
+  };
   const saved = await one(
     `INSERT INTO oms_cortex_chat_messages
        (user_id, thread_id, role, content, sources, tasks, confidence, readiness_notes, cortex_status, cortex_response)
@@ -1519,7 +1529,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       JSON.stringify(normalized.tasks),
       normalized.confidence,
       normalized.readinessNotes,
-      cortex?.ok ? 'ok' : 'degraded',
+      cortexHealth.chatIntegrated ? 'ok' : 'degraded',
       JSON.stringify(cortex || {}),
     ],
   );
@@ -1530,13 +1540,13 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   await pgQuery(
     `INSERT INTO oms_copilot_events (user_id, screen, prompt, response)
      VALUES ($1, $2, $3, $4::jsonb)`,
-    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: cortex?.ok ? 'ok' : 'degraded' })],
+    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: cortexHealth.chatIntegrated ? 'ok' : 'degraded', cortexHealth })],
   ).catch(() => null);
   return {
     thread: mapCortexThread(thread),
     message: mapCortexMessage(saved),
     context: { screen, readiness: context.readiness, tasks: context.tasks.slice(0, 8), recommendations: context.recommendations.slice(0, 5) },
-    cortex: { ok: Boolean(cortex?.ok), status: cortex?.status || 503 },
+    cortex: { ok: cortexHealth.chatIntegrated, status: cortexHealth.status, health: cortexHealth },
   };
 }
 
