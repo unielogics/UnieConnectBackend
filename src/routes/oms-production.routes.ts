@@ -23,6 +23,7 @@ import {
   getOmsSuppliers,
   getWarehouseDetail,
   getWarehouseOverview,
+  updateOmsSkuEnrichment,
 } from '../services/oms-production.service';
 import { getKeepaSnapshot, peekKeepaSnapshot } from '../services/keepa';
 
@@ -77,6 +78,14 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const detail = await getOmsSkuDetail(userId, String(req.params?.skuId || ''));
+    if (!detail) return reply.code(404).send({ error: 'SKU not found' });
+    return detail;
+  });
+
+  fastify.patch('/oms/skus/:skuId/enrichment', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const detail = await updateOmsSkuEnrichment(userId, String(req.params?.skuId || ''), req.body || {});
     if (!detail) return reply.code(404).send({ error: 'SKU not found' });
     return detail;
   });

@@ -742,6 +742,127 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
   };
 }
 
+const cleanText = (value: unknown) => {
+  if (value === undefined) return undefined;
+  const text = String(value ?? '').trim();
+  return text || null;
+};
+
+const cleanNumber = (value: unknown) => {
+  if (value === undefined || value === null || value === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+export async function updateOmsSkuEnrichment(userId: string, skuOrId: string, input: any) {
+  const current = await one<Row>(
+    'SELECT * FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1',
+    [userId, skuOrId],
+  );
+  if (!current) return null;
+
+  const metadata = { ...json(current.metadata, {}) };
+  const attributes = { ...json(current.attributes, {}) };
+  const dimensions = { ...json(current.dimensions, {}) };
+
+  const setMeta = (key: string, value: unknown) => {
+    if (value !== undefined) metadata[key] = value;
+  };
+  const setAttr = (key: string, value: unknown) => {
+    if (value !== undefined) attributes[key] = value;
+  };
+
+  const title = cleanText(input.title);
+  const description = cleanText(input.description);
+  const subtitle = cleanText(input.subtitle);
+  const brand = cleanText(input.brand);
+  const size = cleanText(input.size);
+  const upc = cleanText(input.upc);
+  const ean = cleanText(input.ean);
+  const asinInput = cleanText(input.asin);
+  const asin = asinInput ? asinInput.toUpperCase() : asinInput;
+  const category = cleanText(input.category);
+  const subCategory = cleanText(input.subCategory);
+  const supplierId = cleanText(input.supplierId);
+  const marketplaceSource = cleanText(input.marketplaceSource);
+  const price = cleanNumber(input.price);
+  const weight = cleanNumber(input.weight);
+
+  setMeta('subtitle', subtitle);
+  setMeta('brand', brand);
+  setMeta('price', price);
+  setMeta('source', marketplaceSource);
+  setAttr('size', size);
+
+  if (input.dimensions && typeof input.dimensions === 'object') {
+    const length = cleanNumber(input.dimensions.length);
+    const width = cleanNumber(input.dimensions.width);
+    const height = cleanNumber(input.dimensions.height);
+    if (length !== undefined) dimensions.length = length;
+    if (width !== undefined) dimensions.width = width;
+    if (height !== undefined) dimensions.height = height;
+  }
+
+  const images = input.images === undefined
+    ? undefined
+    : Array.isArray(input.images)
+      ? input.images.map((url: unknown) => cleanText(url)).filter(Boolean)
+      : [];
+  if (images !== undefined) setMeta('images', images);
+
+  const updated = await one<Row>(
+    `UPDATE catalog_items
+     SET title = COALESCE($3, title),
+         description = $4,
+         metadata = $5::jsonb,
+         attributes = $6::jsonb,
+         supplier_id = $7,
+         images = COALESCE($8::jsonb, images),
+         image = CASE WHEN $8::jsonb IS NULL THEN image ELSE $9 END,
+         upc = $10,
+         ean = $11,
+         asin = $12,
+         category = $13,
+         sub_category = $14,
+         weight = $15,
+         dimensions = $16::jsonb,
+         updated_at = now()
+     WHERE id = $1 AND user_id = $2
+     RETURNING *`,
+    [
+      current.id,
+      userId,
+      title === undefined ? null : title,
+      description === undefined ? current.description : description,
+      JSON.stringify(metadata),
+      JSON.stringify(attributes),
+      supplierId === undefined ? current.supplier_id : supplierId,
+      images === undefined ? null : JSON.stringify(images),
+      images?.[0] || null,
+      upc === undefined ? current.upc : upc,
+      ean === undefined ? current.ean : ean,
+      asin === undefined ? current.asin : asin,
+      category === undefined ? current.category : category,
+      subCategory === undefined ? current.sub_category : subCategory,
+      weight === undefined ? current.weight : weight,
+      JSON.stringify(dimensions),
+    ],
+  );
+
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'sku',
+    entityId: current.id,
+    eventType: 'sku_enrichment_updated',
+    sourceSystem: 'oms',
+    summary: `SKU enrichment updated for ${current.sku}.`,
+    payload: { sku: current.sku, fields: Object.keys(input || {}) },
+    confidence: null,
+  });
+
+  return getOmsSkuDetail(userId, updated?.id || current.id);
+}
+
 export async function getOmsOrders(userId: string, filter: MarketplaceFilter = {}) {
   const values: unknown[] = [userId];
   const where = ['o.user_id = $1'];
