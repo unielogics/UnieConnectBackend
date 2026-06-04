@@ -423,18 +423,33 @@ export async function createProductResearchRun(userId: string, input: any) {
 
   const rec = await createRecommendation(userId, {
     runId: run?.id || null,
-    recommendationType: 'product_research',
+    recommendationType: result.missingData.length ? 'data_readiness' : 'product_research',
     entityType: 'sku',
     entityId: item?.id || input?.itemId || result.sku,
     title: result.missingData.length
       ? `${result.sku}: enrichment baseline incomplete`
       : `${result.sku}: ${result.productRisk === 'strong_candidate' ? 'strong optimization candidate' : 'product intelligence ready'}`,
     summary: result.recommendedAction,
-    currentValue: { dataCompleteness: Math.max(0, 100 - result.missingData.length * 20), marketplaceReadiness: result.marketplaceReadiness },
-    optimizedValue: { opportunityScore: result.opportunityScore, warehouseFit: result.fulfillment.warehouseFit },
-    estimatedImpact: { confidence, palletUnits: result.fulfillment.estimatedUnitsPerPallet },
+    currentValue: {
+      dataCompleteness: Math.max(0, 100 - result.missingData.length * 20),
+      marketplaceReadiness: result.marketplaceReadiness,
+      missingFields: result.missingData.map((m) => m.replace(/_/g, ' ')),
+    },
+    optimizedValue: result.missingData.length
+      ? {
+          action: 'Complete the missing baseline fields before Cortex creates an optimization decision.',
+          requiredFields: result.missingData.map((m) => m.replace(/_/g, ' ')),
+        }
+      : {
+          action: 'Use this SKU in Optimize Suite when reviewing inventory placement and replenishment.',
+          opportunityScore: result.opportunityScore,
+          warehouseFit: result.fulfillment.warehouseFit,
+        },
+    estimatedImpact: result.missingData.length
+      ? { confidenceGain: Math.max(0, 90 - Math.round(confidence * 100)), confidence }
+      : { confidence, palletUnits: result.fulfillment.estimatedUnitsPerPallet },
     requiredAction: result.missingData.length ? 'complete_missing_product_data' : 'feed_optimize_suite',
-    approvalState: result.missingData.length ? 'blocked' : 'waiting_approval',
+    approvalState: result.missingData.length ? 'blocked' : 'not_required',
     wmsTruthState: readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only',
     confidence,
     sourceSummary: readiness,
@@ -961,7 +976,23 @@ export async function getRecommendations(userId: string, query: any = {}) {
      LIMIT $${values.length}`,
     values,
   );
-  return { recommendations: data.map(mapRecommendation).filter(Boolean) };
+  const seen = new Set<string>();
+  const recommendations = data
+    .map(mapRecommendation)
+    .filter(Boolean)
+    .filter((rec: any) => {
+      const key = [
+        rec.recommendationType || '',
+        rec.entityType || '',
+        rec.entityId || '',
+        String(rec.title || '').toLowerCase(),
+        rec.status || '',
+      ].join('|');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  return { recommendations };
 }
 
 function closedLoopNumber(...values: any[]): number | null {
