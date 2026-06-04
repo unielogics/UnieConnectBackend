@@ -1425,7 +1425,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       lines.push('I do not see a concrete current-vs-optimized decision yet. Finish the readiness blockers first so Cortex can produce traceable financial or inventory impact.');
     }
   } else {
-    lines.push(`I can answer from this account's OMS data while Cortex is degraded. Current readiness is ${readiness.score || 0}% with posture ${readiness.posture || 'unknown'}.`);
+    lines.push(`I can answer from this account's OMS data. Current readiness is ${readiness.score || 0}% with posture ${readiness.posture || 'unknown'}.`);
     if (tasks[0]) lines.push(`The next useful action is: ${tasks[0].title}`);
     if (recommendations[0]) lines.push(`The latest Cortex signal is: ${recommendations[0].title}`);
   }
