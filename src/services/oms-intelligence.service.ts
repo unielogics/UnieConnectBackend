@@ -1518,8 +1518,8 @@ function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof bu
   return {
     answer: scrubVendorLanguage(String(answer || fallback.answer)),
     sources: Array.isArray(sources) && sources.length ? sources : fallback.sources,
-    tasks: Array.isArray(tasks) ? tasks : [],
-    confidence,
+    tasks: Array.isArray(tasks) && tasks.length ? tasks : fallback.tasks,
+    confidence: confidence ?? fallback.confidence,
     readinessNotes: readinessNotes ? scrubVendorLanguage(String(readinessNotes)) : readinessNotes,
   };
 }
