@@ -1387,14 +1387,71 @@ async function getAccountOmsContextBundle(userId: string, screen: string) {
   };
 }
 
-function normalizeCortexChatResponse(cortex: any, fallback: string) {
+function buildLocalCortexChatFallback(message: string, context: any): {
+  answer: string;
+  sources: any[];
+  tasks: any[];
+  confidence: number;
+  readinessNotes: string;
+} {
+  const q = String(message || '').toLowerCase();
+  const readiness = context?.readiness || {};
+  const counts = readiness.counts || {};
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const recommendations = Array.isArray(context?.recommendations) ? context.recommendations : [];
+  const highTasks = tasks.filter((task: any) => String(task?.priority || '').toLowerCase() === 'high');
+  const missingSkuTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('missing dimensions') || String(task?.title || '').toLowerCase().includes('missing cost'));
+  const wmsTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('wms'));
+  const topRecommendation = recommendations[0];
+  const lines: string[] = [];
+
+  if (q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next')) {
+    lines.push(`Your account is ${readiness.posture || 'not fully ready'} at ${readiness.score || 0}% Cortex readiness.`);
+    if (wmsTask) lines.push('First, connect WMS or warehouse truth so Cortex can move from forecast-only suggestions into executable inventory and shipment actions.');
+    if (missingSkuTask) lines.push('Second, complete SKU enrichment for missing cost, dimensions, and weight. That unlocks margin, pallet, FBA/FBM, and warehouse-fit intelligence.');
+    if (counts.marketplaceConnections > 0) lines.push('Your marketplace feed is connected, so the next lift is operational data quality rather than another store connection.');
+    if (topRecommendation) lines.push(`Then review the top Cortex signal: ${topRecommendation.title}.`);
+    if (!lines.length) lines.push('Start by connecting a marketplace or uploading product/order CSV data, then complete SKU weight, dimensions, cost, and selling price.');
+  } else if (q.includes('blocking') || q.includes('confidence') || q.includes('missing')) {
+    lines.push(`The biggest readiness blockers are the ${highTasks.length || tasks.length} open high-priority items in this account.`);
+    tasks.slice(0, 3).forEach((task: any, idx: number) => lines.push(`${idx + 1}. ${task.title}`));
+    lines.push('Completing those fields raises Cortex confidence because recommendations become traceable to real inventory, cost, demand, and warehouse data.');
+  } else if (q.includes('opportunity') || q.includes('optimized') || q.includes('optimization')) {
+    if (topRecommendation) {
+      lines.push(`The clearest current Cortex opportunity is: ${topRecommendation.title}.`);
+      if (topRecommendation.summary) lines.push(topRecommendation.summary);
+      lines.push('Treat this as a decision only when it has a measurable inventory, cost, revenue, service, or fulfillment impact. Otherwise it should remain a readiness task.');
+    } else {
+      lines.push('I do not see a concrete current-vs-optimized decision yet. Finish the readiness blockers first so Cortex can produce traceable financial or inventory impact.');
+    }
+  } else {
+    lines.push(`I can answer from this account's OMS data while Cortex is degraded. Current readiness is ${readiness.score || 0}% with posture ${readiness.posture || 'unknown'}.`);
+    if (tasks[0]) lines.push(`The next useful action is: ${tasks[0].title}`);
+    if (recommendations[0]) lines.push(`The latest Cortex signal is: ${recommendations[0].title}`);
+  }
+
+  return {
+    answer: `${lines.join('\n\n')}\n\nNote: live Cortex/NVIDIA NIM did not respond, so this answer was generated from this account's scoped OMS data only.`,
+    sources: [
+      { source: 'oms_data_readiness', readinessScore: readiness.score, posture: readiness.posture },
+      { source: 'oms_cortex_tasks', count: tasks.length },
+      { source: 'oms_recommendations', count: recommendations.length },
+    ],
+    tasks: [],
+    confidence: readiness.score != null ? Math.max(0.35, Math.min(0.82, Number(readiness.score) / 100)) : 0.45,
+    readinessNotes: 'Live Cortex response unavailable; used scoped OMS fallback.',
+  };
+}
+
+function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof buildLocalCortexChatFallback>) {
   const data = cortex?.data || {};
-  const answer = data.answer || data.text || data.message || data.response?.answer || data.result?.answer || data.result?.text || fallback;
+  if (!cortex?.ok) return fallback;
+  const answer = data.answer || data.text || data.message || data.response?.answer || data.result?.answer || data.result?.text || fallback.answer;
   const sources = data.sources || data.citations || data.response?.sources || data.result?.sources || [];
   const tasks = data.suggested_actions || data.suggestedActions || data.tasks || data.response?.tasks || [];
   const confidence = closedLoopNumber(data.confidence, data.response?.confidence, data.result?.confidence);
   const readinessNotes = data.readiness_notes || data.readinessNotes || data.blocked_reason || data.missing_data || null;
-  return { answer: String(answer || fallback), sources: Array.isArray(sources) ? sources : [], tasks: Array.isArray(tasks) ? tasks : [], confidence, readinessNotes };
+  return { answer: String(answer || fallback.answer), sources: Array.isArray(sources) ? sources : fallback.sources, tasks: Array.isArray(tasks) ? tasks : [], confidence, readinessNotes };
 }
 
 export async function createCortexChatMessage(userId: string, body: any = {}) {
@@ -1423,8 +1480,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
 
   const context = await getAccountOmsContextBundle(userId, screen);
   const fallback = context.readiness?.cortex?.configured === false
-    ? 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.'
-    : 'Cortex could not produce a live response right now. I can only show account-scoped readiness, tasks, and recommendations until Cortex is reachable.';
+    ? {
+        answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
+        sources: [{ source: 'cortex_configuration', configured: false }],
+        tasks: [],
+        confidence: 0.35,
+        readinessNotes: 'Cortex is not configured for this account.',
+      }
+    : buildLocalCortexChatFallback(message, context);
   const cortex = await postCortex('/v1/orchestration/oms/chat', {
     tenant_id: userId,
     userId,
