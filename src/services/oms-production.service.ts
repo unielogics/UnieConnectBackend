@@ -447,7 +447,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
     autonomousActivity: [
       { system: 'OMS', action: 'Demand forecast refreshed', status: 'complete', confidence: 0.91, at: new Date().toISOString() },
       { system: 'WMS', action: 'Inventory truth projection checked', status: counts.facilities ? 'complete' : 'pending_connection', confidence: counts.facilities ? 0.86 : 0.42, at: new Date().toISOString() },
-      { system: 'Cortex', action: 'Dispatch orchestration readiness scored', status: cortexConfigStatus().configured ? 'ready' : 'degraded', confidence: cortexConfigStatus().configured ? 0.89 : 0.35, at: new Date().toISOString() },
+      { system: 'Cortex', action: 'Dispatch orchestration readiness scored', status: cortexConfigStatus().configured ? 'ready' : 'limited', confidence: cortexConfigStatus().configured ? 0.89 : 0.35, at: new Date().toISOString() },
     ],
     counts,
   };
