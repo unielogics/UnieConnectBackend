@@ -29,6 +29,8 @@ const SELLER_OPTIMIZATION_RECOMMENDATION_TYPES = [
   'data_readiness',
 ];
 
+const CORTEX_TASK_STATUS = new Set(['open', 'done', 'dismissed']);
+
 async function rows<T extends Row = Row>(sql: string, values: unknown[] = []): Promise<T[]> {
   const res = await pgQuery<T>(sql, values);
   return res?.rows || [];
@@ -45,6 +47,64 @@ async function tableExists(tableName: string) {
     [tableName],
   ).catch(() => null);
   return Boolean(found?.exists);
+}
+
+async function ensureCortexWorkspaceTables() {
+  await pgQuery(`
+    CREATE TABLE IF NOT EXISTS oms_cortex_chat_threads (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      screen TEXT NOT NULL DEFAULT 'command',
+      entity_type TEXT,
+      entity_id TEXT,
+      title TEXT NOT NULL DEFAULT 'Cortex chat',
+      status TEXT NOT NULL DEFAULT 'active',
+      last_message_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS oms_cortex_chat_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      thread_id UUID NOT NULL REFERENCES oms_cortex_chat_threads(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+      content TEXT NOT NULL DEFAULT '',
+      sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+      tasks JSONB NOT NULL DEFAULT '[]'::jsonb,
+      confidence NUMERIC,
+      readiness_notes TEXT,
+      cortex_status TEXT,
+      cortex_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS oms_cortex_tasks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      dedupe_key TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'readiness',
+      screen TEXT NOT NULL DEFAULT 'command',
+      entity_type TEXT,
+      entity_id TEXT,
+      title TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '',
+      priority TEXT NOT NULL DEFAULT 'normal',
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done','dismissed')),
+      action_label TEXT,
+      action_target TEXT,
+      evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+      recommendation_id UUID REFERENCES oms_recommendations(id) ON DELETE SET NULL,
+      completed_at TIMESTAMPTZ,
+      dismissed_at TIMESTAMPTZ,
+      auto_completed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(user_id, dedupe_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_oms_cortex_threads_user_screen ON oms_cortex_chat_threads(user_id, screen, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oms_cortex_messages_thread_created ON oms_cortex_chat_messages(thread_id, created_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_oms_cortex_tasks_user_status ON oms_cortex_tasks(user_id, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oms_cortex_tasks_user_screen ON oms_cortex_tasks(user_id, screen, status);
+  `).catch(() => null);
 }
 
 async function writeRunEvent(userId: string, runId: string | null | undefined, eventType: string, summary: string, payload: any = {}) {
@@ -1084,6 +1144,333 @@ export async function getScreenIntelligenceContext(userId: string, screen: strin
   };
 }
 
+function taskTargetFromText(text: string) {
+  const value = text.toLowerCase();
+  if (value.includes('supplier')) return { screen: 'suppliers', entityType: 'supplier', actionLabel: 'Open suppliers' };
+  if (value.includes('wms') || value.includes('warehouse')) return { screen: 'warehouses', entityType: 'warehouse', actionLabel: 'Open warehouses' };
+  if (value.includes('dimension') || value.includes('weight') || value.includes('cost') || value.includes('sku')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Open SKUs' };
+  if (value.includes('amazon')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Open listings' };
+  if (value.includes('csv')) return { screen: 'product-research', entityType: 'csv', actionLabel: 'Upload CSV' };
+  if (value.includes('marketplace') || value.includes('connect')) return { screen: 'connections', entityType: 'connection', actionLabel: 'Open connections' };
+  return { screen: 'command', entityType: 'account', actionLabel: 'Open Command Center' };
+}
+
+function priorityForTask(text: string, score?: number) {
+  const value = text.toLowerCase();
+  if (value.includes('connect') || value.includes('missing') || value.includes('blocked') || (score != null && score < 50)) return 'high';
+  if (value.includes('cleanup') || value.includes('need')) return 'normal';
+  return 'low';
+}
+
+function taskDedupeSlug(text: string) {
+  return String(text || 'task')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120) || 'task';
+}
+
+async function upsertCortexTask(userId: string, task: any) {
+  await ensureCortexWorkspaceTables();
+  const row = await one(
+    `INSERT INTO oms_cortex_tasks
+      (user_id, dedupe_key, source, screen, entity_type, entity_id, title, detail, priority, action_label, action_target, evidence, recommendation_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
+     ON CONFLICT (user_id, dedupe_key) DO UPDATE SET
+       source = EXCLUDED.source,
+       screen = EXCLUDED.screen,
+       entity_type = EXCLUDED.entity_type,
+       entity_id = EXCLUDED.entity_id,
+       title = EXCLUDED.title,
+       detail = EXCLUDED.detail,
+       priority = EXCLUDED.priority,
+       action_label = EXCLUDED.action_label,
+       action_target = EXCLUDED.action_target,
+       evidence = EXCLUDED.evidence,
+       recommendation_id = EXCLUDED.recommendation_id,
+       updated_at = now()
+     WHERE oms_cortex_tasks.status = 'open'
+     RETURNING *`,
+    [
+      userId,
+      task.dedupeKey,
+      task.source || 'readiness',
+      task.screen || 'command',
+      task.entityType || null,
+      task.entityId || null,
+      task.title,
+      task.detail || '',
+      task.priority || 'normal',
+      task.actionLabel || null,
+      task.actionTarget || task.screen || null,
+      JSON.stringify(task.evidence || {}),
+      task.recommendationId || null,
+    ],
+  ).catch(() => null);
+  return row ? mapCortexTask(row) : null;
+}
+
+export async function refreshCortexTasks(userId: string) {
+  await ensureCortexWorkspaceTables();
+  const [readiness, recs] = await Promise.all([
+    getDataReadiness(userId),
+    getRecommendations(userId, { status: 'open', limit: 100 }),
+  ]);
+  const activeKeys = new Set<string>();
+
+  for (const blocker of (readiness.blockers || []).filter(Boolean) as string[]) {
+    const target = taskTargetFromText(blocker);
+    const dedupeKey = `readiness:${taskDedupeSlug(blocker)}`;
+    activeKeys.add(dedupeKey);
+    await upsertCortexTask(userId, {
+      dedupeKey,
+      source: 'readiness',
+      screen: target.screen,
+      entityType: target.entityType,
+      title: blocker,
+      detail: `Resolve this readiness blocker to improve Cortex confidence from ${readiness.score}%.`,
+      priority: priorityForTask(blocker, readiness.score),
+      actionLabel: target.actionLabel,
+      actionTarget: target.screen,
+      evidence: { readinessScore: readiness.score, posture: readiness.posture, counts: readiness.counts },
+    });
+  }
+
+  for (const rec of (recs.recommendations || []).filter(Boolean) as any[]) {
+    const dedupeKey = `recommendation:${rec.id}`;
+    activeKeys.add(dedupeKey);
+    const recScreen =
+      rec.entityType === 'sku' ? 'skus' :
+      rec.entityType === 'supplier' ? 'suppliers' :
+      rec.entityType === 'order' ? 'orders' :
+      rec.entityType === 'shipment_plan' ? 'shipments' :
+      rec.entityType === 'carrier_audit' || rec.recommendationType === 'carrier_audit' ? 'labels' :
+      rec.entityType === 'billing' || rec.recommendationType === 'billing_profit' ? 'billing' :
+      rec.entityType === 'business_double' || rec.recommendationType === 'business_double' ? 'double' :
+      'command';
+    await upsertCortexTask(userId, {
+      dedupeKey,
+      source: 'recommendation',
+      screen: recScreen,
+      entityType: rec.entityType || rec.recommendationType,
+      entityId: rec.entityId || rec.id,
+      title: rec.title,
+      detail: rec.summary,
+      priority: Number(rec.confidence || 0) >= 0.8 ? 'normal' : 'low',
+      actionLabel: 'Review decision',
+      actionTarget: recScreen,
+      recommendationId: rec.id,
+      evidence: { currentValue: rec.currentValue, optimizedValue: rec.optimizedValue, estimatedImpact: rec.estimatedImpact, confidence: rec.confidence },
+    });
+  }
+
+  await pgQuery(
+    `UPDATE oms_cortex_tasks
+     SET status = 'done', completed_at = COALESCE(completed_at, now()), auto_completed_at = COALESCE(auto_completed_at, now()), updated_at = now()
+     WHERE user_id = $1 AND status = 'open' AND dedupe_key LIKE ANY($2::text[]) AND NOT (dedupe_key = ANY($3::text[]))`,
+    [userId, ['readiness:%', 'recommendation:%'], Array.from(activeKeys)],
+  ).catch(() => null);
+
+  const tasks = await rows(
+    `SELECT * FROM oms_cortex_tasks WHERE user_id = $1 ORDER BY
+       CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+       updated_at DESC LIMIT 200`,
+    [userId],
+  );
+  return { tasks: tasks.map(mapCortexTask), readiness };
+}
+
+export async function getCortexTasks(userId: string, query: any = {}) {
+  await ensureCortexWorkspaceTables();
+  if (query.refresh === 'true' || query.refresh === true) await refreshCortexTasks(userId);
+  const filters = ['user_id = $1'];
+  const values: any[] = [userId];
+  const status = String(query.status || 'open');
+  if (CORTEX_TASK_STATUS.has(status)) {
+    values.push(status);
+    filters.push(`status = $${values.length}`);
+  }
+  if (query.screen) {
+    values.push(String(query.screen));
+    filters.push(`screen = $${values.length}`);
+  }
+  values.push(Math.min(200, Math.max(1, number(query.limit, 100))));
+  const tasks = await rows(
+    `SELECT * FROM oms_cortex_tasks WHERE ${filters.join(' AND ')}
+     ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC
+     LIMIT $${values.length}`,
+    values,
+  );
+  return { tasks: tasks.map(mapCortexTask) };
+}
+
+export async function completeCortexTask(userId: string, taskId: string) {
+  await ensureCortexWorkspaceTables();
+  const row = await one(
+    `UPDATE oms_cortex_tasks
+     SET status = 'done', completed_at = COALESCE(completed_at, now()), updated_at = now()
+     WHERE user_id = $1 AND id = $2 RETURNING *`,
+    [userId, taskId],
+  );
+  return row ? mapCortexTask(row) : null;
+}
+
+export async function dismissCortexTask(userId: string, taskId: string) {
+  await ensureCortexWorkspaceTables();
+  const row = await one(
+    `UPDATE oms_cortex_tasks
+     SET status = 'dismissed', dismissed_at = COALESCE(dismissed_at, now()), updated_at = now()
+     WHERE user_id = $1 AND id = $2 RETURNING *`,
+    [userId, taskId],
+  );
+  return row ? mapCortexTask(row) : null;
+}
+
+async function getAccountOmsContextBundle(userId: string, screen: string) {
+  const [readiness, recommendations, tasksRes, ledger, skus, orders, warehouses, suppliers, labelRuns] = await Promise.all([
+    getDataReadiness(userId),
+    getRecommendations(userId, { screen, status: 'open', limit: 10 }),
+    getCortexTasks(userId, { status: 'open', limit: 20 }),
+    rows(`SELECT entity_type, entity_id, event_type, source_system, summary, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]).catch(() => []),
+    rows(`SELECT id, sku, title, weight, dimensions, attributes, metadata, wms_inventory FROM catalog_items WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(`SELECT id, order_number, channel, status, total, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(`SELECT warehouse_code, status, facility_id, metadata, connected_at FROM oms_warehouse_links WHERE user_id = $1 ORDER BY connected_at DESC NULLS LAST LIMIT 25`, [userId]).catch(() => []),
+    rows(`SELECT id, name, status, email, metadata, updated_at FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(`SELECT id, filename, status, row_count, findings_count, estimated_refunds, optimized_service_savings, created_at FROM oms_label_audit_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10`, [userId]).catch(() => []),
+  ]);
+  return {
+    tenant: { userId, accountScope: 'authenticated_oms_account' },
+    screen,
+    generatedAt: new Date().toISOString(),
+    readiness,
+    recommendations: recommendations.recommendations,
+    tasks: tasksRes.tasks,
+    ledger,
+    samples: {
+      skus: skus.map((r) => ({ id: r.id, sku: r.sku, title: r.title, weight: r.weight, dimensions: json(r.dimensions, {}), source: r.metadata?.source || r.metadata?.importSource || null })),
+      orders: orders.map((r) => ({ id: r.id, orderNumber: r.order_number, channel: r.channel, status: r.status, total: money(r.total), state: r.shipping_address?.state || r.shipping_address?.province || null })),
+      warehouses,
+      suppliers,
+      labelAuditRuns: labelRuns,
+    },
+  };
+}
+
+function normalizeCortexChatResponse(cortex: any, fallback: string) {
+  const data = cortex?.data || {};
+  const answer = data.answer || data.text || data.message || data.response?.answer || data.result?.answer || data.result?.text || fallback;
+  const sources = data.sources || data.citations || data.response?.sources || data.result?.sources || [];
+  const tasks = data.suggested_actions || data.suggestedActions || data.tasks || data.response?.tasks || [];
+  const confidence = closedLoopNumber(data.confidence, data.response?.confidence, data.result?.confidence);
+  const readinessNotes = data.readiness_notes || data.readinessNotes || data.blocked_reason || data.missing_data || null;
+  return { answer: String(answer || fallback), sources: Array.isArray(sources) ? sources : [], tasks: Array.isArray(tasks) ? tasks : [], confidence, readinessNotes };
+}
+
+export async function createCortexChatMessage(userId: string, body: any = {}) {
+  await ensureCortexWorkspaceTables();
+  const screen = String(body.screen || 'command').slice(0, 80);
+  const message = String(body.message || '').trim();
+  if (!message) throw new Error('Message is required');
+  const entityType = body.entityType ? String(body.entityType).slice(0, 80) : null;
+  const entityId = body.entityId ? String(body.entityId).slice(0, 160) : null;
+  let thread = body.threadId
+    ? await one('SELECT * FROM oms_cortex_chat_threads WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, String(body.threadId)]).catch(() => null)
+    : null;
+  if (!thread) {
+    thread = await one(
+      `INSERT INTO oms_cortex_chat_threads (user_id, screen, entity_type, entity_id, title, last_message_at)
+       VALUES ($1, $2, $3, $4, $5, now()) RETURNING *`,
+      [userId, screen, entityType, entityId, message.slice(0, 64) || 'Cortex chat'],
+    );
+  }
+
+  await pgQuery(
+    `INSERT INTO oms_cortex_chat_messages (user_id, thread_id, role, content)
+     VALUES ($1, $2, 'user', $3)`,
+    [userId, thread?.id, message],
+  );
+
+  const context = await getAccountOmsContextBundle(userId, screen);
+  const fallback = context.readiness?.cortex?.configured === false
+    ? 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.'
+    : 'Cortex could not produce a live response right now. I can only show account-scoped readiness, tasks, and recommendations until Cortex is reachable.';
+  const cortex = await postCortex('/v1/orchestration/oms/chat', {
+    tenant_id: userId,
+    userId,
+    screen,
+    entity_type: entityType,
+    entity_id: entityId,
+    thread_id: thread?.id,
+    message,
+    context,
+    response_contract: {
+      answer: 'string',
+      sources: 'array of cited OMS source objects when possible',
+      suggested_actions: 'array of proposed user actions or tasks',
+      confidence: 'number 0-1',
+      readiness_notes: 'blocked or missing data notes',
+    },
+  }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+  const normalized = normalizeCortexChatResponse(cortex, fallback);
+  const saved = await one(
+    `INSERT INTO oms_cortex_chat_messages
+       (user_id, thread_id, role, content, sources, tasks, confidence, readiness_notes, cortex_status, cortex_response)
+     VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9::jsonb)
+     RETURNING *`,
+    [
+      userId,
+      thread?.id,
+      normalized.answer,
+      JSON.stringify(normalized.sources),
+      JSON.stringify(normalized.tasks),
+      normalized.confidence,
+      normalized.readinessNotes,
+      cortex?.ok ? 'ok' : 'degraded',
+      JSON.stringify(cortex || {}),
+    ],
+  );
+  await pgQuery(
+    `UPDATE oms_cortex_chat_threads SET last_message_at = now(), updated_at = now() WHERE user_id = $1 AND id = $2`,
+    [userId, thread?.id],
+  ).catch(() => null);
+  await pgQuery(
+    `INSERT INTO oms_copilot_events (user_id, screen, prompt, response)
+     VALUES ($1, $2, $3, $4::jsonb)`,
+    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: cortex?.ok ? 'ok' : 'degraded' })],
+  ).catch(() => null);
+  return {
+    thread: mapCortexThread(thread),
+    message: mapCortexMessage(saved),
+    context: { screen, readiness: context.readiness, tasks: context.tasks.slice(0, 8), recommendations: context.recommendations.slice(0, 5) },
+    cortex: { ok: Boolean(cortex?.ok), status: cortex?.status || 503 },
+  };
+}
+
+export async function getCortexChatThreads(userId: string, query: any = {}) {
+  await ensureCortexWorkspaceTables();
+  const filters = ['user_id = $1'];
+  const values: any[] = [userId];
+  if (query.screen) {
+    values.push(String(query.screen));
+    filters.push(`screen = $${values.length}`);
+  }
+  values.push(Math.min(50, Math.max(1, number(query.limit, 20))));
+  const data = await rows(
+    `SELECT * FROM oms_cortex_chat_threads WHERE ${filters.join(' AND ')}
+     ORDER BY COALESCE(last_message_at, updated_at, created_at) DESC LIMIT $${values.length}`,
+    values,
+  );
+  return { threads: data.map(mapCortexThread) };
+}
+
+export async function getCortexChatThread(userId: string, threadId: string) {
+  await ensureCortexWorkspaceTables();
+  const thread = await one('SELECT * FROM oms_cortex_chat_threads WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, threadId]);
+  if (!thread) return null;
+  const messages = await rows('SELECT * FROM oms_cortex_chat_messages WHERE user_id = $1 AND thread_id = $2 ORDER BY created_at ASC LIMIT 200', [userId, threadId]);
+  return { thread: mapCortexThread(thread), messages: messages.map(mapCortexMessage) };
+}
+
 function mapRun(row: any) {
   if (!row) return null;
   return {
@@ -1167,6 +1554,65 @@ function mapRecommendation(row: any) {
     rejectedAt: iso(row.rejected_at),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
+  };
+}
+
+function mapCortexTask(row: any) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    publicId: publicEntityId('CT', row.id),
+    dedupeKey: row.dedupe_key,
+    source: row.source,
+    screen: row.screen,
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    title: row.title,
+    detail: row.detail,
+    priority: row.priority,
+    status: row.status,
+    actionLabel: row.action_label,
+    actionTarget: row.action_target,
+    evidence: json(row.evidence, {}),
+    recommendationId: row.recommendation_id,
+    completedAt: iso(row.completed_at),
+    dismissedAt: iso(row.dismissed_at),
+    autoCompletedAt: iso(row.auto_completed_at),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function mapCortexThread(row: any) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    publicId: publicEntityId('CH', row.id),
+    screen: row.screen,
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    title: row.title,
+    status: row.status,
+    lastMessageAt: iso(row.last_message_at),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function mapCortexMessage(row: any) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    role: row.role,
+    content: row.content,
+    sources: json(row.sources, []),
+    tasks: json(row.tasks, []),
+    confidence: row.confidence == null ? null : Number(row.confidence),
+    readinessNotes: row.readiness_notes,
+    cortexStatus: row.cortex_status,
+    cortexResponse: json(row.cortex_response, {}),
+    createdAt: iso(row.created_at),
   };
 }
 

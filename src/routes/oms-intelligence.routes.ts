@@ -16,6 +16,13 @@ import {
   rejectRecommendation,
   ingestCortexResult,
   verifyCortexWebhookSignature,
+  completeCortexTask,
+  createCortexChatMessage,
+  dismissCortexTask,
+  getCortexChatThread,
+  getCortexChatThreads,
+  getCortexTasks,
+  refreshCortexTasks,
   type CortexCallbackBody,
 } from '../services/oms-intelligence.service';
 
@@ -122,6 +129,59 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     return getScreenIntelligenceContext(userId, String(req.query?.screen || 'command'));
   });
+
+  fastify.post('/oms/intelligence/cortex/chat', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    try {
+      return await createCortexChatMessage(userId, req.body || {});
+    } catch (err: any) {
+      return reply.code(400).send({ error: err?.message || 'Cortex chat failed' });
+    }
+  });
+
+  fastify.get('/oms/intelligence/cortex/chat/threads', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getCortexChatThreads(userId, req.query || {});
+  });
+
+  fastify.get('/oms/intelligence/cortex/chat/threads/:id', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const thread = await getCortexChatThread(userId, String(req.params?.id || ''));
+    if (!thread) return reply.code(404).send({ error: 'Cortex chat thread not found' });
+    return thread;
+  });
+
+  fastify.get('/oms/intelligence/tasks', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getCortexTasks(userId, req.query || {});
+  });
+
+  fastify.post('/oms/intelligence/tasks/refresh', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return refreshCortexTasks(userId);
+  });
+
+  fastify.post('/oms/intelligence/tasks/:id/complete', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const task = await completeCortexTask(userId, String(req.params?.id || ''));
+    if (!task) return reply.code(404).send({ error: 'Cortex task not found' });
+    return { task };
+  });
+
+  fastify.post('/oms/intelligence/tasks/:id/dismiss', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const task = await dismissCortexTask(userId, String(req.params?.id || ''));
+    if (!task) return reply.code(404).send({ error: 'Cortex task not found' });
+    return { task };
+  });
+
   fastify.get('/oms/intelligence/runs/:id/status', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
