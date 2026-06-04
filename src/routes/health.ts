@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { config } from '../config/env';
 import { getPostgresPool } from '../db/postgres';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
+import { amazonSpApiConfigHealth } from '../services/amazon-spapi';
 
 let _ddb: DynamoDBClient | null = null;
 function ddb(): DynamoDBClient {
@@ -29,6 +30,7 @@ export async function healthRoutes(fastify: FastifyInstance) {
     const amazonRedirectUri =
       config.amazon.redirectUri ||
       (appBaseUrl ? `${appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/amazon/callback` : null);
+    const amazon = amazonSpApiConfigHealth();
     return {
       status: 'ok',
       service: 'UnieConnect',
@@ -38,11 +40,11 @@ export async function healthRoutes(fastify: FastifyInstance) {
       appBaseUrl,
       corsOrigins: config.corsOrigins,
       amazonRedirectUri: amazonRedirectUri || undefined,
-      amazonAppIdKind: config.amazon.appId
-        ? config.amazon.appId.startsWith('amzn1.sellerapps.app.')
-          ? 'seller_app'
-          : 'nonstandard'
-        : 'missing',
+      amazonAppIdKind: amazon.appIdKind,
+      amazonOAuthReady: amazon.oauthReady,
+      amazonSpApiSigningReady: amazon.signingReady,
+      amazonSpApiRegion: amazon.region,
+      amazonSpApiHost: amazon.host,
     };
   });
 

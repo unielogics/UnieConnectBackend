@@ -12,6 +12,7 @@ import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } fr
 import { exchangeCodeForTokens as exchangeAmazonCodeForTokens } from '../services/amazon-auth';
 import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
 import { markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
+import { amazonAppIdKind, getAmazonAccountHealth, getAmazonInboundLabels, pullAmazonSql } from '../services/amazon-spapi';
 
 type AnyRow = Record<string, any>;
 
@@ -792,12 +793,21 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           log: req.log,
         });
       } else if (account.channel === 'amazon') {
-        await setSyncStatus(account.id, 'products', 'error', { error: 'Amazon SP-API pull is still pending provider integration' });
-        return reply.code(202).send({
-          success: false,
-          account: mapChannel(account),
-          syncStatus: 'pending_provider_integration',
-          message: 'Amazon OAuth can be staged, but live SP-API catalog/order/inventory pulls are not wired yet.',
+        if (!account.refresh_token_enc) {
+          await setSyncStatus(account.id, 'products', 'error', { error: 'Amazon Seller Central authorization is required before SP-API sync' });
+          return reply.code(409).send({
+            success: false,
+            account: mapChannel(account),
+            syncStatus: 'needs_authorization',
+            message: 'Authorize Amazon Seller Central from Connections before running catalog, order, inventory, or FBA label sync.',
+          });
+        }
+        syncResult = await pullAmazonSql({
+          userId,
+          channelAccountId: account.id,
+          connection: account,
+          initialSync: !account.last_sync_at,
+          log: req.log,
         });
       } else {
         return reply.code(400).send({ error: `Unsupported marketplace channel: ${account.channel}` });
@@ -946,7 +956,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           [userId, JSON.stringify({
             state,
             provider: 'amazon',
-            appIdKind: config.amazon.appId.startsWith('amzn1.sellerapps.app.') ? 'seller_app' : 'nonstandard',
+            appIdKind: amazonAppIdKind(),
             redirectUri: config.amazon.redirectUri,
           })],
         );
@@ -954,7 +964,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           status: 'authorization_url_created',
           channel,
           state,
-          appIdKind: config.amazon.appId.startsWith('amzn1.sellerapps.app.') ? 'seller_app' : 'nonstandard',
+          appIdKind: amazonAppIdKind(),
         });
       }
     });
@@ -1049,7 +1059,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
             callbackReceivedAt: new Date().toISOString(),
             tokenSource: 'oauth_callback',
             query: req.query || {},
-            appIdKind: config.amazon.appId.startsWith('amzn1.sellerapps.app.') ? 'seller_app' : 'nonstandard',
+            appIdKind: amazonAppIdKind(),
           };
           let account = await one(
             `UPDATE marketplace_connections
@@ -2985,16 +2995,48 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     return { workflowId: draft?.id, workflow: draft };
   });
 
-  const amazonPending = async (_req: any, reply: any) => reply.code(202).send({ status: 'pending_provider_integration', source: 'aurora_postgres' });
+  app.get('/amazon/health', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getAmazonAccountHealth(userId);
+  });
+
+  const amazonConnectionForUser = async (userId: string) =>
+    one("SELECT * FROM marketplace_connections WHERE user_id = $1 AND channel = 'amazon' AND status = 'connected' ORDER BY updated_at DESC LIMIT 1", [userId]);
+
+  const amazonPending = async (_req: any, reply: any) => reply.code(202).send({
+    status: 'pending_provider_integration',
+    source: 'aurora_postgres',
+    message: 'This Amazon workflow still requires a full Send to Amazon inbound-plan implementation. Catalog, orders, FBA inventory, and existing-shipment label retrieval are wired to SP-API.',
+  });
   app.get('/amazon/send-to-amazon/workflows/:workflowId', amazonPending);
   app.post('/amazon/send-to-amazon/workflows/:workflowId/placement-preview', amazonPending);
   app.post('/amazon/send-to-amazon/workflows/:workflowId/confirm-placement', amazonPending);
-  app.post('/amazon/send-to-amazon/workflows/:workflowId/shipments/:shipmentId/labels', amazonPending);
-  app.post('/amazon/inventory', amazonPending);
+  app.post('/amazon/send-to-amazon/workflows/:workflowId/shipments/:shipmentId/labels', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const connection = await amazonConnectionForUser(userId);
+    if (!connection?.refresh_token_enc) return reply.code(409).send({ error: 'Amazon Seller Central authorization is required before fetching FBA labels' });
+    return getAmazonInboundLabels(connection, req.params.shipmentId, req.body || req.query || {});
+  });
+  app.post('/amazon/inventory', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const connection = await amazonConnectionForUser(userId);
+    if (!connection?.refresh_token_enc) return reply.code(409).send({ error: 'Amazon Seller Central authorization is required before inventory sync' });
+    const result = await pullAmazonSql({ userId, channelAccountId: connection.id, connection, initialSync: false, log: req.log });
+    return { success: !result.errors?.inventory, syncResult: result };
+  });
   app.post('/amazon/fulfillment', amazonPending);
   app.post('/amazon/inbound/plan', amazonPending);
   app.post('/amazon/inbound/shipment', amazonPending);
-  app.get('/amazon/inbound/:shipmentId/labels', amazonPending);
+  app.get('/amazon/inbound/:shipmentId/labels', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const connection = await amazonConnectionForUser(userId);
+    if (!connection?.refresh_token_enc) return reply.code(409).send({ error: 'Amazon Seller Central authorization is required before fetching FBA labels' });
+    return getAmazonInboundLabels(connection, req.params.shipmentId, req.query || {});
+  });
   app.post('/amazon/inbound/workflows/draft', amazonPending);
   app.post('/amazon/inbound/workflows/sku-labels', amazonPending);
   app.get('/amazon/inbound/history', async (req: any, reply) => {
@@ -3010,6 +3052,12 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const items = await rows('SELECT * FROM catalog_items WHERE user_id = $1 AND asin IS NOT NULL ORDER BY updated_at DESC LIMIT 200', [userId]);
     return { items: items.map((row) => mapItem(row)) };
   });
-  app.get('/amazon/shipping/labels/:shipmentId', amazonPending);
+  app.get('/amazon/shipping/labels/:shipmentId', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const connection = await amazonConnectionForUser(userId);
+    if (!connection?.refresh_token_enc) return reply.code(409).send({ error: 'Amazon Seller Central authorization is required before fetching FBA labels' });
+    return getAmazonInboundLabels(connection, req.params.shipmentId, req.query || {});
+  });
   app.post('/amazon/shipping/shipments', amazonPending);
 }

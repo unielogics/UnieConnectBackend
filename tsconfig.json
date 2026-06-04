@@ -62,6 +62,7 @@
     "src/services/marketplace-sql-sync.ts",
     "src/services/ebay.ts",
     "src/services/amazon-auth.ts",
+    "src/services/amazon-spapi.ts",
     "src/services/keepa.ts",
     "src/services/demo-seed.service.ts",
     "src/services/oms-production.service.ts",
