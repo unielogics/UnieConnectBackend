@@ -3,6 +3,7 @@ import { config } from '../config/env';
 import { getPostgresPool } from '../db/postgres';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { amazonSpApiConfigHealth } from '../services/amazon-spapi';
+import { shopifyWebhookHealth } from '../services/shopify';
 
 let _ddb: DynamoDBClient | null = null;
 function ddb(): DynamoDBClient {
@@ -31,6 +32,7 @@ export async function healthRoutes(fastify: FastifyInstance) {
       config.amazon.redirectUri ||
       (appBaseUrl ? `${appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/amazon/callback` : null);
     const amazon = amazonSpApiConfigHealth();
+    const shopify = shopifyWebhookHealth();
     return {
       status: 'ok',
       service: 'UnieConnect',
@@ -45,6 +47,11 @@ export async function healthRoutes(fastify: FastifyInstance) {
       amazonSpApiSigningReady: amazon.signingReady,
       amazonSpApiRegion: amazon.region,
       amazonSpApiHost: amazon.host,
+      shopifyOAuthReady: shopify.oauthReady,
+      shopifyWebhookDeliveryMode: shopify.deliveryMode,
+      shopifyWebhookUri: shopify.webhookUri,
+      shopifyWebhookTopicCount: shopify.topics.length,
+      shopifyPubSubServiceAccount: shopify.pubSubServiceAccount,
     };
   });
 

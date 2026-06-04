@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { FastifyInstance } from 'fastify';
 import fetch from 'node-fetch';
@@ -9,9 +9,10 @@ import { publicEntityId } from '../lib/public-id';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
+import { registerWebhooks as registerShopifyWebhooks, shopifyWebhookHealth } from '../services/shopify';
 import { exchangeCodeForTokens as exchangeAmazonCodeForTokens } from '../services/amazon-auth';
 import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
-import { markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
+import { applyShopifyWebhook, markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
 import { amazonAppIdKind, getAmazonAccountHealth, getAmazonInboundLabels, pullAmazonSql } from '../services/amazon-spapi';
 
 type AnyRow = Record<string, any>;
@@ -171,6 +172,33 @@ function wantsJson(req: any) {
 function redirectOrJson(req: any, reply: any, url: string, extra: Record<string, unknown> = {}) {
   if (wantsJson(req)) return reply.send({ url, ...extra });
   return reply.redirect(url);
+}
+
+function safeEqual(a: string, b: string) {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function verifyShopifyOAuthHmac(query: AnyRow) {
+  if (!config.shopify.clientSecret || !query?.hmac) return false;
+  const provided = trim(query.hmac);
+  const message = Object.keys(query)
+    .filter((key) => key !== 'hmac' && key !== 'signature')
+    .sort()
+    .map((key) => `${key}=${Array.isArray(query[key]) ? query[key].join(',') : query[key]}`)
+    .join('&');
+  const expected = createHmac('sha256', config.shopify.clientSecret).update(message).digest('hex');
+  return safeEqual(provided, expected);
+}
+
+function verifyShopifyWebhookHmac(req: any) {
+  if (!config.shopify.webhookSecret) return false;
+  const provided = trim(req.headers?.['x-shopify-hmac-sha256']);
+  const raw = req.rawBody;
+  if (!provided || !Buffer.isBuffer(raw)) return false;
+  const expected = createHmac('sha256', config.shopify.webhookSecret).update(raw).digest('base64');
+  return safeEqual(provided, expected);
 }
 
 function amazonSellerCentralBase(region?: string) {
@@ -730,6 +758,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       storage: 'aurora_postgres',
       tokenPresent: Boolean(account.access_token_enc || account.refresh_token_enc),
       lastSyncAt: iso(account.last_sync_at),
+      shopifyConfig: account.channel === 'shopify' ? shopifyWebhookHealth() : undefined,
     };
   });
 
@@ -858,7 +887,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const redirectUri = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/shopify/callback`;
     const params = new URLSearchParams({
       client_id: config.shopify.clientId,
-      scope: 'read_products,read_orders,read_inventory,read_locations,read_customers',
+      scope: 'read_products,read_orders,read_inventory,read_locations,read_customers,read_fulfillments,write_inventory,write_fulfillments',
       redirect_uri: redirectUri,
       state,
     });
@@ -874,6 +903,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const shop = trim(req.query?.shop);
     const saved = await one('SELECT * FROM oauth_states WHERE state = $1 AND channel = $2 AND used_at IS NULL AND expires_at > now()', [state, 'shopify']);
     if (!saved || !code || !shop) return reply.code(400).send({ error: 'Invalid Shopify OAuth state' });
+    if (!verifyShopifyOAuthHmac(req.query || {})) return reply.code(401).send({ error: 'Invalid Shopify OAuth signature' });
     let tokenPayload: any = {};
     try {
       const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
@@ -900,6 +930,44 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         setSyncStatus(account.id, 'customers', 'pending'),
         setSyncStatus(account.id, 'inventory', 'pending'),
       ]);
+      const webhookAddress = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/shopify`;
+      try {
+        await registerShopifyWebhooks({
+          shop,
+          accessToken: tokenPayload.access_token,
+          address: webhookAddress,
+          topics: config.shopify.webhookTopics,
+          log: req.log,
+        });
+        await pgQuery(
+          `UPDATE marketplace_connections
+           SET metadata = metadata || $3::jsonb, updated_at = now()
+           WHERE id = $1 AND user_id = $2`,
+          [
+            account.id,
+            saved.user_id,
+            JSON.stringify({
+              shopifyWebhookRegisteredAt: new Date().toISOString(),
+              shopifyWebhookDelivery: shopifyWebhookHealth(),
+            }),
+          ],
+        );
+      } catch (err: any) {
+        req.log.warn({ err, shop, accountId: account.id }, 'Shopify webhook registration failed');
+        await pgQuery(
+          `UPDATE marketplace_connections
+           SET metadata = metadata || $3::jsonb, updated_at = now()
+           WHERE id = $1 AND user_id = $2`,
+          [
+            account.id,
+            saved.user_id,
+            JSON.stringify({
+              shopifyWebhookRegistrationError: err?.message || 'Webhook registration failed',
+              shopifyWebhookDelivery: shopifyWebhookHealth(),
+            }),
+          ],
+        );
+      }
     }
     await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
     await writeLedger(saved.user_id, { entityType: 'marketplace_connection', entityId: account?.id, eventType: 'connected', summary: `Shopify marketplace connected for ${shop}.` });
@@ -1138,7 +1206,23 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     });
   }
 
-  app.post('/webhooks/shopify', async (_req: any, reply) => reply.code(202).send({ accepted: true, storage: 'aurora_postgres' }));
+  app.post('/webhooks/shopify', async (req: any, reply) => {
+    if (!verifyShopifyWebhookHmac(req)) return reply.code(401).send({ error: 'Invalid Shopify webhook signature' });
+    const shopDomain = trim(req.headers?.['x-shopify-shop-domain']);
+    const topic = trim(req.headers?.['x-shopify-topic']);
+    const webhookId = trim(req.headers?.['x-shopify-webhook-id']) || null;
+    try {
+      const result = await applyShopifyWebhook({ shopDomain, topic, webhookId, payload: req.body || {} });
+      return reply.code(202).send({ accepted: true, storage: 'aurora_postgres', ...result });
+    } catch (err: any) {
+      req.log.error({ err, shopDomain, topic, webhookId }, 'Shopify webhook processing failed');
+      return reply.code(202).send({
+        accepted: true,
+        storage: 'aurora_postgres',
+        processingError: err?.message || 'Shopify webhook processing failed',
+      });
+    }
+  });
   app.post('/webhooks/ebay/account-deletion', async (_req: any, reply) => reply.code(200).send({ accepted: true }));
 
   app.get('/items', async (req: any, reply) => {

@@ -12,6 +12,16 @@ import { config } from './config/env';
 
 async function start() {
   const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
+  app.removeContentTypeParser('application/json');
+  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (req: any, body, done) => {
+    if (req.url.includes('/webhooks/shopify')) req.rawBody = Buffer.isBuffer(body) ? body : Buffer.from(body as any);
+    try {
+      const text = Buffer.isBuffer(body) ? body.toString('utf8') : String(body || '');
+      done(null, text ? JSON.parse(text) : {});
+    } catch (err: any) {
+      done(err, undefined);
+    }
+  });
 
   // Request/response tracing for observability
   app.addHook('onRequest', async (req) => {

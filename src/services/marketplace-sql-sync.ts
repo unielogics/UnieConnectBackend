@@ -251,6 +251,121 @@ async function upsertOrder(ctx: SyncContext, channel: 'shopify' | 'ebay', raw: a
   }
 }
 
+export async function applyShopifyWebhook(params: {
+  shopDomain: string;
+  topic: string;
+  payload: any;
+  webhookId?: string | null;
+}) {
+  const shopDomain = trim(params.shopDomain).toLowerCase();
+  const topic = trim(params.topic).toLowerCase();
+  if (!shopDomain || !topic) throw new Error('Shopify webhook is missing shop domain or topic');
+  const account = await one(
+    "SELECT * FROM marketplace_connections WHERE channel = 'shopify' AND lower(shop_domain) = lower($1) AND status = 'connected' ORDER BY updated_at DESC LIMIT 1",
+    [shopDomain],
+  );
+  if (!account?.id || !account.user_id) throw new Error(`No connected Shopify account found for ${shopDomain}`);
+  const ctx = { userId: account.user_id, channelAccountId: account.id };
+  const payload = params.payload || {};
+  const metadata = { source: 'shopify_webhook', topic, webhookId: params.webhookId || null };
+
+  if (topic === 'app/uninstalled') {
+    await pgQuery(
+      `UPDATE marketplace_connections
+       SET status = 'disconnected', metadata = metadata || $3::jsonb, updated_at = now()
+       WHERE id = $1 AND user_id = $2`,
+      [account.id, account.user_id, JSON.stringify({ ...metadata, uninstalledAt: new Date().toISOString() })],
+    );
+    return { accountId: account.id, action: 'connection_disconnected' };
+  }
+
+  if (topic.startsWith('orders/')) {
+    await upsertOrder(ctx, 'shopify', { ...payload, webhook_metadata: metadata });
+    await setSyncStatus(account.id, 'orders', 'synced', { metadata: { topic, webhookId: params.webhookId || null } });
+    return { accountId: account.id, action: 'order_upserted' };
+  }
+
+  if (topic.startsWith('products/')) {
+    if (topic === 'products/delete') {
+      await pgQuery(
+        `UPDATE item_channel_mappings
+         SET status = 'deleted', payload = payload || $4::jsonb, updated_at = now()
+         WHERE user_id = $1 AND channel_connection_id = $2 AND channel = 'shopify' AND channel_item_id = $3`,
+        [account.user_id, account.id, trim(payload?.id), JSON.stringify(metadata)],
+      );
+      await setSyncStatus(account.id, 'products', 'synced', { metadata: { topic, webhookId: params.webhookId || null } });
+      return { accountId: account.id, action: 'product_deleted' };
+    }
+    const images = Array.isArray(payload?.images) ? payload.images.map((image: any) => image?.src || image?.url).filter(Boolean) : [];
+    let count = 0;
+    for (const variant of Array.isArray(payload?.variants) ? payload.variants : []) {
+      const sku = trim(variant?.sku);
+      if (!sku) continue;
+      const item: any = await upsertCatalogItem({
+        userId: account.user_id,
+        sku,
+        title: trim(payload?.title) || sku,
+        description: plainText(payload?.body_html),
+        image: images[0] || null,
+        images,
+        metadata: { ...metadata, productId: payload?.id, variantId: variant?.id, inventoryItemId: variant?.inventory_item_id },
+      });
+      if (item?.id) {
+        await upsertMapping({
+          userId: account.user_id,
+          itemId: item.id,
+          channelAccountId: account.id,
+          channel: 'shopify',
+          channelItemId: trim(payload?.id),
+          channelVariantId: trim(variant?.id) || null,
+          sku,
+          status: payload?.status === 'active' ? 'active' : 'inactive',
+          payload: { ...metadata, product: payload, variant, inventory_item_id: variant?.inventory_item_id },
+        });
+        count++;
+      }
+    }
+    await setSyncStatus(account.id, 'products', 'synced', { count, metadata: { topic, webhookId: params.webhookId || null } });
+    return { accountId: account.id, action: 'product_upserted', count };
+  }
+
+  if (topic.startsWith('customers/')) {
+    await ensureCustomer(ctx, 'shopify', trim(payload?.id) || null, { ...payload, webhook_metadata: metadata });
+    await setSyncStatus(account.id, 'customers', 'synced', { metadata: { topic, webhookId: params.webhookId || null } });
+    return { accountId: account.id, action: 'customer_upserted' };
+  }
+
+  if (topic === 'inventory_levels/update') {
+    const mapping: any = await one(
+      `SELECT m.*, i.wms_inventory
+       FROM item_channel_mappings m
+       JOIN catalog_items i ON i.id = m.item_id
+       WHERE m.user_id = $1 AND m.channel_connection_id = $2 AND m.payload->>'inventory_item_id' = $3
+       LIMIT 1`,
+      [account.user_id, account.id, trim(payload?.inventory_item_id)],
+    );
+    if (mapping?.item_id) {
+      await pgQuery(
+        `UPDATE catalog_items
+         SET wms_inventory = wms_inventory || $3::jsonb,
+             metadata = metadata || $4::jsonb,
+             updated_at = now()
+         WHERE id = $1 AND user_id = $2`,
+        [
+          mapping.item_id,
+          account.user_id,
+          JSON.stringify({ shopify: { locationId: String(payload?.location_id || ''), available: num(payload?.available) } }),
+          JSON.stringify({ ...metadata, shopifyInventorySyncedAt: new Date().toISOString() }),
+        ],
+      );
+    }
+    await setSyncStatus(account.id, 'inventory', 'synced', { metadata: { topic, webhookId: params.webhookId || null } });
+    return { accountId: account.id, action: 'inventory_updated', matched: Boolean(mapping?.item_id) };
+  }
+
+  return { accountId: account.id, action: 'ignored', topic };
+}
+
 export async function pullShopifySql(params: SyncContext & { shopDomain: string; accessToken: string; initialSync?: boolean }): Promise<PullResult> {
   const { shopDomain, accessToken, initialSync, ...ctx } = params;
   const base = `https://${shopDomain}/admin/api/${config.shopify.apiVersion}`;

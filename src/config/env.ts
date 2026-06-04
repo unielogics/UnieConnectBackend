@@ -14,6 +14,23 @@ export const config = {
     clientId: process.env.SHOPIFY_CLIENT_ID || '',
     clientSecret: process.env.SHOPIFY_CLIENT_SECRET || '',
     webhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET || '',
+    appAutomationToken: process.env.SHOPIFY_APP_AUTOMATION_TOKEN || '',
+    webhookUri: process.env.SHOPIFY_WEBHOOK_URI || '',
+    webhookTopics: (process.env.SHOPIFY_WEBHOOK_TOPICS || [
+      'app/uninstalled',
+      'products/create',
+      'products/update',
+      'products/delete',
+      'orders/create',
+      'orders/updated',
+      'orders/cancelled',
+      'orders/fulfilled',
+      'orders/paid',
+      'inventory_levels/update',
+      'customers/create',
+      'customers/update',
+      'customers/delete',
+    ].join(',')).split(',').map((s) => s.trim()).filter(Boolean),
     appBaseUrl: process.env.APP_BASE_URL || '', // e.g., https://api.unieconnect.com
     // 2026-01 may not be released; webhook registration fails. Use 2024-01 for compatibility.
     apiVersion: (process.env.SHOPIFY_API_VERSION || '2024-01').replace(/^2026-/, '2024-'),

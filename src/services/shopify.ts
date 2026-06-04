@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import { config } from '../config/env';
 
 type TokenResponse = { access_token: string; scope: string };
+type WebhookLog = { info: (o: object, msg?: string) => void; warn: (o: object, msg?: string) => void };
 
 export async function exchangeCodeForToken(shop: string, code: string): Promise<string> {
   const url = `https://${shop}/admin/oauth/access_token`;
@@ -27,9 +28,15 @@ export async function registerWebhooks(params: {
   accessToken: string;
   address: string;
   topics: string[];
-  log?: { info: (o: object, msg?: string) => void; warn: (o: object, msg?: string) => void };
+  log?: WebhookLog;
 }) {
   const { shop, accessToken, address, topics, log } = params;
+  const uri = config.shopify.webhookUri || address;
+  if (uri !== address || uri.startsWith('pubsub://') || uri.startsWith('arn:aws:events:')) {
+    const graphParams: { shop: string; accessToken: string; uri: string; topics: string[]; log?: WebhookLog } = { shop, accessToken, uri, topics };
+    if (log) graphParams.log = log;
+    return registerGraphqlWebhooks(graphParams);
+  }
   const version = config.shopify.apiVersion;
   log?.info?.({ shop, address, version, topicCount: topics.length }, '[Shopify] registerWebhooks start');
 
@@ -81,5 +88,97 @@ export async function registerWebhooks(params: {
     created++;
   }
   log?.info?.({ shop, created, totalTopics: topics.length }, '[Shopify] registerWebhooks done');
+}
+
+function topicToEnum(topic: string) {
+  return topic.trim().replace(/[\/.-]/g, '_').toUpperCase();
+}
+
+async function shopifyGraphql(shop: string, accessToken: string, query: string, variables: Record<string, unknown>) {
+  const res = await fetch(`https://${shop}/admin/api/${config.shopify.apiVersion}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': accessToken,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (!res.ok || json?.errors) {
+    throw new Error(`Shopify GraphQL failed (${res.status}): ${JSON.stringify(json?.errors || json).slice(0, 300)}`);
+  }
+  return json;
+}
+
+export async function registerGraphqlWebhooks(params: {
+  shop: string;
+  accessToken: string;
+  uri: string;
+  topics: string[];
+  log?: WebhookLog;
+}) {
+  const { shop, accessToken, uri, topics, log } = params;
+  log?.info?.({ shop, uri, topicCount: topics.length, version: config.shopify.apiVersion }, '[Shopify] registerGraphqlWebhooks start');
+  const existingQuery = `query {
+    webhookSubscriptions(first: 250) {
+      nodes { id topic uri }
+    }
+  }`;
+  const existingJson = await shopifyGraphql(shop, accessToken, existingQuery, {});
+  const existing = Array.isArray(existingJson?.data?.webhookSubscriptions?.nodes) ? existingJson.data.webhookSubscriptions.nodes : [];
+  const existingSet = new Set(existing.map((w: any) => `${String(w.topic)}|${String(w.uri)}`));
+  const mutation = `mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+    webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+      webhookSubscription { id topic uri format }
+      userErrors { field message }
+    }
+  }`;
+  let created = 0;
+  const errors: Record<string, string> = {};
+  for (const topic of topics) {
+    const topicEnum = topicToEnum(topic);
+    if (existingSet.has(`${topicEnum}|${uri}`)) continue;
+    const result = await shopifyGraphql(shop, accessToken, mutation, {
+      topic: topicEnum,
+      webhookSubscription: { uri, format: 'JSON' },
+    });
+    const userErrors = result?.data?.webhookSubscriptionCreate?.userErrors || [];
+    if (Array.isArray(userErrors) && userErrors.length) {
+      const message = userErrors.map((e: any) => e?.message).filter(Boolean).join('; ');
+      if (/already|taken|exists/i.test(message)) continue;
+      errors[topic] = message || 'Webhook subscription rejected';
+      log?.warn?.({ shop, topic, uri, message }, '[Shopify] GraphQL webhook create user error');
+      continue;
+    }
+    created++;
+  }
+  if (Object.keys(errors).length) {
+    throw new Error(`Shopify webhook registration partially failed: ${JSON.stringify(errors)}`);
+  }
+  log?.info?.({ shop, uri, created, totalTopics: topics.length }, '[Shopify] registerGraphqlWebhooks done');
+}
+
+export function shopifyWebhookHealth() {
+  const defaultHttpUri = config.shopify.appBaseUrl
+    ? `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/shopify`
+    : '';
+  const uri = config.shopify.webhookUri || defaultHttpUri;
+  const deliveryMode = uri.startsWith('pubsub://')
+    ? 'google_pubsub'
+    : uri.startsWith('arn:aws:events:')
+      ? 'amazon_eventbridge'
+      : uri
+        ? 'https'
+        : 'missing';
+  return {
+    oauthReady: Boolean(config.shopify.clientId && config.shopify.clientSecret && config.shopify.appBaseUrl),
+    hasWebhookSecret: Boolean(config.shopify.webhookSecret),
+    hasAutomationToken: Boolean(config.shopify.appAutomationToken),
+    apiVersion: config.shopify.apiVersion,
+    webhookUri: uri || null,
+    deliveryMode,
+    topics: config.shopify.webhookTopics,
+    pubSubServiceAccount: 'delivery@shopify-pubsub-webhooks.iam.gserviceaccount.com',
+  };
 }
 
