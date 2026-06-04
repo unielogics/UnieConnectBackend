@@ -1177,13 +1177,29 @@ export async function getScreenIntelligenceContext(userId: string, screen: strin
 
 function taskTargetFromText(text: string) {
   const value = text.toLowerCase();
+  if (value.includes('label') || value.includes('carrier') || value.includes('refund')) return { screen: 'labels', entityType: 'label_audit', actionLabel: 'Open label audit' };
+  if (value.includes('billing') || value.includes('invoice') || value.includes('fee') || value.includes('margin')) return { screen: 'billing', entityType: 'billing', actionLabel: 'Open billing' };
   if (value.includes('supplier')) return { screen: 'suppliers', entityType: 'supplier', actionLabel: 'Open suppliers' };
-  if (value.includes('wms') || value.includes('warehouse')) return { screen: 'warehouses', entityType: 'warehouse', actionLabel: 'Open warehouses' };
-  if (value.includes('dimension') || value.includes('weight') || value.includes('cost') || value.includes('sku')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Open SKUs' };
-  if (value.includes('amazon')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Open listings' };
-  if (value.includes('csv')) return { screen: 'product-research', entityType: 'csv', actionLabel: 'Upload CSV' };
-  if (value.includes('marketplace') || value.includes('connect')) return { screen: 'connections', entityType: 'connection', actionLabel: 'Open connections' };
+  if (value.includes('wms') || value.includes('warehouse') || value.includes('facility')) return { screen: 'warehouses', entityType: 'warehouse', actionLabel: 'Connect warehouse' };
+  if (value.includes('amazon') || value.includes('listing') || value.includes('asin') || value.includes('fba') || value.includes('fbm')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Open listings' };
+  if (value.includes('dimension') || value.includes('weight') || value.includes('cost') || value.includes('sku') || value.includes('title') || value.includes('description')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Enrich SKUs' };
+  if (value.includes('csv') || value.includes('upload')) return { screen: 'product-research', entityType: 'csv', actionLabel: 'Upload CSV' };
+  if (value.includes('marketplace') || value.includes('connect') || value.includes('feed')) return { screen: 'connections', entityType: 'connection', actionLabel: 'Open connections' };
   return { screen: 'command', entityType: 'account', actionLabel: 'Open Command Center' };
+}
+
+function recommendationTaskTarget(rec: any) {
+  const type = String(rec?.recommendationType || '').toLowerCase();
+  const entityType = String(rec?.entityType || '').toLowerCase();
+  const text = `${type} ${entityType} ${rec?.title || ''} ${rec?.summary || ''}`.toLowerCase();
+  if (entityType === 'sku' || text.includes('sku') || text.includes('listing')) return { screen: 'skus', actionLabel: 'Review SKU decision' };
+  if (entityType === 'supplier' || text.includes('supplier')) return { screen: 'suppliers', actionLabel: 'Review supplier action' };
+  if (entityType === 'order' || text.includes('fulfillment')) return { screen: 'orders', actionLabel: 'Review order action' };
+  if (entityType === 'shipment_plan' || text.includes('shipment') || text.includes('inbound')) return { screen: 'shipments', actionLabel: 'Review shipment plan' };
+  if (entityType === 'carrier_audit' || type === 'carrier_audit' || text.includes('label') || text.includes('refund')) return { screen: 'labels', actionLabel: 'Review label audit' };
+  if (entityType === 'billing' || type === 'billing_profit' || text.includes('billing') || text.includes('margin')) return { screen: 'billing', actionLabel: 'Review billing impact' };
+  if (entityType === 'business_double' || type === 'business_double' || text.includes('business double')) return { screen: 'double', actionLabel: 'Open Business Double' };
+  return { screen: 'command', actionLabel: 'Review in Command Center' };
 }
 
 function priorityForTask(text: string, score?: number) {
@@ -1270,28 +1286,27 @@ export async function refreshCortexTasks(userId: string) {
   for (const rec of (recs.recommendations || []).filter(Boolean) as any[]) {
     const dedupeKey = `recommendation:${rec.id}`;
     activeKeys.add(dedupeKey);
-    const recScreen =
-      rec.entityType === 'sku' ? 'skus' :
-      rec.entityType === 'supplier' ? 'suppliers' :
-      rec.entityType === 'order' ? 'orders' :
-      rec.entityType === 'shipment_plan' ? 'shipments' :
-      rec.entityType === 'carrier_audit' || rec.recommendationType === 'carrier_audit' ? 'labels' :
-      rec.entityType === 'billing' || rec.recommendationType === 'billing_profit' ? 'billing' :
-      rec.entityType === 'business_double' || rec.recommendationType === 'business_double' ? 'double' :
-      'command';
+    const target = recommendationTaskTarget(rec);
     await upsertCortexTask(userId, {
       dedupeKey,
       source: 'recommendation',
-      screen: recScreen,
+      screen: target.screen,
       entityType: rec.entityType || rec.recommendationType,
       entityId: rec.entityId || rec.id,
       title: rec.title,
       detail: rec.summary,
       priority: Number(rec.confidence || 0) >= 0.8 ? 'normal' : 'low',
-      actionLabel: 'Review decision',
-      actionTarget: recScreen,
+      actionLabel: target.actionLabel,
+      actionTarget: target.screen,
       recommendationId: rec.id,
-      evidence: { currentValue: rec.currentValue, optimizedValue: rec.optimizedValue, estimatedImpact: rec.estimatedImpact, confidence: rec.confidence },
+      evidence: {
+        currentValue: rec.currentValue,
+        optimizedValue: rec.optimizedValue,
+        estimatedImpact: rec.estimatedImpact,
+        confidence: rec.confidence,
+        recommendationType: rec.recommendationType,
+        approvalState: rec.approvalState,
+      },
     });
   }
 
