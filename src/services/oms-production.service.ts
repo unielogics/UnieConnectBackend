@@ -8,6 +8,10 @@ import { postCortex, cortexConfigStatus } from './cortex-orchestration';
 
 type RangeKey = 'today' | '7d' | '30d';
 type Row = Record<string, any>;
+type MarketplaceFilter = {
+  channel?: string;
+  channelAccountId?: string;
+};
 
 const number = (value: unknown, fallback = 0) => {
   const n = Number(value);
@@ -183,10 +187,40 @@ async function baseCounts(userId: string) {
   };
 }
 
-async function getItems(userId: string, limit = 200) {
+function marketplaceFilterWhere(alias: string, filter: MarketplaceFilter, values: unknown[]) {
+  const clauses: string[] = [];
+  if (filter.channelAccountId) {
+    values.push(filter.channelAccountId);
+    clauses.push(`EXISTS (
+      SELECT 1 FROM item_channel_mappings m
+      WHERE m.user_id = ${alias}.user_id
+        AND m.item_id = ${alias}.id
+        AND m.channel_connection_id = $${values.length}
+    )`);
+  } else if (filter.channel === 'unmapped') {
+    clauses.push(`NOT EXISTS (
+      SELECT 1 FROM item_channel_mappings m
+      WHERE m.user_id = ${alias}.user_id
+        AND m.item_id = ${alias}.id
+    )`);
+  } else if (filter.channel) {
+    values.push(filter.channel);
+    clauses.push(`EXISTS (
+      SELECT 1 FROM item_channel_mappings m
+      WHERE m.user_id = ${alias}.user_id
+        AND m.item_id = ${alias}.id
+        AND m.channel = $${values.length}
+    )`);
+  }
+  return clauses;
+}
+
+async function getItems(userId: string, limit = 200, filter: MarketplaceFilter = {}) {
+  const values: unknown[] = [userId, limit];
+  const clauses = ['i.user_id = $1', ...marketplaceFilterWhere('i', filter, values)];
   const data = await rows(
-    'SELECT * FROM catalog_items WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2',
-    [userId, limit],
+    `SELECT i.* FROM catalog_items i WHERE ${clauses.join(' AND ')} ORDER BY i.updated_at DESC LIMIT $2`,
+    values,
   );
   return data;
 }
@@ -480,17 +514,29 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
   return { approved: true, planId: stored?.id || planId, stored, cortex };
 }
 
-export async function getInventoryPlan(userId: string, horizon = '6m') {
+export async function getInventoryPlan(userId: string, horizon = '6m', filter: MarketplaceFilter = {}) {
+  const velocityValues: unknown[] = [userId, rangeStart('30d')];
+  const velocityClauses = ['ol.user_id = $1', 'COALESCE(o.placed_at, o.created_at) >= $2'];
+  if (filter.channelAccountId) {
+    velocityValues.push(filter.channelAccountId);
+    velocityClauses.push(`o.channel_connection_id = $${velocityValues.length}`);
+  } else if (filter.channel && filter.channel !== 'unmapped') {
+    velocityValues.push(filter.channel);
+    velocityClauses.push(`COALESCE(o.channel, mc.channel) = $${velocityValues.length}`);
+  } else if (filter.channel === 'unmapped') {
+    velocityClauses.push('o.channel_connection_id IS NULL');
+  }
   const [items, facilities, velocityRows] = await Promise.all([
-    getItems(userId),
+    getItems(userId, 200, filter),
     getFacilities(userId),
     rows<{ sku: string; units: string }>(
       `SELECT ol.sku, COALESCE(SUM(ol.quantity), 0)::text AS units
        FROM order_lines ol
        INNER JOIN orders o ON o.id = ol.order_id
-       WHERE ol.user_id = $1 AND COALESCE(o.placed_at, o.created_at) >= $2
+       LEFT JOIN marketplace_connections mc ON mc.id = o.channel_connection_id
+       WHERE ${velocityClauses.join(' AND ')}
        GROUP BY ol.sku`,
-      [userId, rangeStart('30d')],
+      velocityValues,
     ),
   ]);
   const velocityBySku = new Map(velocityRows.map((row) => [String(row.sku || ''), number(row.units)]));
@@ -533,8 +579,8 @@ export async function getInventoryPlan(userId: string, horizon = '6m') {
   };
 }
 
-export async function getOmsSkus(userId: string) {
-  const plan = await getInventoryPlan(userId);
+export async function getOmsSkus(userId: string, filter: MarketplaceFilter = {}) {
+  const plan = await getInventoryPlan(userId, '6m', filter);
   const amazonProfiles = await getAmazonProfilesForItems(userId, plan.skus.map((sku: any) => String(sku.id)).filter(Boolean));
   const skus = plan.skus.map((sku: any) => ({
     ...sku,
@@ -641,15 +687,26 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
   };
 }
 
-export async function getOmsOrders(userId: string) {
+export async function getOmsOrders(userId: string, filter: MarketplaceFilter = {}) {
+  const values: unknown[] = [userId];
+  const where = ['o.user_id = $1'];
+  if (filter.channelAccountId) {
+    values.push(filter.channelAccountId);
+    where.push(`o.channel_connection_id = $${values.length}`);
+  } else if (filter.channel && filter.channel !== 'unmapped') {
+    values.push(filter.channel);
+    where.push(`COALESCE(o.channel, mc.channel) = $${values.length}`);
+  } else if (filter.channel === 'unmapped') {
+    where.push('o.channel_connection_id IS NULL');
+  }
   const orders = await rows(
-    `SELECT o.*, c.email AS customer_email, c.name AS customer_name, mc.channel AS account_channel, mc.display_name
+    `SELECT o.*, c.email AS customer_email, c.name AS customer_name, mc.channel AS account_channel, mc.display_name, mc.shop_domain, mc.selling_partner_id
      FROM orders o
      LEFT JOIN customers c ON c.id = o.customer_id
      LEFT JOIN marketplace_connections mc ON mc.id = o.channel_connection_id
-     WHERE o.user_id = $1
+     WHERE ${where.join(' AND ')}
      ORDER BY COALESCE(o.placed_at, o.created_at) DESC LIMIT 200`,
-    [userId],
+    values,
   );
   return {
     orders: orders.map((order) => {
@@ -662,6 +719,8 @@ export async function getOmsOrders(userId: string) {
         customerDisplayId: order.customer_id ? publicEntityId('CU', order.customer_id) : null,
         customer: order.customer_name || order.customer_email || undefined,
         ch: order.channel || order.account_channel || 'manual',
+        channelAccountId: order.channel_connection_id || null,
+        channelDisplay: order.display_name || order.shop_domain || order.selling_partner_id || order.channel || order.account_channel || 'manual',
         total: money(totals.total || totals.subtotal || 0),
         placedAt: iso(order.placed_at),
         createdAt: iso(order.created_at),

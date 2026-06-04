@@ -916,13 +916,34 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     } catch (err: any) {
       return reply.code(400).send({ error: err?.message || 'Shopify token exchange failed' });
     }
-    const account = await one(
-      `INSERT INTO marketplace_connections
-        (user_id, channel, status, display_name, shop_domain, access_token_enc, scopes, metadata)
-       VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5::jsonb)
+    let account = await one(
+      `UPDATE marketplace_connections
+       SET status = 'connected',
+           display_name = $3,
+           access_token_enc = $4,
+           scopes = $5,
+           metadata = metadata || $6::jsonb,
+           updated_at = now()
+       WHERE user_id = $1 AND channel = 'shopify' AND lower(shop_domain) = lower($2)
        RETURNING *`,
-      [saved.user_id, shop, tokenPayload.access_token || null, String(tokenPayload.scope || '').split(',').filter(Boolean), JSON.stringify({ oauthCompletedAt: new Date().toISOString() })],
+      [
+        saved.user_id,
+        shop,
+        shop,
+        tokenPayload.access_token || null,
+        String(tokenPayload.scope || '').split(',').filter(Boolean),
+        JSON.stringify({ oauthCompletedAt: new Date().toISOString(), reconnect: true }),
+      ],
     );
+    if (!account) {
+      account = await one(
+        `INSERT INTO marketplace_connections
+          (user_id, channel, status, display_name, shop_domain, access_token_enc, scopes, metadata)
+         VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5::jsonb)
+         RETURNING *`,
+        [saved.user_id, shop, tokenPayload.access_token || null, String(tokenPayload.scope || '').split(',').filter(Boolean), JSON.stringify({ oauthCompletedAt: new Date().toISOString() })],
+      );
+    }
     if (account?.id) {
       await Promise.all([
         setSyncStatus(account.id, 'products', 'pending'),
@@ -1230,9 +1251,13 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const { limit, offset } = pagination(req.query);
     const channel = trim(req.query?.channel);
+    const channelAccountId = trim(req.query?.channelAccountId);
     const values: unknown[] = [userId, limit, offset];
     let where = 'i.user_id = $1';
-    if (channel && channel !== 'unmapped') {
+    if (channelAccountId) {
+      values.push(channelAccountId);
+      where += ` AND EXISTS (SELECT 1 FROM item_channel_mappings m WHERE m.item_id = i.id AND m.channel_connection_id = $${values.length})`;
+    } else if (channel && channel !== 'unmapped') {
       values.push(channel);
       where += ` AND EXISTS (SELECT 1 FROM item_channel_mappings m WHERE m.item_id = i.id AND m.channel = $${values.length})`;
     } else if (channel === 'unmapped') {
@@ -1537,7 +1562,27 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const { limit, offset } = pagination(req.query);
-    const data = await rows('SELECT * FROM orders WHERE user_id = $1 ORDER BY placed_at DESC NULLS LAST, created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
+    const channel = trim(req.query?.channel);
+    const channelAccountId = trim(req.query?.channelAccountId);
+    const values: unknown[] = [userId, limit, offset];
+    const where = ['o.user_id = $1'];
+    if (channelAccountId) {
+      values.push(channelAccountId);
+      where.push(`o.channel_connection_id = $${values.length}`);
+    } else if (channel && channel !== 'unmapped') {
+      values.push(channel);
+      where.push(`COALESCE(o.channel, mc.channel) = $${values.length}`);
+    } else if (channel === 'unmapped') {
+      where.push('o.channel_connection_id IS NULL');
+    }
+    const data = await rows(
+      `SELECT o.*
+       FROM orders o
+       LEFT JOIN marketplace_connections mc ON mc.id = o.channel_connection_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY o.placed_at DESC NULLS LAST, o.created_at DESC LIMIT $2 OFFSET $3`,
+      values,
+    );
     return data.map((row) => mapOrder(row));
   });
 

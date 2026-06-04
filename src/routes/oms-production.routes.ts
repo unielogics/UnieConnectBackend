@@ -31,6 +31,11 @@ function requireUser(req: any, reply: any): string | null {
 }
 
 export async function omsProductionRoutes(fastify: FastifyInstance) {
+  const marketplaceFilter = (query: any) => ({
+    channel: typeof query?.channel === 'string' ? query.channel.trim() : undefined,
+    channelAccountId: typeof query?.channelAccountId === 'string' ? query.channelAccountId.trim() : undefined,
+  });
+
   fastify.get('/oms/command-center', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
@@ -54,13 +59,13 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
   fastify.get('/oms/inventory-plan', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    return getInventoryPlan(userId, String(req.query?.horizon || '6m'));
+    return getInventoryPlan(userId, String(req.query?.horizon || '6m'), marketplaceFilter(req.query));
   });
 
   fastify.get('/oms/skus', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    return getOmsSkus(userId);
+    return getOmsSkus(userId, marketplaceFilter(req.query));
   });
 
   fastify.get('/oms/skus/:skuId', async (req: any, reply) => {
@@ -74,7 +79,7 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
   fastify.get('/oms/orders', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    return getOmsOrders(userId);
+    return getOmsOrders(userId, marketplaceFilter(req.query));
   });
 
   fastify.get('/oms/asns', async (req: any, reply) => {
