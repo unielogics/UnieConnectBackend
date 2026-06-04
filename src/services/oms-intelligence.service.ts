@@ -39,6 +39,14 @@ async function one<T extends Row = Row>(sql: string, values: unknown[] = []): Pr
   return data[0] || null;
 }
 
+async function tableExists(tableName: string) {
+  const found = await one<{ exists: boolean }>(
+    `SELECT to_regclass($1) IS NOT NULL AS exists`,
+    [tableName],
+  ).catch(() => null);
+  return Boolean(found?.exists);
+}
+
 async function writeRunEvent(userId: string, runId: string | null | undefined, eventType: string, summary: string, payload: any = {}) {
   if (!runId) return;
   await pgQuery(
@@ -101,6 +109,7 @@ async function completeRun(params: {
 }
 
 export async function getDataReadiness(userId: string) {
+  const hasAmazonItemProfiles = await tableExists('amazon_item_profiles');
   const [counts] = await rows(
     `SELECT
        (SELECT COUNT(*) FROM marketplace_connections WHERE user_id = $1 AND status IN ('connected','active','synced'))::int AS marketplace_connections,
@@ -108,14 +117,14 @@ export async function getDataReadiness(userId: string) {
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1)::int AS catalog_items,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND LOWER(COALESCE(metadata->>'source', metadata->>'importSource', '')) LIKE '%csv%')::int AS csv_items,
        (SELECT COUNT(*) FROM item_channel_mappings WHERE user_id = $1)::int AS marketplace_mapped_items,
-       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1)::int AS amazon_profiles,
-       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND asin IS NOT NULL AND asin <> '')::int AS amazon_listed_items,
-       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND listing_status IN ('listed','active') AND fulfillment_channel IN ('AMAZON','FBA') AND cardinality(blockers) = 0)::int AS amazon_fba_eligible_items,
-       (SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND (listing_status = 'needs_listing' OR cardinality(blockers) > 0))::int AS amazon_blocked_items,
+       ${hasAmazonItemProfiles ? "(SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1)::int" : "0::int"} AS amazon_profiles,
+       ${hasAmazonItemProfiles ? "(SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND asin IS NOT NULL AND asin <> '')::int" : "0::int"} AS amazon_listed_items,
+       ${hasAmazonItemProfiles ? "(SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND listing_status IN ('listed','active') AND fulfillment_channel IN ('AMAZON','FBA') AND cardinality(blockers) = 0)::int" : "0::int"} AS amazon_fba_eligible_items,
+       ${hasAmazonItemProfiles ? "(SELECT COUNT(*) FROM amazon_item_profiles WHERE user_id = $1 AND (listing_status = 'needs_listing' OR cardinality(blockers) > 0))::int" : "0::int"} AS amazon_blocked_items,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1)::int AS orders,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1 AND channel_connection_id IS NOT NULL)::int AS marketplace_orders,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1 AND LOWER(COALESCE(metadata->>'source', '')) LIKE '%csv%')::int AS csv_orders,
-       (SELECT COUNT(*) FROM facilities WHERE user_id = $1 OR user_id IS NULL)::int AS facilities,
+       (SELECT COUNT(*) FROM facilities WHERE (user_id = $1 OR user_id IS NULL) AND COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo'))::int AS facilities,
        (SELECT COUNT(*) FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected')::int AS wms_links,
        (SELECT COUNT(*) FROM suppliers WHERE user_id = $1)::int AS suppliers,
        (SELECT COUNT(*) FROM suppliers WHERE user_id = $1 AND COALESCE(metadata->'pickupProfile'->>'hoursOfOperation', metadata->>'hoursOfOperation', '') <> '')::int AS suppliers_with_pickup,

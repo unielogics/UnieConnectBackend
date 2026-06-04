@@ -609,19 +609,18 @@ async function writeLedger(userId: string, params: { entityType: string; entityI
 }
 
 async function closestFacility(userId: string) {
-  return one('SELECT * FROM facilities WHERE (user_id = $1 OR user_id IS NULL) AND status = $2 ORDER BY user_id NULLS LAST, created_at ASC LIMIT 1', [userId, 'active']);
+  return one(
+    `SELECT * FROM facilities
+     WHERE (user_id = $1 OR user_id IS NULL)
+       AND status = $2
+       AND COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo')
+     ORDER BY user_id NULLS LAST, created_at ASC LIMIT 1`,
+    [userId, 'active'],
+  );
 }
 
 async function seedDefaultFacility(userId: string) {
-  const existing = await closestFacility(userId);
-  if (existing) return existing;
-  return one(
-    `INSERT INTO facilities (user_id, code, name, facility_type, address, latitude, longitude, metadata)
-     VALUES ($1, 'NJ-01', 'New Jersey Market Hub', 'warehouse', $2::jsonb, 40.7357, -74.1724, '{"source":"sql_default"}'::jsonb)
-     ON CONFLICT (user_id, code) DO UPDATE SET updated_at = now()
-     RETURNING *`,
-    [userId, JSON.stringify({ city: 'Newark', state: 'NJ', stateOrProvinceCode: 'NJ', country: 'US' })],
-  );
+  return closestFacility(userId);
 }
 
 function wmsBillingAddress(address: AnyRow | null | undefined) {
@@ -1851,8 +1850,13 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.get('/facilities', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    await seedDefaultFacility(userId);
-    const data = await rows('SELECT * FROM facilities WHERE user_id = $1 OR user_id IS NULL ORDER BY code ASC', [userId]);
+    const data = await rows(
+      `SELECT * FROM facilities
+       WHERE (user_id = $1 OR user_id IS NULL)
+         AND COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo')
+       ORDER BY code ASC`,
+      [userId],
+    );
     return data.map(mapFacility);
   });
 
@@ -2482,7 +2486,17 @@ export async function sqlModeRoutes(app: FastifyInstance) {
 
       const facility =
         (await one('SELECT * FROM facilities WHERE code = $1 AND (user_id = $2 OR user_id IS NULL)', [warehouseCode, userId])) ||
-        (await seedDefaultFacility(userId));
+        (await one(
+          `INSERT INTO facilities (user_id, code, name, facility_type, status, address, metadata)
+           VALUES ($1, $2, $3, 'warehouse', 'active', '{}'::jsonb, $4::jsonb)
+           ON CONFLICT (user_id, code) DO UPDATE SET
+             name = EXCLUDED.name,
+             status = 'active',
+             metadata = facilities.metadata || EXCLUDED.metadata,
+             updated_at = now()
+           RETURNING *`,
+          [userId, warehouseCode, warehouseCode, JSON.stringify({ source: 'wms_internal_bootstrap', generatedBy: 'warehouse_invitation' })],
+        ));
       const link = await one(
         `INSERT INTO oms_warehouse_links (user_id, facility_id, warehouse_code, connection_code, metadata)
          VALUES ($1, $2, $3, $4, $5::jsonb)
@@ -2641,8 +2655,11 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.get('/oms/facilities', async (req: any, reply) => {
     const userId = requireManager(req, reply);
     if (!userId) return;
-    await seedDefaultFacility(userId);
-    const data = await rows('SELECT * FROM facilities ORDER BY code ASC');
+    const data = await rows(
+      `SELECT * FROM facilities
+       WHERE COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo')
+       ORDER BY code ASC`,
+    );
     return { facilities: data.map(mapFacility) };
   });
 

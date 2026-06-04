@@ -227,10 +227,21 @@ async function getItems(userId: string, limit = 200, filter: MarketplaceFilter =
 
 async function getFacilities(userId: string) {
   const data = await rows(
-    'SELECT * FROM facilities WHERE user_id = $1 OR user_id IS NULL ORDER BY code ASC LIMIT 200',
+    `SELECT * FROM facilities
+     WHERE (user_id = $1 OR user_id IS NULL)
+       AND COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo')
+     ORDER BY code ASC LIMIT 200`,
     [userId],
   );
   return data;
+}
+
+async function tableExists(tableName: string) {
+  const found = await one<{ exists: boolean }>(
+    'SELECT to_regclass($1) IS NOT NULL AS exists',
+    [tableName],
+  ).catch(() => null);
+  return Boolean(found?.exists);
 }
 
 async function recentLedger(userId: string, limit = 30) {
@@ -347,6 +358,7 @@ function mapAmazonProfile(row: Row | null) {
 
 async function getAmazonProfilesForItems(userId: string, itemIds: string[]) {
   if (!itemIds.length) return new Map<string, ReturnType<typeof mapAmazonProfile>>();
+  if (!(await tableExists('amazon_item_profiles'))) return new Map<string, ReturnType<typeof mapAmazonProfile>>();
   const profiles = await rows(
     `SELECT DISTINCT ON (item_id) *
      FROM amazon_item_profiles
@@ -623,13 +635,15 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     [userId, `%${item.sku}%`],
   );
   const facilities = await getFacilities(userId);
-  const amazonProfile = await one(
-    `SELECT *
-     FROM amazon_item_profiles
-     WHERE user_id = $1 AND item_id = $2
-     ORDER BY COALESCE(last_amazon_sync_at, updated_at, created_at) DESC LIMIT 1`,
-    [userId, item.id],
-  );
+  const amazonProfile = (await tableExists('amazon_item_profiles'))
+    ? await one(
+        `SELECT *
+         FROM amazon_item_profiles
+         WHERE user_id = $1 AND item_id = $2
+         ORDER BY COALESCE(last_amazon_sync_at, updated_at, created_at) DESC LIMIT 1`,
+        [userId, item.id],
+      )
+    : null;
   // (paste-replace) Keepa enrichment: best-effort, never fails the response.
   const asin = (item.asin || '').trim().toUpperCase() || null;
   let keepa: any = null;
