@@ -8,7 +8,9 @@ import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
 import { publicEntityId } from '../lib/public-id';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
-import { buildEbayAuthUrl, exchangeEbayCodeForToken } from '../services/ebay';
+import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
+import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
+import { markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
 
 type AnyRow = Record<string, any>;
 
@@ -718,12 +720,14 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const account = await one('SELECT * FROM marketplace_connections WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     if (!account) return reply.code(404).send({ error: 'Not found' });
+    const sync = await getSyncStatus(account.id);
     return {
       accountId: account.id,
       channel: account.channel,
       status: account.status,
-      syncStatus: account.last_sync_at ? 'complete' : 'pending',
+      syncStatus: sync.fullSync ? 'complete' : 'pending',
       lastSyncAt: iso(account.last_sync_at),
+      ...sync,
       source: 'aurora_postgres',
     };
   });
@@ -731,13 +735,77 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.post('/channel-accounts/:id/refresh', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const account = await one(
-      'UPDATE marketplace_connections SET last_sync_at = now(), updated_at = now(), metadata = metadata || $3::jsonb WHERE id = $1 AND user_id = $2 RETURNING *',
-      [req.params.id, userId, JSON.stringify({ lastManualRefresh: new Date().toISOString(), refreshMode: 'sql_mode' })],
-    );
+    const account = await one('SELECT * FROM marketplace_connections WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     if (!account) return reply.code(404).send({ error: 'Not found' });
-    await writeLedger(userId, { entityType: 'marketplace_connection', entityId: account.id, eventType: 'refresh_requested', summary: `Refresh requested for ${account.channel} marketplace connection.`, payload: { accountId: account.id } });
-    return { success: true, account: mapChannel(account), syncStatus: 'queued' };
+    if (account.status !== 'connected') {
+      return reply.code(409).send({ error: 'Marketplace connection is not connected', status: account.status });
+    }
+    let syncResult: any = null;
+    try {
+      if (account.channel === 'shopify') {
+        if (!account.shop_domain || !account.access_token_enc) {
+          return reply.code(400).send({ error: 'Shopify connection is missing shop domain or access token' });
+        }
+        syncResult = await pullShopifySql({
+          userId,
+          channelAccountId: account.id,
+          shopDomain: account.shop_domain,
+          accessToken: account.access_token_enc,
+          initialSync: !account.last_sync_at,
+          log: req.log,
+        });
+      } else if (account.channel === 'ebay') {
+        let accessToken = account.access_token_enc;
+        if ((!accessToken || (account.token_expires_at && new Date(account.token_expires_at).getTime() < Date.now() + 60_000)) && account.refresh_token_enc) {
+          const token = await refreshEbayAccessToken(account.refresh_token_enc);
+          accessToken = token.accessToken;
+          await pgQuery(
+            `UPDATE marketplace_connections
+             SET access_token_enc = $3, refresh_token_enc = COALESCE($4, refresh_token_enc), token_expires_at = $5, updated_at = now()
+             WHERE id = $1 AND user_id = $2`,
+            [account.id, userId, accessToken, token.refreshToken || null, token.expiresAt || null],
+          );
+        }
+        if (!accessToken) return reply.code(400).send({ error: 'eBay connection is missing access token' });
+        syncResult = await pullEbaySql({
+          userId,
+          channelAccountId: account.id,
+          accessToken,
+          marketplaceId: account.marketplace_id || config.ebay.marketplaceId,
+          log: req.log,
+        });
+      } else if (account.channel === 'amazon') {
+        await setSyncStatus(account.id, 'products', 'error', { error: 'Amazon SP-API pull is still pending provider integration' });
+        return reply.code(202).send({
+          success: false,
+          account: mapChannel(account),
+          syncStatus: 'pending_provider_integration',
+          message: 'Amazon OAuth can be staged, but live SP-API catalog/order/inventory pulls are not wired yet.',
+        });
+      } else {
+        return reply.code(400).send({ error: `Unsupported marketplace channel: ${account.channel}` });
+      }
+      const updated = await markMarketplaceRefresh(account.id, userId, syncResult);
+      await writeLedger(userId, {
+        entityType: 'marketplace_connection',
+        entityId: account.id,
+        eventType: 'refresh_completed',
+        summary: `Refresh completed for ${account.channel} marketplace connection.`,
+        payload: { accountId: account.id, syncResult },
+      });
+      const sync = await getSyncStatus(account.id);
+      return { success: true, account: mapChannel(updated || account), syncStatus: sync.fullSync ? 'complete' : 'partial', syncResult, ...sync };
+    } catch (err: any) {
+      req.log.error({ err, accountId: account.id, channel: account.channel }, 'marketplace refresh failed');
+      await writeLedger(userId, {
+        entityType: 'marketplace_connection',
+        entityId: account.id,
+        eventType: 'refresh_failed',
+        summary: `Refresh failed for ${account.channel} marketplace connection.`,
+        payload: { accountId: account.id, error: err?.message || 'Refresh failed' },
+      });
+      return reply.code(502).send({ error: 'Marketplace refresh failed', detail: err?.message || 'Refresh failed' });
+    }
   });
 
   app.get('/auth/shopify/start', async (req: any, reply) => {
@@ -763,7 +831,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const redirectUri = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/shopify/callback`;
     const params = new URLSearchParams({
       client_id: config.shopify.clientId,
-      scope: 'read_products,read_orders,read_inventory',
+      scope: 'read_products,read_orders,read_inventory,read_locations,read_customers',
       redirect_uri: redirectUri,
       state,
     });
@@ -793,11 +861,19 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     }
     const account = await one(
       `INSERT INTO marketplace_connections
-        (user_id, channel, status, display_name, shop_domain, access_token_enc, scopes, metadata, last_sync_at)
-       VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5::jsonb, now())
+        (user_id, channel, status, display_name, shop_domain, access_token_enc, scopes, metadata)
+       VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5::jsonb)
        RETURNING *`,
       [saved.user_id, shop, tokenPayload.access_token || null, String(tokenPayload.scope || '').split(',').filter(Boolean), JSON.stringify({ oauthCompletedAt: new Date().toISOString() })],
     );
+    if (account?.id) {
+      await Promise.all([
+        setSyncStatus(account.id, 'products', 'pending'),
+        setSyncStatus(account.id, 'orders', 'pending'),
+        setSyncStatus(account.id, 'customers', 'pending'),
+        setSyncStatus(account.id, 'inventory', 'pending'),
+      ]);
+    }
     await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
     await writeLedger(saved.user_id, { entityType: 'marketplace_connection', entityId: account?.id, eventType: 'connected', summary: `Shopify marketplace connected for ${shop}.` });
     return reply.redirect(`${config.frontendOrigin.replace(/\/+$/, '')}/dashboard?connected=shopify`);
@@ -875,7 +951,6 @@ export async function sqlModeRoutes(app: FastifyInstance) {
                  refresh_token_enc = COALESCE($5, refresh_token_enc),
                  token_expires_at = $6,
                  scopes = $7,
-                 last_sync_at = now(),
                  updated_at = now(),
                  metadata = metadata || $8::jsonb
              WHERE user_id = $1 AND channel = 'ebay' AND metadata->>'state' = $2
@@ -894,8 +969,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           if (!account) {
             account = await one(
               `INSERT INTO marketplace_connections
-                (user_id, channel, status, display_name, marketplace_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, metadata, last_sync_at)
-               VALUES ($1, 'ebay', 'connected', 'eBay', $2, $3, $4, $5, $6, $7::jsonb, now())
+                (user_id, channel, status, display_name, marketplace_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, metadata)
+               VALUES ($1, 'ebay', 'connected', 'eBay', $2, $3, $4, $5, $6, $7::jsonb)
                RETURNING *`,
               [
                 saved.user_id,
@@ -907,6 +982,14 @@ export async function sqlModeRoutes(app: FastifyInstance) {
                 JSON.stringify(metadata),
               ],
             );
+          }
+          if (account?.id) {
+            await Promise.all([
+              setSyncStatus(account.id, 'products', 'pending'),
+              setSyncStatus(account.id, 'orders', 'pending'),
+              setSyncStatus(account.id, 'customers', 'pending'),
+              setSyncStatus(account.id, 'inventory', 'pending'),
+            ]);
           }
           await writeLedger(saved.user_id, {
             entityType: 'marketplace_connection',
