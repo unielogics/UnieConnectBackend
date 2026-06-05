@@ -1430,9 +1430,9 @@ function chatPlural(count: number, singular: string, plural = `${singular}s`) {
 }
 
 function compactTaskLine(task: any, index: number) {
-  const action = task?.actionLabel || 'Open task';
-  const detail = task?.detail ? ` - ${task.detail}` : '';
-  return `${index}. ${task?.title || 'Cortex task'} (${action})${detail}`;
+  const title = String(task?.title || 'Review Cortex task').replace(/\.$/, '');
+  const action = task?.actionLabel ? `Open: ${task.actionLabel}` : 'Open the related screen';
+  return `${index}. ${title}. ${action}.`;
 }
 
 function scrubVendorLanguage(text: string) {
@@ -1443,12 +1443,20 @@ function scrubVendorLanguage(text: string) {
     .replace(/\bdrivers?\b/gi, 'runtime');
 }
 
+function readablePosture(value: any) {
+  const posture = String(value || '').replace(/_/g, ' ').toLowerCase();
+  if (posture === 'ready') return 'ready';
+  if (posture === 'limited') return 'partially ready';
+  if (posture === 'needs data') return 'needs more data';
+  return posture || 'not fully scored';
+}
+
 function buildLocalCortexChatFallback(message: string, context: any): {
   answer: string;
   sources: any[];
   tasks: any[];
   confidence: number;
-  readinessNotes: string;
+  readinessNotes: string | null;
 } {
   const q = String(message || '').toLowerCase();
   const readiness = context?.readiness || {};
@@ -1470,45 +1478,46 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   const wmsTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('wms'));
   const topRecommendation = recommendations[0];
   const lines: string[] = [];
-  const readinessLine = `Account readiness is ${readiness.score || 0}% with a ${String(readiness.posture || 'unknown').replace(/_/g, ' ')} posture.`;
-  const dataLine = `Data connected: ${chatPlural(skuCount, 'SKU')}, ${chatPlural(orderCount, 'order')}, ${chatPlural(chatCount(counts.marketplaceConnections), 'marketplace connection')}, ${chatPlural(warehouseCount, 'warehouse link')}, ${chatPlural(supplierCount, 'supplier')}, and ${chatPlural(labelRunCount, 'label audit run')}.`;
+  const readinessLine = `Readiness: ${readiness.score || 0}% (${readablePosture(readiness.posture)}).`;
+  const dataLine = `Connected data: ${chatPlural(skuCount, 'SKU')}, ${chatPlural(orderCount, 'order')}, ${chatPlural(chatCount(counts.marketplaceConnections), 'marketplace connection')}, ${chatPlural(warehouseCount, 'warehouse link')}, ${chatPlural(supplierCount, 'supplier')}, and ${chatPlural(labelRunCount, 'label audit run')}.`;
   const gaps = [
     chatCount(counts.missingDimensions) ? `${chatPlural(chatCount(counts.missingDimensions), 'SKU')} missing dimensions or weight` : null,
     chatCount(counts.missingCost) ? `${chatPlural(chatCount(counts.missingCost), 'SKU')} missing cost data` : null,
     !warehouseCount ? 'no connected warehouse or WMS truth' : null,
     chatCount(counts.amazonBlockedItems) ? `${chatPlural(chatCount(counts.amazonBlockedItems), 'Amazon SKU')} blocked for listing/FBA readiness` : null,
   ].filter(Boolean);
-  const gapLine = gaps.length ? `Main gaps: ${gaps.join('; ')}.` : 'Main gaps: none blocking the core intelligence path right now.';
+  const gapLine = gaps.length ? `What is holding it back: ${gaps.join('; ')}.` : 'Nothing major is blocking the core intelligence path right now.';
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
+  const actionIntent = q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
 
   if (q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next')) {
-    lines.push(`Here is the fastest path to get the account moving.\n\n${readinessLine}\n${gapLine}`);
+    lines.push('The fastest path is to improve the data that controls execution quality, then run optimization again.');
     if (nextSteps.length) lines.push(`Do these next:\n${nextSteps.join('\n')}`);
     else lines.push('Do this next:\n1. Connect a marketplace or upload product/order CSV data.\n2. Enrich SKU weight, dimensions, cost, and selling price.\n3. Connect warehouse/WMS truth before physical execution.');
-    if (chatCount(counts.marketplaceConnections) > 0) lines.push('The marketplace feed is already present, so the next lift is operational quality: SKU enrichment, warehouse truth, and cost evidence.');
+    lines.push(`${readinessLine} ${gapLine}`);
+    if (chatCount(counts.marketplaceConnections) > 0) lines.push('The marketplace feed is present, so the next lift is SKU enrichment, warehouse truth, and cost evidence.');
     if (topRecommendation) lines.push(`Most relevant Cortex signal: ${topRecommendation.title}.`);
   } else if (q.includes('blocking') || q.includes('confidence') || q.includes('missing')) {
-    lines.push(`${readinessLine}\n${gapLine}`);
-    lines.push(`The biggest blockers are ${highTasks.length || sortedTasks.length} open ${highTasks.length ? 'high-priority' : 'readiness'} item${(highTasks.length || sortedTasks.length) === 1 ? '' : 's'}.`);
+    lines.push(gapLine);
+    lines.push(`${readinessLine} The biggest blockers are ${highTasks.length || sortedTasks.length} open ${highTasks.length ? 'high-priority' : 'readiness'} item${(highTasks.length || sortedTasks.length) === 1 ? '' : 's'}.`);
     if (nextSteps.length) lines.push(`Work queue:\n${nextSteps.join('\n')}`);
-    lines.push('Why it matters: Cortex can only approve or automate concrete changes when the recommendation is traceable to real inventory, cost, demand, warehouse, and service data.');
+    lines.push('Why it matters: Cortex should only approve or automate concrete changes when the recommendation is traceable to real inventory, cost, demand, warehouse, and service data.');
   } else if (q.includes('opportunity') || q.includes('optimized') || q.includes('optimization')) {
-    lines.push(readinessLine);
     if (topRecommendation) {
       lines.push(`The clearest current Cortex opportunity is ${topRecommendation.title}.`);
       if (topRecommendation.summary) lines.push(topRecommendation.summary);
-      lines.push('Decision rule: show Accept/Deny only for measurable inventory, cost, revenue, service, or fulfillment impact. Readiness gaps should remain tasks, not approval decisions.');
+      lines.push(`${readinessLine} Accept/Deny belongs only on measurable inventory, cost, revenue, service, or fulfillment changes. Readiness gaps should remain tasks, not approval decisions.`);
     } else {
-      lines.push('I do not see a concrete current-vs-optimized decision yet. Finish the readiness blockers first so Cortex can produce traceable financial or inventory impact.');
+      lines.push(`I do not see a concrete current-vs-optimized decision yet. ${readinessLine} Finish the readiness blockers first so Cortex can produce traceable financial or inventory impact.`);
     }
   } else if (q.includes('summarize') || q.includes('happening') || q.includes('account') || q.includes('status')) {
-    lines.push(`Here is what is happening in this account.\n\n${readinessLine}\n${dataLine}\n${gapLine}`);
-    if (nextSteps.length) lines.push(`Next best actions:\n${nextSteps.join('\n')}`);
+    lines.push(`Here is the account snapshot.\n\n${dataLine}\n${readinessLine} ${gapLine}`);
+    if (nextSteps.length) lines.push(`Next best actions are available in the task inbox. The top one is: ${sortedTasks[0]?.title || 'review Cortex tasks'}.`);
     if (recommendations[0]) lines.push(`Latest Cortex signal: ${recommendations[0].title}.`);
     if (!warehouseCount && wmsTask) lines.push('The main operational layer still missing is warehouse/WMS truth, so physical execution should stay gated until that is connected.');
   } else {
-    lines.push(`${readinessLine}\n${dataLine}\n${gapLine}`);
-    if (nextSteps.length) lines.push(`Suggested next actions:\n${nextSteps.join('\n')}`);
+    lines.push(`${dataLine}\n${readinessLine} ${gapLine}`);
+    if (actionIntent && nextSteps.length) lines.push(`Suggested next actions:\n${nextSteps.join('\n')}`);
     if (recommendations[0]) lines.push(`Latest Cortex signal: ${recommendations[0].title}.`);
   }
 
@@ -1520,9 +1529,9 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
     ],
-    tasks: sortedTasks.slice(0, 5).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel })),
+    tasks: actionIntent ? sortedTasks.slice(0, 3).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel })) : [],
     confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
-    readinessNotes: 'Answer generated from this account’s scoped OMS data.',
+    readinessNotes: null,
   };
 }
 
