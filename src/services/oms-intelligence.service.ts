@@ -1156,22 +1156,41 @@ export async function getScreenIntelligenceContext(userId: string, screen: strin
     getRecommendations(userId, { screen, limit: 5, status: 'open' }),
   ]);
   const top = recommendations.recommendations[0];
+  const counts = readiness.counts || {};
+  const screenLabel = String(screen || 'command').replace(/-/g, ' ');
+  const defaultPrompts = [
+    'What should I work on next?',
+    'Which data is blocking higher confidence?',
+    'What current vs optimized decision is ready?',
+  ];
+  const promptMap: Record<string, string[]> = {
+    command: ['Summarize what is happening in my account', 'What should I work on next?', 'What current vs optimized decision is ready?'],
+    skus: ['Which SKUs need enrichment first?', 'What product data is blocking Cortex confidence?', 'Which SKUs have listing or warehouse-fit opportunities?'],
+    'sku-detail': ['What is missing from this SKU?', 'What can improve this SKU margin or fulfillment?', 'Is this SKU ready for Amazon listing?'],
+    orders: ['Which orders need fulfillment attention?', 'What can improve service speed?', 'Are there order issues Cortex can safely route?'],
+    shipments: ['What is blocking shipment planning?', 'Which supplier or WMS data is missing?', 'What inbound plan can be optimized?'],
+    warehouses: ['Which warehouse needs attention?', 'What inventory or WMS truth is missing?', 'How should warehouse coverage improve?'],
+    labels: ['Which labels should be audited first?', 'What refund evidence is missing?', 'Where are carrier costs leaking?'],
+    billing: ['Where am I losing margin?', 'Which costs need invoice evidence?', 'What billing decision is ready to approve?'],
+    suppliers: ['Which suppliers need pickup profiles?', 'What supplier data blocks execution?', 'Which supplier should I work on next?'],
+    'product-research': ['Research a single product', 'What CSV should I upload next?', 'Which product fields are missing most often?'],
+    marketplace: ['Which apps should be installed?', 'What is gated until activation?', 'Which connection unlocks the most value?'],
+    connections: ['Which connection should I add next?', 'Is Cortex available for this account?', 'Which services are system managed?'],
+    double: ['What changed from current to optimized?', 'Which approval has measurable impact?', 'What can be automated after approval?'],
+  };
+  const baseSummary = `On ${screenLabel}, Cortex sees ${readiness.score}% readiness with ${number(counts.catalogItems)} SKUs, ${number(counts.orders)} orders, ${number(counts.wmsLinks)} warehouse links, and ${number(counts.marketplaceConnections)} marketplace connections.`;
   return {
     screen,
     posture: readiness.posture,
     readiness,
     summary: top
-      ? `${top.title}: ${top.summary}`
+      ? `${baseSummary} Current signal: ${top.title}. ${top.summary}`
       : latest.latest
-        ? `Latest Seller Optimization is available with ${readiness.primarySource.replace(/_/g, ' ')} as the primary source.`
-        : 'Run Seller Optimization to generate current-vs-optimized intelligence for this screen.',
+        ? `${baseSummary} Latest Seller Optimization is available with ${readiness.primarySource.replace(/_/g, ' ')} as the primary source.`
+        : `${baseSummary} Run Seller Optimization to generate current-vs-optimized intelligence for this screen.`,
     latestOptimization: latest.latest,
     recommendations: recommendations.recommendations,
-    recommendedPrompts: [
-      'What is the biggest current vs optimized opportunity?',
-      'Which data is blocking higher confidence?',
-      'What action can be safely automated?',
-    ],
+    recommendedPrompts: promptMap[String(screen || 'command')] || defaultPrompts,
   };
 }
 
