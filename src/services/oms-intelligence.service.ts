@@ -1391,11 +1391,11 @@ export async function dismissCortexTask(userId: string, taskId: string) {
   return row ? mapCortexTask(row) : null;
 }
 
-async function getAccountOmsContextBundle(userId: string, screen: string) {
+async function getAccountOmsContextBundle(userId: string, screen: string, options: { refreshTasks?: boolean } = {}) {
   const [readiness, recommendations, tasksRes, ledger, skus, orders, warehouses, suppliers, labelRuns] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { screen, status: 'open', limit: 10 }),
-    getCortexTasks(userId, { status: 'open', limit: 20 }),
+    getCortexTasks(userId, { status: 'open', limit: 20, refresh: options.refreshTasks }),
     rows(`SELECT entity_type, entity_id, event_type, source_system, summary, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]).catch(() => []),
     rows(`SELECT id, sku, title, weight, dimensions, attributes, metadata, wms_inventory FROM catalog_items WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, order_number, channel, status, total, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
@@ -1567,7 +1567,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     [userId, thread?.id, message],
   );
 
-  const context = await getAccountOmsContextBundle(userId, screen);
+  const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
