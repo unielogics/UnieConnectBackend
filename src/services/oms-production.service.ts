@@ -25,6 +25,38 @@ const money = (value: unknown) => {
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 
+function sumSelectedQuantity(items: unknown): number {
+  if (!Array.isArray(items)) return 0;
+  return items.reduce((sum, item: any) => sum + number(item?.quantity ?? item?.qty ?? item?.units, 0), 0);
+}
+
+function extractPlanArray(plan: any, ...keys: string[]) {
+  for (const key of keys) {
+    const value = plan?.[key] ?? plan?.planning?.[key] ?? plan?.monthly_replenishment_plan_v1?.[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+
+function buildOmsDecisionContext(plan: any) {
+  return {
+    expectedQuantities: {
+      forecast_horizon_months: plan?.forecastHorizonMonths ?? plan?.forecast_horizon_months ?? null,
+      planned_sku_count: Array.isArray(plan?.skuRecommendations) ? plan.skuRecommendations.length : null,
+      planned_lane_count: extractPlanArray(plan, 'warehouse_transfer_plan', 'transfer_lanes', 'lanes').length,
+    },
+    expectedSavings: plan?.savings || plan?.optimizedMetrics?.savings || {},
+    expectedServiceImpact: {
+      current: plan?.currentMetrics?.service || plan?.currentMetrics?.delivery || null,
+      optimized: plan?.optimizedMetrics?.service || plan?.optimizedMetrics?.delivery || null,
+      impact: plan?.serviceImpact || plan?.optimizedMetrics?.serviceImpact || null,
+    },
+    warehousePlan: plan?.warehousePlan || plan?.inventoryPlan || plan?.regionalPlan || extractPlanArray(plan, 'warehouse_transfer_plan', 'transfer_lanes', 'lanes'),
+    skuPlan: plan?.skuPlan || plan?.skuRecommendations || [],
+    lanePlan: extractPlanArray(plan, 'warehouse_transfer_plan', 'transfer_lanes', 'lanes'),
+  };
+}
+
 function supplierPickupProfile(row: Row) {
   const metadata = json(row.metadata, {});
   const address = json(row.address, {});
@@ -539,10 +571,15 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
     confidence: 0.93,
   });
 
+  const decisionContext = buildOmsDecisionContext(plan);
   const cortex = await postCortex('/v1/oms/business-double/approved', {
     userId,
+    recommendationId: planId,
     planId: stored?.id || planId,
     plan,
+    ...decisionContext,
+    approvalActor: approvedBy || userId,
+    decisionLifecycle: 'approved',
     approvedAt: new Date().toISOString(),
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
 
@@ -1328,9 +1365,23 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
   const cortex = await postCortex('/v1/oms/shipment/projected', {
     userId,
     draftId,
+    shipmentPlanId: plan?.id || null,
+    asnId: asn?.id || null,
     projectedPlan: plan,
     asn,
     selectedItems,
+    expectedQuantities: {
+      planned_quantity: sumSelectedQuantity(selectedItems),
+      selected_item_count: Array.isArray(selectedItems) ? selectedItems.length : 0,
+    },
+    warehousePlan: {
+      facility_id: facility?.id || null,
+      facility_name: facility?.name || null,
+      hidden_from_client: true,
+      requires_wms_truth: true,
+    },
+    skuPlan: selectedItems,
+    decisionLifecycle: 'waiting_for_wms_truth',
     requiresBol: body?.requiresBol !== false,
     requiresLabels: Boolean(body?.requiresLabels),
     supplierPickupProfile: supplierPickup,

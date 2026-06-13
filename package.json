@@ -9,7 +9,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "migrate:oms-postgres": "ts-node scripts/migrate-oms-postgres.ts"
+    "migrate:oms-postgres": "ts-node scripts/migrate-oms-postgres.ts",
+    "backfill:cortex-credentials": "ts-node scripts/backfill-cortex-credentials.ts"
   },
   "keywords": [],
   "author": "",
