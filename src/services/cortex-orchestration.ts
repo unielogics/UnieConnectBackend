@@ -17,6 +17,7 @@ type CortexPostOptions = {
   userId?: string | null;
   idempotencyKey?: string;
   extraHeaders?: Record<string, string>;
+  allowGlobalApiKey?: boolean;
 };
 
 function deriveCortexUserId(payload: any, options?: CortexPostOptions): string | null {
@@ -102,12 +103,12 @@ export async function postCortex(path: string, payload: any, options: CortexPost
     ? await getCortexCredentialHeaders(userId).catch(() => null)
     : null;
 
-  if (!credentialHeaders && !config.cortex.apiKey) {
+  if (!credentialHeaders && (!options.allowGlobalApiKey || !config.cortex.apiKey)) {
     return {
       ok: false,
       status: 503,
       data: {
-        error: 'No tenant Cortex credential or CORTEX_API_KEY is configured on UnieConnect',
+        error: 'No active tenant Cortex credential is configured on UnieConnect',
         path,
         userId,
       },
