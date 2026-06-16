@@ -635,6 +635,12 @@ function wmsBillingAddress(address: AnyRow | null | undefined) {
   };
 }
 
+function wmsExternalOmsObjectId(userId: string) {
+  const normalized = trim(userId);
+  if (/^[a-f0-9]{24}$/i.test(normalized)) return normalized.toLowerCase();
+  return createHash('sha1').update(`unieconnect:app_user:${normalized}`).digest('hex').slice(0, 24);
+}
+
 async function buildWmsOmsProfile(userId: string) {
   const user = await one(
     `SELECT id, email, first_name, last_name, phone, llc_name, billing_address
@@ -669,7 +675,7 @@ async function buildWmsOmsProfile(userId: string) {
 
   return {
     profile: {
-      omsIntermediaryId: userId,
+      omsIntermediaryId: wmsExternalOmsObjectId(userId),
       omsCompanyName: llcName || [firstName, lastName].filter(Boolean).join(' ') || email || `OMS ${userId}`,
       omsFirstName: firstName,
       omsLastName: lastName,
@@ -2410,15 +2416,18 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.post('/oms/connect', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const code = trim(req.body?.connectionCode || req.body?.warehouseCode);
+    const code = trim(req.body?.connectionCode || req.body?.warehouseCode).toUpperCase();
     if (!code) return reply.code(400).send({ error: 'connectionCode required' });
     const { profile, missing } = await buildWmsOmsProfile(userId);
-    if (!profile || missing.length > 0) {
+    if (!profile) {
       return reply.code(400).send({
-        error: 'profile_incomplete',
-        message: 'Complete your OMS company profile before connecting a warehouse.',
+        error: 'profile_not_found',
+        message: 'Could not find the current OMS user profile.',
         missingFields: missing,
       });
+    }
+    if (missing.length > 0) {
+      req.log?.warn?.({ userId, missing }, 'OMS-WMS connect proceeding with incomplete OMS profile');
     }
 
     try {
@@ -2517,6 +2526,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
             connectedAt: new Date().toISOString(),
             wmsIntermediaryId,
             wmsOmsIntermediaryId,
+            profileMissingFields: missing,
             wmsCredentialClientId: credentialResponse.clientId,
           }),
         ],
