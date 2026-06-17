@@ -806,6 +806,32 @@ async function syncOmsCatalogToWms(params: {
   });
 }
 
+async function syncOmsCatalogToConnectedWms(userId: string, log?: any) {
+  const links = await rows(
+    `SELECT warehouse_code, metadata
+     FROM oms_warehouse_links
+     WHERE user_id = $1 AND status = 'connected'
+     ORDER BY connected_at DESC NULLS LAST, updated_at DESC NULLS LAST`,
+    [userId],
+  ).catch((err: any) => {
+    log?.warn?.({ err, userId }, 'OMS catalog sync skipped because connected WMS links could not be loaded');
+    return [];
+  });
+
+  const results = [];
+  for (const link of links) {
+    const metadata = json(link.metadata, {});
+    const warehouseCode = trim(link.warehouse_code);
+    const wmsIntermediaryId = trim(metadata.wmsIntermediaryId || metadata.wms_intermediary_id);
+    if (!warehouseCode || !wmsIntermediaryId) {
+      results.push({ warehouseCode, success: false, skipped: 'missing_wms_intermediary_id' });
+      continue;
+    }
+    results.push(await syncOmsCatalogToWms({ userId, warehouseCode, wmsIntermediaryId, log }));
+  }
+  return results;
+}
+
 const DEFAULT_WMS_BRIDGE_SCOPES = [
   'inventory:read',
   'inventory:update',
@@ -1426,6 +1452,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         ],
       );
       await writeLedger(userId, { entityType: 'catalog_item', entityId: item?.id, eventType: 'created', summary: `Catalog item ${trim(body.sku)} created in Aurora.` });
+      syncOmsCatalogToConnectedWms(userId, req.log).catch((err: any) =>
+        req.log?.warn?.({ err, userId, itemId: item?.id }, 'OMS item create WMS catalog sync failed'),
+      );
       return mapItem(item || {});
     } catch (err: any) {
       req.log.error({ err }, 'failed to create SQL item');
@@ -1524,6 +1553,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     );
     if (!item) return reply.code(404).send({ error: 'Not found' });
     await writeLedger(userId, { entityType: 'catalog_item', entityId: item.id, eventType: 'updated', summary: `Catalog item ${item.sku} updated.` });
+    syncOmsCatalogToConnectedWms(userId, req.log).catch((err: any) =>
+      req.log?.warn?.({ err, userId, itemId: item?.id }, 'OMS item update WMS catalog sync failed'),
+    );
     return mapItem(item);
   });
 
@@ -1830,6 +1862,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
        VALUES ($1, $2, $3, $4, COALESCE($5, 'active'), $6::jsonb, $7::jsonb) RETURNING *`,
       [userId, trim(body.name), normalizedEmail(body.email) || null, body.phone || null, body.status || 'active', JSON.stringify(body.address || {}), JSON.stringify(metadata)],
     );
+    syncOmsCatalogToConnectedWms(userId, req.log).catch((err: any) =>
+      req.log?.warn?.({ err, userId, supplierId: supplier?.id }, 'OMS supplier create WMS catalog sync failed'),
+    );
     return mapSupplier(supplier || {});
   });
 
@@ -1880,6 +1915,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       [req.params.id, userId, body.name ?? null, body.email === undefined ? null : normalizedEmail(body.email), body.phone ?? null, body.status ?? null, body.address === undefined ? null : JSON.stringify(body.address || {}), metadata === null ? null : JSON.stringify(metadata)],
     );
     if (!supplier) return reply.code(404).send({ error: 'Not found' });
+    syncOmsCatalogToConnectedWms(userId, req.log).catch((err: any) =>
+      req.log?.warn?.({ err, userId, supplierId: supplier?.id }, 'OMS supplier update WMS catalog sync failed'),
+    );
     return mapSupplier(supplier);
   });
 
