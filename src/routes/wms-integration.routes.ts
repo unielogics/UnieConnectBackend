@@ -121,6 +121,310 @@ async function applyInventorySnapshot(params: {
   return { received: rows.length, applied, unmatched };
 }
 
+function bodyPayload(body: any): any {
+  return body?.payload && typeof body.payload === 'object' ? body.payload : body || {};
+}
+
+function textValue(...values: unknown[]): string | null {
+  for (const value of values) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+function wmsMetadata(body: any, warehouseCode: string) {
+  const payload = bodyPayload(body);
+  return {
+    source: 'wms',
+    sourceSystem: 'uniewms',
+    warehouseCode,
+    wmsEntityId: String(body.entityId || body.entity_id || payload.id || payload._id || ''),
+    wmsIntermediaryId: body.wmsIntermediaryId || body.wms_intermediary_id || null,
+    externalReference: body.externalReference || payload.sku || payload.orderNumber || payload.asnNumber || payload.vendorNumber || payload.customerNumber || null,
+    operation: body.operation || null,
+    lastWmsSyncAt: new Date().toISOString(),
+    raw: payload,
+  };
+}
+
+async function upsertWmsItem(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const sku = textValue(payload.sku, body.externalReference);
+  if (!sku) return { skipped: true, reason: 'missing_sku' };
+  const metadata = wmsMetadata(body, warehouseCode);
+  const archived = body.operation === 'archived' || payload.archived === true || payload.status === 'archived';
+  const dimensions = payload.dimensions || {
+    length: payload.length,
+    width: payload.width,
+    height: payload.height,
+  };
+  const result = await pgQuery(
+    `INSERT INTO catalog_items
+      (user_id, sku, title, description, image, images, upc, ean, asin, category, sub_category, lob, weight, dimensions, archived, metadata)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16::jsonb)
+     ON CONFLICT (user_id, sku) DO UPDATE SET
+      title = EXCLUDED.title,
+      description = COALESCE(EXCLUDED.description, catalog_items.description),
+      image = COALESCE(EXCLUDED.image, catalog_items.image),
+      images = CASE WHEN jsonb_array_length(EXCLUDED.images) > 0 THEN EXCLUDED.images ELSE catalog_items.images END,
+      upc = COALESCE(EXCLUDED.upc, catalog_items.upc),
+      ean = COALESCE(EXCLUDED.ean, catalog_items.ean),
+      asin = COALESCE(EXCLUDED.asin, catalog_items.asin),
+      category = COALESCE(EXCLUDED.category, catalog_items.category),
+      sub_category = COALESCE(EXCLUDED.sub_category, catalog_items.sub_category),
+      lob = COALESCE(EXCLUDED.lob, catalog_items.lob),
+      weight = COALESCE(EXCLUDED.weight, catalog_items.weight),
+      dimensions = CASE WHEN EXCLUDED.dimensions <> '{}'::jsonb THEN EXCLUDED.dimensions ELSE catalog_items.dimensions END,
+      archived = EXCLUDED.archived,
+      metadata = catalog_items.metadata || EXCLUDED.metadata,
+      updated_at = now()
+     RETURNING id`,
+    [
+      userId,
+      sku,
+      textValue(payload.title, payload.itemName, payload.name, sku),
+      textValue(payload.description, payload.itemDescription),
+      textValue(payload.image),
+      JSON.stringify(Array.isArray(payload.images) ? payload.images : payload.image ? [payload.image] : []),
+      textValue(payload.upc),
+      textValue(payload.ean),
+      textValue(payload.asin),
+      textValue(payload.category),
+      textValue(payload.subCategory, payload.sub_category),
+      textValue(payload.lob, payload.productType),
+      payload.weight ? Number(payload.weight) : null,
+      JSON.stringify(dimensions || {}),
+      archived,
+      JSON.stringify(metadata),
+    ],
+  );
+  return { upserted: result?.rows?.[0]?.id || null };
+}
+
+async function upsertWmsSupplier(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const name = textValue(payload.name, `${payload.firstName || ''} ${payload.lastName || ''}`, payload.vendorNumber, body.externalReference);
+  if (!name) return { skipped: true, reason: 'missing_supplier_name' };
+  const metadata = wmsMetadata(body, warehouseCode);
+  const existing = await pgQuery(
+    `SELECT id FROM suppliers
+     WHERE user_id = $1
+       AND (metadata->>'wmsEntityId' = $2 OR metadata->>'externalReference' = $3)
+     LIMIT 1`,
+    [userId, metadata.wmsEntityId, String(metadata.externalReference || '')],
+  );
+  const address = {
+    addressLine1: payload.addressLine1,
+    addressLine2: payload.addressLine2,
+    city: payload.city,
+    state: payload.state,
+    zipCode: payload.zipCode,
+    country: payload.country,
+  };
+  if (existing?.rows?.[0]?.id) {
+    await pgQuery(
+      `UPDATE suppliers
+       SET name=$3, email=$4, phone=$5, status=$6, address=$7::jsonb, metadata=metadata || $8::jsonb, updated_at=now()
+       WHERE user_id=$1 AND id=$2`,
+      [userId, existing.rows[0].id, name, textValue(payload.email), textValue(payload.phone), textValue(payload.status) || 'active', JSON.stringify(address), JSON.stringify(metadata)],
+    );
+    return { upserted: existing.rows[0].id };
+  }
+  const inserted = await pgQuery(
+    `INSERT INTO suppliers (user_id, name, email, phone, status, address, metadata)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)
+     RETURNING id`,
+    [userId, name, textValue(payload.email), textValue(payload.phone), textValue(payload.status) || 'active', JSON.stringify(address), JSON.stringify(metadata)],
+  );
+  return { upserted: inserted?.rows?.[0]?.id || null };
+}
+
+async function upsertWmsCustomer(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const name = textValue(payload.name, `${payload.firstName || ''} ${payload.lastName || ''}`, payload.customerNumber, body.externalReference);
+  const metadata = wmsMetadata(body, warehouseCode);
+  const externalCustomerId = metadata.wmsEntityId || String(body.entityId || '');
+  if (!name && !externalCustomerId) return { skipped: true, reason: 'missing_customer_identity' };
+  const address = {
+    addressLine1: payload.addressLine1,
+    addressLine2: payload.addressLine2,
+    city: payload.city,
+    state: payload.state,
+    zipCode: payload.zipCode,
+    country: payload.country,
+  };
+  const existing = await pgQuery('SELECT id FROM customers WHERE user_id=$1 AND external_customer_id=$2 LIMIT 1', [userId, externalCustomerId]);
+  if (existing?.rows?.[0]?.id) {
+    await pgQuery(
+      `UPDATE customers
+       SET name=$3, email=$4, phone=$5, company=$6, addresses=$7::jsonb, metadata=metadata || $8::jsonb, updated_at=now()
+       WHERE user_id=$1 AND id=$2`,
+      [userId, existing.rows[0].id, name, textValue(payload.email), textValue(payload.phone), textValue(payload.company), JSON.stringify([address]), JSON.stringify(metadata)],
+    );
+    return { upserted: existing.rows[0].id };
+  }
+  const result = await pgQuery(
+    `INSERT INTO customers (user_id, name, email, phone, company, channel, external_customer_id, addresses, metadata)
+     VALUES ($1,$2,$3,$4,$5,'wms',$6,$7::jsonb,$8::jsonb)
+     RETURNING id`,
+    [userId, name, textValue(payload.email), textValue(payload.phone), textValue(payload.company), externalCustomerId, JSON.stringify([address]), JSON.stringify(metadata)],
+  );
+  return { upserted: result?.rows?.[0]?.id || null };
+}
+
+async function upsertWmsOrder(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const externalOrderId = String(body.entityId || payload.id || payload._id || '');
+  const orderNumber = textValue(payload.orderNumber, payload.alternativeOrderNumber, body.externalReference, externalOrderId);
+  if (!externalOrderId && !orderNumber) return { skipped: true, reason: 'missing_order_identity' };
+  const metadata = wmsMetadata(body, warehouseCode);
+  const existing = await pgQuery(
+    `SELECT id FROM orders WHERE user_id=$1 AND (external_order_id=$2 OR order_number=$3) LIMIT 1`,
+    [userId, externalOrderId, orderNumber],
+  );
+  const totals = payload.totals || {
+    quantity: payload.totalQuantity,
+    value: payload.totalValue,
+  };
+  const params = [
+    userId,
+    existing?.rows?.[0]?.id || null,
+    externalOrderId,
+    orderNumber,
+    textValue(payload.status) || 'open',
+    JSON.stringify(totals || {}),
+    JSON.stringify(payload.shipping?.address || payload.shippingAddress || {}),
+    textValue(payload.trackingNumber, payload.shipping?.trackingNumber),
+    JSON.stringify(metadata),
+  ];
+  let orderId = existing?.rows?.[0]?.id;
+  if (orderId) {
+    await pgQuery(
+      `UPDATE orders
+       SET external_order_id=$3, order_number=$4, status=$5, totals=$6::jsonb, shipping_address=$7::jsonb, tracking_number=$8, metadata=metadata || $9::jsonb, updated_at=now()
+       WHERE user_id=$1 AND id=$2`,
+      params,
+    );
+  } else {
+    const inserted = await pgQuery(
+      `INSERT INTO orders (user_id, channel, external_order_id, order_number, status, totals, shipping_address, tracking_number, metadata)
+       VALUES ($1,'wms',$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9::jsonb)
+       RETURNING id`,
+      params,
+    );
+    orderId = inserted?.rows?.[0]?.id;
+  }
+  if (orderId && Array.isArray(payload.lineItems)) {
+    await pgQuery('DELETE FROM order_lines WHERE user_id=$1 AND order_id=$2', [userId, orderId]);
+    for (const line of payload.lineItems) {
+      await pgQuery(
+        `INSERT INTO order_lines (user_id, order_id, sku, title, quantity, unit_price, total_price, metadata)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+        [
+          userId,
+          orderId,
+          textValue(line.sku),
+          textValue(line.itemName, line.title, line.sku),
+          Number(line.quantity || 0),
+          Number(line.unitPrice || 0),
+          Number(line.totalPrice || (Number(line.quantity || 0) * Number(line.unitPrice || 0))),
+          JSON.stringify({ source: 'wms', raw: line }),
+        ],
+      );
+    }
+  }
+  return { upserted: orderId || null };
+}
+
+async function upsertWmsAsn(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const metadata = wmsMetadata(body, warehouseCode);
+  const externalId = String(body.entityId || payload.id || payload._id || '');
+  const asnNumber = textValue(payload.asnNumber, body.externalReference, payload.poNumber, externalId);
+  if (!externalId && !asnNumber) return { skipped: true, reason: 'missing_asn_identity' };
+  const existing = await pgQuery(
+    `SELECT id FROM asns WHERE user_id=$1 AND (payload->>'wmsEntityId'=$2 OR asn_number=$3) LIMIT 1`,
+    [userId, externalId, asnNumber],
+  );
+  const asnPayload = { ...payload, ...metadata };
+  if (existing?.rows?.[0]?.id) {
+    await pgQuery(
+      `UPDATE asns
+       SET asn_number=$3, status=$4, payload=$5::jsonb, updated_at=now()
+       WHERE user_id=$1 AND id=$2`,
+      [userId, existing.rows[0].id, asnNumber, textValue(payload.status) || body.operation || 'created', JSON.stringify(asnPayload)],
+    );
+    return { upserted: existing.rows[0].id };
+  }
+  const inserted = await pgQuery(
+    `INSERT INTO asns (user_id, asn_number, status, payload)
+     VALUES ($1,$2,$3,$4::jsonb)
+     RETURNING id`,
+    [userId, asnNumber, textValue(payload.status) || body.operation || 'created', JSON.stringify(asnPayload)],
+  );
+  return { upserted: inserted?.rows?.[0]?.id || null };
+}
+
+async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const metadata = wmsMetadata(body, warehouseCode);
+  const externalId = String(body.entityId || payload.id || payload._id || '');
+  const invoiceNumber = textValue(payload.invoiceNumber, body.externalReference, externalId);
+  if (!externalId && !invoiceNumber) return { skipped: true, reason: 'missing_invoice_identity' };
+  const existing = await pgQuery(
+    `SELECT id FROM invoice_lines
+     WHERE user_id=$1
+       AND (payload->>'wmsEntityId'=$2 OR invoice_id=$3)
+     LIMIT 1`,
+    [userId, externalId, invoiceNumber],
+  );
+  const total = Number(payload?.totals?.total || payload?.total || payload?.amount || 0);
+  const invoicePayload = { ...payload, ...metadata };
+  if (existing?.rows?.[0]?.id) {
+    await pgQuery(
+      `UPDATE invoice_lines
+       SET description=$3, amount=$4, status=$5, payload=$6::jsonb, updated_at=now()
+       WHERE user_id=$1 AND id=$2`,
+      [
+        userId,
+        existing.rows[0].id,
+        `WMS invoice ${invoiceNumber || externalId}`,
+        total,
+        textValue(payload.status, body.operation) || 'open',
+        JSON.stringify(invoicePayload),
+      ],
+    );
+    return { upserted: existing.rows[0].id };
+  }
+  const inserted = await pgQuery(
+    `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, status, payload)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+     RETURNING id`,
+    [
+      userId,
+      invoiceNumber || externalId,
+      `WMS invoice ${invoiceNumber || externalId}`,
+      total,
+      textValue(payload.status, body.operation) || 'open',
+      JSON.stringify(invoicePayload),
+    ],
+  );
+  return { upserted: inserted?.rows?.[0]?.id || null };
+}
+
+async function applyEntityEvent(params: { userId: string; warehouseCode: string; body: any }) {
+  const entityType = String(params.body.entityType || params.body.entity_type || '').toLowerCase();
+  if (!['entity_upsert', 'entity_status', 'entity_archive'].includes(String(params.body.eventType || ''))) return null;
+  if (entityType === 'item' || entityType === 'catalog_item') return upsertWmsItem(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'supplier' || entityType === 'vendor') return upsertWmsSupplier(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'customer') return upsertWmsCustomer(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'order') return upsertWmsOrder(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'asn') return upsertWmsAsn(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'invoice') return upsertWmsInvoice(params.userId, params.warehouseCode, params.body);
+  return { skipped: true, reason: `unsupported_entity_type:${entityType}` };
+}
+
 async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
   const credential = await verifyWmsCallback(req, reply);
   if (!credential) return;
@@ -164,6 +468,14 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
         body,
       })
     : null;
+  const entityApplied = await applyEntityEvent({
+    userId: String(credential.user_id),
+    warehouseCode,
+    body: {
+      ...body,
+      eventType,
+    },
+  });
 
   await pgQuery(
     `INSERT INTO oms_execution_ledger
@@ -179,7 +491,7 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
     ],
   );
 
-  return reply.code(202).send({ accepted: true, event: event?.rows[0] || null, inventoryApplied });
+  return reply.code(202).send({ accepted: true, event: event?.rows[0] || null, inventoryApplied, entityApplied });
 }
 
 export async function wmsIntegrationRoutes(app: FastifyInstance) {
