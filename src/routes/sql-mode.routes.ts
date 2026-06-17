@@ -2427,7 +2427,13 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       });
     }
     if (missing.length > 0) {
-      req.log?.warn?.({ userId, missing }, 'OMS-WMS connect proceeding with incomplete OMS profile');
+      req.log?.warn?.({ userId, missing }, 'OMS-WMS connect blocked by incomplete OMS profile');
+      return reply.code(400).send({
+        error: 'profile_incomplete',
+        message:
+          'Complete your OMS profile before connecting a warehouse. WMS requires first name, last name, email, phone, LLC name, and full billing address.',
+        missingFields: missing,
+      });
     }
 
     try {

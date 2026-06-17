@@ -73,13 +73,16 @@ export async function authRoutes(fastify: FastifyInstance) {
     return user;
   });
 
-  fastify.patch('/auth/me', async (req: any, reply) => {
+  const updateCurrentUser = async (req: any, reply: any) => {
     const userId = req.user?.userId;
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const updated = await updateSqlUserProfile(String(userId), req.body || {});
     if (!updated) return reply.code(401).send({ error: 'User not found' });
     return updated;
-  });
+  };
+
+  fastify.patch('/auth/me', updateCurrentUser);
+  fastify.post('/auth/me', updateCurrentUser);
 
   fastify.post('/auth/login', async (req: any, reply) => {
     const { email, password } = req.body || {};
@@ -105,7 +108,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     return { success: true };
   });
 
-  fastify.post('/auth/change-password', async (req: any, reply) => {
+  const updateCurrentUserPassword = async (req: any, reply: any) => {
     const userId = req.user?.userId;
     const { oldPassword, newPassword } = req.body || {};
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
@@ -113,7 +116,10 @@ export async function authRoutes(fastify: FastifyInstance) {
     const result = await changeSqlUserPassword(String(userId), String(oldPassword), String(newPassword));
     if (!result.ok) return reply.code(result.status).send({ error: 'Invalid credentials' });
     return { success: true };
-  });
+  };
+
+  fastify.post('/auth/change-password', updateCurrentUserPassword);
+  fastify.patch('/auth/change-password', updateCurrentUserPassword);
 
   fastify.get('/auth/invite/validate', async (req: any) => {
     const token = String(req.query?.token || '').trim();
