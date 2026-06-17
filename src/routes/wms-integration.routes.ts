@@ -1,4 +1,5 @@
 import { FastifyInstance } from 'fastify';
+import { randomBytes } from 'crypto';
 import { config } from '../config/env';
 import { pgQuery } from '../db/postgres';
 import {
@@ -25,6 +26,33 @@ async function requireInternalOrUser(req: any, reply: any): Promise<string | nul
   if (userId) return String(userId);
   reply.code(401).send({ error: 'Unauthorized' });
   return null;
+}
+
+function requireInternalKey(req: any, reply: any): boolean {
+  const provided = headerValue(req.headers['x-internal-api-key']);
+  if (provided && config.internalApiKey && provided === config.internalApiKey) return true;
+  reply.code(401).send({ error: 'Unauthorized' });
+  return false;
+}
+
+function safeInviteMetadata(metadata: any) {
+  const profile = metadata?.prefillProfile || {};
+  return {
+    source: metadata?.source,
+    warehouseCode: metadata?.warehouseCode,
+    wmsIntermediaryId: metadata?.wmsIntermediaryId,
+    intermediaryNumber: metadata?.intermediaryNumber,
+    networkPolicy: metadata?.networkPolicy || null,
+    prefillProfile: {
+      email: profile.email || '',
+      firstName: profile.firstName || '',
+      lastName: profile.lastName || '',
+      phone: profile.phone || '',
+      companyName: profile.companyName || '',
+      llcName: profile.llcName || profile.companyName || '',
+      billingAddress: profile.billingAddress || null,
+    },
+  };
 }
 
 async function verifyWmsCallback(req: any, reply: any) {
@@ -495,6 +523,78 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
 }
 
 export async function wmsIntegrationRoutes(app: FastifyInstance) {
+  app.post('/internal/wms/oms-invites', async (req: any, reply) => {
+    if (!requireInternalKey(req, reply)) return;
+    const body = req.body || {};
+    const profile = body.profile || {};
+    const email = String(profile.email || '').toLowerCase().trim();
+    const warehouseCode = String(body.warehouseCode || '').trim();
+    const wmsIntermediaryId = String(body.wmsIntermediaryId || '').trim();
+    const connectionCode = String(body.connectionCode || '').trim().toUpperCase();
+    if (!email || !warehouseCode || !wmsIntermediaryId || !connectionCode) {
+      return reply.code(400).send({
+        error: 'email, warehouseCode, wmsIntermediaryId, and connectionCode are required',
+      });
+    }
+
+    const metadata = {
+      source: 'wms_intermediary_invite',
+      warehouseCode,
+      wmsIntermediaryId,
+      intermediaryNumber: body.intermediaryNumber || null,
+      connectionCode,
+      networkPolicy: body.networkPolicy || {},
+      prefillProfile: {
+        email,
+        firstName: String(profile.firstName || '').trim(),
+        lastName: String(profile.lastName || '').trim(),
+        phone: String(profile.phone || '').trim(),
+        companyName: String(profile.companyName || '').trim(),
+        llcName: String(profile.llcName || profile.companyName || '').trim(),
+        billingAddress: profile.billingAddress || null,
+      },
+    };
+
+    const existing = await pgQuery<{ token: string; expires_at: string; metadata: any }>(
+      `SELECT token, expires_at, metadata
+       FROM invite_tokens
+       WHERE used_at IS NULL
+         AND expires_at > now()
+         AND metadata->>'source' = 'wms_intermediary_invite'
+         AND metadata->>'warehouseCode' = $1
+         AND metadata->>'wmsIntermediaryId' = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [warehouseCode, wmsIntermediaryId],
+    );
+    const existingInvite = existing?.rows[0];
+    if (existingInvite) {
+      return {
+        status: 'pending',
+        token: existingInvite.token,
+        inviteLink: `${config.frontendOrigin}/signup?invite=${encodeURIComponent(existingInvite.token)}`,
+        expiresAt: existingInvite.expires_at,
+        metadata: safeInviteMetadata(existingInvite.metadata),
+      };
+    }
+
+    const token = randomBytes(24).toString('hex');
+    const inserted = await pgQuery<{ expires_at: string }>(
+      `INSERT INTO invite_tokens (token, role, metadata)
+       VALUES ($1, 'ecommerce_client', $2::jsonb)
+       RETURNING expires_at`,
+      [token, JSON.stringify(metadata)],
+    );
+
+    return reply.code(201).send({
+      status: 'pending',
+      token,
+      inviteLink: `${config.frontendOrigin}/signup?invite=${encodeURIComponent(token)}`,
+      expiresAt: inserted?.rows[0]?.expires_at,
+      metadata: safeInviteMetadata(metadata),
+    });
+  });
+
   app.post('/internal/wms/integration-credentials/register', async (req: any, reply) => {
     const userId = await requireInternalOrUser(req, reply);
     if (!userId) return;

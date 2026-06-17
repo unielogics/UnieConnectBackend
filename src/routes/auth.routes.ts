@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { FastifyInstance } from 'fastify';
 import jwt from 'jsonwebtoken';
@@ -8,6 +8,7 @@ import { isValidRole, normalizeRole } from '../lib/roles';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { seedDemoDataForUser, shouldAutoSeed } from '../services/demo-seed.service';
 import { syncCurrentUserProfileToWms } from '../services/wms-profile-sync.service';
+import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import {
   changeSqlUserPassword,
   findSqlUserById,
@@ -63,6 +64,150 @@ function signUser(user: { userId: string; email: string; role: string }) {
     config.authSecret,
     { expiresIn: '7d' },
   );
+}
+
+function trim(value: unknown) {
+  return String(value ?? '').trim();
+}
+
+function safeInviteMetadata(metadata: any) {
+  const profile = metadata?.prefillProfile || {};
+  if (!metadata || typeof metadata !== 'object') return null;
+  return {
+    source: metadata.source || null,
+    warehouseCode: metadata.warehouseCode || null,
+    intermediaryNumber: metadata.intermediaryNumber || null,
+    networkPolicy: metadata.networkPolicy || null,
+    prefillProfile: {
+      email: profile.email || '',
+      firstName: profile.firstName || '',
+      lastName: profile.lastName || '',
+      phone: profile.phone || '',
+      companyName: profile.companyName || '',
+      llcName: profile.llcName || profile.companyName || '',
+      billingAddress: profile.billingAddress || null,
+    },
+  };
+}
+
+function wmsExternalOmsObjectId(userId: string) {
+  const normalized = trim(userId);
+  if (/^[a-f0-9]{24}$/i.test(normalized)) return normalized.toLowerCase();
+  return createHash('sha1').update(`unieconnect:app_user:${normalized}`).digest('hex').slice(0, 24);
+}
+
+async function callWmsInternal<T = any>(path: string, body: Record<string, unknown>): Promise<T> {
+  if (!config.wmsApiUrl || !config.internalApiKey) {
+    throw new Error('WMS API or internal key is not configured');
+  }
+  const res = await fetch(`${config.wmsApiUrl}/api/v1${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Internal-Api-Key': config.internalApiKey,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => ({}))) as any;
+  if (!res.ok) {
+    throw new Error(String(data.message || data.error || `WMS request failed with ${res.status}`));
+  }
+  return data as T;
+}
+
+async function autoConnectWarehouseFromInvite(userId: string, metadata: any, req: any) {
+  if (metadata?.source !== 'wms_intermediary_invite') return;
+  const connectionCode = trim(metadata.connectionCode).toUpperCase();
+  const warehouseCode = trim(metadata.warehouseCode);
+  if (!connectionCode || !warehouseCode) return;
+  const profile = metadata.prefillProfile || {};
+  const billingAddress = profile.billingAddress || {};
+  const payload = {
+    connectionCode,
+    wmsIntermediaryId: metadata.wmsIntermediaryId || undefined,
+    networkPolicy: metadata.networkPolicy || {},
+    omsIntermediaryId: wmsExternalOmsObjectId(userId),
+    omsCompanyName: trim(profile.llcName || profile.companyName || profile.email || `OMS ${userId}`),
+    omsFirstName: trim(profile.firstName),
+    omsLastName: trim(profile.lastName),
+    omsPhone: trim(profile.phone),
+    omsEmail: String(profile.email || '').toLowerCase().trim(),
+    omsLlcName: trim(profile.llcName || profile.companyName),
+    omsBillingAddress: billingAddress,
+  };
+  const connected = await callWmsInternal<{
+    warehouseCode: string;
+    wmsIntermediaryId?: string;
+    omsIntermediaryId?: string;
+  }>('/internal/oms/connect', payload);
+
+  let credentialResult: any = null;
+  try {
+    credentialResult = await callWmsInternal('/internal/oms/integration-credentials', {
+      warehouseCode: connected.warehouseCode || warehouseCode,
+      omsIntermediaryId: connected.omsIntermediaryId || payload.omsIntermediaryId,
+    });
+    const c = credentialResult?.credential;
+    if (c?.clientId && c?.passkey) {
+      await registerWmsCredential({
+        userId,
+        warehouseCode: connected.warehouseCode || warehouseCode,
+        clientId: c.clientId,
+        passkey: c.passkey,
+        scopes: c.scopes || [],
+        expiresAt: c.expiresAt ? new Date(c.expiresAt) : null,
+        metadata: {
+          source: 'wms_intermediary_invite',
+          wmsIntermediaryId: connected.wmsIntermediaryId,
+          omsIntermediaryId: connected.omsIntermediaryId,
+        },
+      });
+    }
+  } catch (err: any) {
+    req.log?.warn({ err, userId, warehouseCode }, 'WMS integration credential registration failed during invite signup');
+  }
+
+  await pgQuery(
+    `INSERT INTO facilities (user_id, name, type, code, city, state, status, metadata)
+     VALUES ($1, $2, 'warehouse', $3, '', '', 'active', $4::jsonb)
+     ON CONFLICT DO NOTHING`,
+    [
+      userId,
+      `WMS ${connected.warehouseCode || warehouseCode}`,
+      connected.warehouseCode || warehouseCode,
+      JSON.stringify({ source: 'wms_intermediary_invite', connectionCode }),
+    ],
+  ).catch(() => null);
+
+  const facility = await pgQuery<{ id: string }>(
+    'SELECT id FROM facilities WHERE user_id = $1 AND code = $2 LIMIT 1',
+    [userId, connected.warehouseCode || warehouseCode],
+  );
+  const facilityId = facility?.rows[0]?.id || null;
+  await pgQuery(
+    `INSERT INTO oms_warehouse_links (user_id, facility_id, warehouse_code, connection_code, status, metadata)
+     VALUES ($1, $2, $3, $4, 'connected', $5::jsonb)
+     ON CONFLICT (user_id, warehouse_code)
+     DO UPDATE SET status = 'connected', connection_code = EXCLUDED.connection_code, metadata = oms_warehouse_links.metadata || EXCLUDED.metadata`,
+    [
+      userId,
+      facilityId,
+      connected.warehouseCode || warehouseCode,
+      connectionCode,
+      JSON.stringify({
+        connectedBy: 'wms_intermediary_invite',
+        wmsIntermediaryId: connected.wmsIntermediaryId || metadata.wmsIntermediaryId,
+        wmsOmsIntermediaryId: connected.omsIntermediaryId || payload.omsIntermediaryId,
+        networkPolicy: metadata.networkPolicy || {},
+        credentialId: credentialResult?.credential?.id || null,
+      }),
+    ],
+  );
+  await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
+    userId,
+    'warehouse_connected_from_invite',
+    JSON.stringify({ warehouseCode: connected.warehouseCode || warehouseCode, wmsIntermediaryId: connected.wmsIntermediaryId }),
+  ]).catch(() => null);
 }
 
 export async function authRoutes(fastify: FastifyInstance) {
@@ -136,28 +281,33 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.get('/auth/invite/validate', async (req: any) => {
     const token = String(req.query?.token || '').trim();
     if (!token) return { valid: false };
-    const res = await pgQuery<{ role: string }>(
-      'SELECT role FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
+    const res = await pgQuery<{ role: string; metadata: any }>(
+      'SELECT role, metadata FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
       [token],
     );
     const invite = res?.rows[0];
-    return invite ? { valid: true, role: normalizeRole(invite.role) } : { valid: false };
+    return invite ? { valid: true, role: normalizeRole(invite.role), metadata: safeInviteMetadata(invite.metadata) } : { valid: false };
   });
 
   fastify.post('/auth/invite/signup', async (req: any, reply) => {
     const { token, firstName, lastName, email, phone, password } = req.body || {};
     const inviteToken = String(token || '').trim();
-    const normalizedEmail = String(email || '').toLowerCase().trim();
-    if (!inviteToken || !normalizedEmail || !password) {
+    if (!inviteToken || !password) {
       return reply.code(400).send({ error: 'token, email and password required' });
     }
 
-    const inviteRes = await pgQuery<{ id: string; role: string }>(
-      'SELECT id, role FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
+    const inviteRes = await pgQuery<{ id: string; role: string; metadata: any }>(
+      'SELECT id, role, metadata FROM invite_tokens WHERE token = $1 AND used_at IS NULL AND expires_at > now() LIMIT 1',
       [inviteToken],
     );
     const invite = inviteRes?.rows[0];
     if (!invite) return reply.code(400).send({ error: 'Invalid or expired invite link' });
+
+    const inviteProfile = invite.metadata?.prefillProfile || {};
+    const normalizedEmail = String(email || inviteProfile.email || '').toLowerCase().trim();
+    if (!normalizedEmail) {
+      return reply.code(400).send({ error: 'email is required' });
+    }
 
     const existing = await findSqlUserByEmail(normalizedEmail);
     if (existing) return reply.code(409).send({ error: 'User with this email already exists' });
@@ -165,17 +315,24 @@ export async function authRoutes(fastify: FastifyInstance) {
     const userId = randomUUID();
     const passwordHash = await bcrypt.hash(String(password), 10);
     const role = normalizeRole(invite.role);
+    const resolvedFirstName = firstName ? String(firstName).trim() : trim(inviteProfile.firstName);
+    const resolvedLastName = lastName ? String(lastName).trim() : trim(inviteProfile.lastName);
+    const resolvedPhone = phone ? String(phone).trim() : trim(inviteProfile.phone);
+    const resolvedLlcName = trim(inviteProfile.llcName || inviteProfile.companyName);
+    const resolvedBillingAddress = inviteProfile.billingAddress || null;
     await pgQuery(
-      `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone, llc_name, billing_address)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
       [
         userId,
         normalizedEmail,
         passwordHash,
         role,
-        firstName ? String(firstName).trim() : null,
-        lastName ? String(lastName).trim() : null,
-        phone ? String(phone).trim() : null,
+        resolvedFirstName || null,
+        resolvedLastName || null,
+        resolvedPhone || null,
+        resolvedLlcName || null,
+        resolvedBillingAddress ? JSON.stringify(resolvedBillingAddress) : null,
       ],
     );
     await pgQuery(
@@ -191,7 +348,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
       userId,
       'invite_signup',
-      JSON.stringify({ inviteId: invite.id }),
+      JSON.stringify({ inviteId: invite.id, source: invite.metadata?.source || 'manual_invite' }),
     ]);
 
     const user = await findSqlUserById(userId);
@@ -203,6 +360,11 @@ export async function authRoutes(fastify: FastifyInstance) {
     void ensureCortexCredentialForUser(userId).catch((err: any) => {
       req.log?.warn({ err, userId }, 'cortex credential auto-provision failed during signup');
     });
+    try {
+      await autoConnectWarehouseFromInvite(userId, invite.metadata, req);
+    } catch (err: any) {
+      req.log?.warn({ err, userId, inviteId: invite.id }, 'warehouse auto-connect failed during invite signup');
+    }
     // Optional demo data seed for stage/demo accounts.
     if (shouldAutoSeed(normalizedEmail)) {
       void seedDemoDataForUser(userId).catch((err: any) => {

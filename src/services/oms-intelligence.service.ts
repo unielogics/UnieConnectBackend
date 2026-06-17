@@ -766,9 +766,36 @@ async function createSellerContextRecommendations(params: {
   return recommendations.filter(Boolean);
 }
 
+async function getConnectedNetworkPolicy(userId: string) {
+  const links = await rows(
+    `SELECT warehouse_code, metadata
+     FROM oms_warehouse_links
+     WHERE user_id = $1 AND status = 'connected'
+     ORDER BY connected_at DESC NULLS LAST
+     LIMIT 10`,
+    [userId],
+  ).catch(() => []);
+  const policies = links
+    .map((link: any) => ({
+      warehouseCode: link.warehouse_code,
+      ...(json(link.metadata, {})?.networkPolicy || {}),
+    }))
+    .filter((policy: any) => policy && Object.keys(policy).length > 1);
+  const anchored = policies.find((policy: any) => policy.multiWarehouseOptimizationEnabled === false);
+  return {
+    policies,
+    activePolicy: anchored || policies[0] || null,
+    multiWarehouseExecutable: anchored ? false : policies.length ? policies.some((p: any) => p.multiWarehouseOptimizationEnabled === true) : true,
+  };
+}
+
 export async function createSellerOptimizationRun(userId: string, input: any = {}) {
   const readiness = await getDataReadiness(userId);
-  const [business, inventory] = await Promise.all([getBusinessDouble(userId), getInventoryPlan(userId, input?.horizon || '6m')]);
+  const [business, inventory, networkPolicy] = await Promise.all([
+    getBusinessDouble(userId),
+    getInventoryPlan(userId, input?.horizon || '6m'),
+    getConnectedNetworkPolicy(userId),
+  ]);
   const run = await createRun(userId, 'seller_optimization', input, readiness);
   await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
 
@@ -819,6 +846,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
     optimizedStockoutRiskSkus: inventory.proposed?.stockoutRiskSkus || 0,
     sharedPalletCandidates: inventory.proposed?.sharedPalletCandidates || 0,
     blockers: readiness.blockers,
+    networkPolicy,
   };
 
   const stored = await one(
@@ -833,7 +861,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
       JSON.stringify(summary),
       JSON.stringify(business.plan || {}),
       JSON.stringify(inventory || {}),
-      JSON.stringify(readiness),
+      JSON.stringify({ ...readiness, networkPolicy }),
       Math.min(0.96, Math.max(0.35, readiness.score / 100 + (cortex.ok ? 0.08 : 0))),
     ],
   );
@@ -846,15 +874,22 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
       entityType: 'business_double',
       entityId: stored?.id,
       title: 'Approve optimized operating model',
-      summary: `Projected monthly savings of $${Math.round(monthlySavings).toLocaleString()} from placement, fulfillment, and consolidation improvements.`,
+      summary: networkPolicy.multiWarehouseExecutable
+        ? `Projected monthly savings of $${Math.round(monthlySavings).toLocaleString()} from placement, fulfillment, and consolidation improvements.`
+        : `Modeled monthly savings of $${Math.round(monthlySavings).toLocaleString()} require warehouse owner approval for multi-warehouse optimization. Executable plans stay anchored to ${networkPolicy.activePolicy?.anchorWarehouseCode || 'the connected warehouse'}.`,
       currentValue: { monthlyCost: currentMonthlyCost, warehouseCount: business.plan?.currentMetrics?.warehouseNodes },
-      optimizedValue: { monthlyCost: optimizedMonthlyCost, warehouseCount: business.plan?.optimizedMetrics?.warehouseNodes },
+      optimizedValue: {
+        monthlyCost: optimizedMonthlyCost,
+        warehouseCount: business.plan?.optimizedMetrics?.warehouseNodes,
+        executable: networkPolicy.multiWarehouseExecutable,
+        anchorWarehouseCode: networkPolicy.activePolicy?.anchorWarehouseCode || null,
+      },
       estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12 },
-      requiredAction: 'approve_business_double',
-      approvalState: 'waiting_approval',
+      requiredAction: networkPolicy.multiWarehouseExecutable ? 'approve_business_double' : 'review_network_policy',
+      approvalState: networkPolicy.multiWarehouseExecutable ? 'waiting_approval' : 'blocked_by_network_policy',
       wmsTruthState: readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only',
       confidence: stored?.confidence,
-      sourceSummary: readiness,
+      sourceSummary: { ...readiness, networkPolicy },
     }));
   }
   const highRiskSkus = (inventory.skus || []).filter((sku: any) => sku.risk === 'high' || number(sku.daysOfCover) < 14).slice(0, 5);
