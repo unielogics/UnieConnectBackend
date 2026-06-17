@@ -7,6 +7,7 @@ import { pgQuery } from '../db/postgres';
 import { isValidRole, normalizeRole } from '../lib/roles';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { seedDemoDataForUser, shouldAutoSeed } from '../services/demo-seed.service';
+import { syncCurrentUserProfileToWms } from '../services/wms-profile-sync.service';
 import {
   changeSqlUserPassword,
   findSqlUserById,
@@ -78,6 +79,17 @@ export async function authRoutes(fastify: FastifyInstance) {
     if (!userId) return reply.code(401).send({ error: 'Unauthorized' });
     const updated = await updateSqlUserProfile(String(userId), req.body || {});
     if (!updated) return reply.code(401).send({ error: 'User not found' });
+    void syncCurrentUserProfileToWms(String(userId), req.log).catch((err: any) => {
+      req.log?.warn(
+        {
+          err: String(err?.message || err),
+          status: err?.status,
+          payload: err?.payload,
+          userId: String(userId),
+        },
+        'WMS profile sync failed after OMS profile update',
+      );
+    });
     return updated;
   };
 
