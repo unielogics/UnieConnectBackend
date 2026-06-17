@@ -717,6 +717,95 @@ async function callWmsInternal<T = AnyRow>(path: string, body: AnyRow): Promise<
   return data as T;
 }
 
+async function syncOmsCatalogToWms(params: {
+  userId: string;
+  warehouseCode: string;
+  wmsIntermediaryId: string;
+  log?: any;
+}) {
+  const [suppliers, items] = await Promise.all([
+    rows(
+      `SELECT id, name, email, phone, status, address, metadata
+       FROM suppliers
+       WHERE user_id = $1
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC
+       LIMIT 1000`,
+      [params.userId],
+    ),
+    rows(
+      `SELECT id, sku, title, description, supplier_id, image, images, upc, ean, asin,
+              category, sub_category, weight, dimensions, archived, metadata
+       FROM catalog_items
+       WHERE user_id = $1
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC
+       LIMIT 5000`,
+      [params.userId],
+    ),
+  ]);
+
+  if (!suppliers.length && !items.length) {
+    return {
+      success: true,
+      suppliersReceived: 0,
+      itemsReceived: 0,
+      suppliersUpserted: 0,
+      itemsUpserted: 0,
+      skipped: 'no_oms_catalog_data',
+    };
+  }
+
+  const payload = {
+    warehouseCode: params.warehouseCode,
+    wmsIntermediaryId: params.wmsIntermediaryId,
+    suppliers: suppliers.map((supplier) => ({
+      id: supplier.id,
+      name: supplier.name,
+      email: supplier.email,
+      phone: supplier.phone,
+      status: supplier.status,
+      address: json(supplier.address, {}),
+      metadata: json(supplier.metadata, {}),
+    })),
+    items: items.map((item) => ({
+      id: item.id,
+      sku: item.sku,
+      title: item.title,
+      description: item.description,
+      supplierId: item.supplier_id,
+      image: item.image,
+      images: json(item.images, []),
+      upc: item.upc,
+      ean: item.ean,
+      asin: item.asin,
+      category: item.category,
+      subCategory: item.sub_category,
+      weight: item.weight,
+      dimensions: json(item.dimensions, null),
+      archived: Boolean(item.archived),
+      metadata: json(item.metadata, {}),
+    })),
+  };
+
+  return callWmsInternal('/internal/oms/catalog/sync', payload).catch((err: any) => {
+    params.log?.warn?.(
+      {
+        err: String(err?.message || err),
+        warehouseCode: params.warehouseCode,
+        supplierCount: suppliers.length,
+        itemCount: items.length,
+      },
+      'OMS catalog sync to WMS failed after warehouse connect',
+    );
+    return {
+      success: false,
+      error: err?.payload?.error || 'wms_catalog_sync_failed',
+      message: String(err?.message || 'WMS catalog sync failed'),
+      suppliersReceived: suppliers.length,
+      itemsReceived: items.length,
+    };
+  });
+}
+
 const DEFAULT_WMS_BRIDGE_SCOPES = [
   'inventory:read',
   'inventory:update',
@@ -2538,6 +2627,13 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         ],
       );
 
+      const catalogSync = await syncOmsCatalogToWms({
+        userId,
+        warehouseCode,
+        wmsIntermediaryId,
+        log: req.log,
+      });
+
       await writeLedger(userId, {
         entityType: 'oms_wms_bridge',
         entityId: link?.id || null,
@@ -2550,6 +2646,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           wmsIntermediaryId,
           clientId: credentialResponse.clientId,
           scopes: credentialResponse.credential?.scopes || DEFAULT_WMS_BRIDGE_SCOPES,
+          catalogSync,
         },
       });
 
@@ -2564,6 +2661,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           scopes: credentialResponse.credential?.scopes || DEFAULT_WMS_BRIDGE_SCOPES,
           expiresAt: credentialResponse.credential?.expiresAt || null,
         },
+        catalogSync,
       };
     } catch (err: any) {
       const status = Number(err?.status || 502);
