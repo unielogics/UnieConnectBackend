@@ -1,6 +1,8 @@
 import { getKeepaSnapshot } from "./keepa";
 import { randomUUID } from 'crypto';
 import { FastifyBaseLogger } from 'fastify';
+import fetch from 'node-fetch';
+import { config } from '../config/env';
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
 import { LabelAuditFinding, LabelAuditRun } from './oms-production.types';
@@ -78,6 +80,176 @@ function supplierPickupProfile(row: Row) {
     pickupInstructions: pickup.pickupInstructions || metadata.pickupInstructions || '',
     contactName: pickup.contactName || metadata.contactName || metadata.primaryContact || '',
     address,
+  };
+}
+
+async function callWmsInternal<T = Row>(path: string, body: Row): Promise<T> {
+  if (!config.wmsApiUrl || !config.internalApiKey) {
+    throw new Error('WMS internal API is not configured');
+  }
+  const res = await fetch(`${config.wmsApiUrl}/api/v1${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Internal-Api-Key': config.internalApiKey,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => ({}))) as Row;
+  if (!res.ok) {
+    const err = new Error(String(data.message || data.error || `WMS request failed with ${res.status}`));
+    (err as any).status = res.status;
+    (err as any).payload = data;
+    throw err;
+  }
+  return data as T;
+}
+
+function shipmentLineQuantity(line: any) {
+  return number(
+    line?.quantity ??
+      line?.qty ??
+      line?.units ??
+      (number(line?.cartons, 0) > 0 && number(line?.unitsPerCarton, 0) > 0
+        ? number(line.cartons) * number(line.unitsPerCarton)
+        : undefined),
+    0,
+  );
+}
+
+async function findWmsLinkForFacility(userId: string, facility: Row | null) {
+  if (!facility) return null;
+  if (facility.id) {
+    const byFacility = await one(
+      'SELECT * FROM oms_warehouse_links WHERE user_id = $1 AND facility_id = $2 AND status = $3 ORDER BY connected_at DESC NULLS LAST FETCH FIRST 1 ROWS ONLY',
+      [userId, facility.id, 'connected'],
+    );
+    if (byFacility) return byFacility;
+  }
+  if (facility.code) {
+    return one(
+      'SELECT * FROM oms_warehouse_links WHERE user_id = $1 AND warehouse_code = $2 AND status = $3 ORDER BY connected_at DESC NULLS LAST FETCH FIRST 1 ROWS ONLY',
+      [userId, facility.code, 'connected'],
+    );
+  }
+  return null;
+}
+
+async function createWmsAsnForShipment(params: {
+  userId: string;
+  draftId: string;
+  supplier: Row | null;
+  facility: Row | null;
+  selectedItems: any[];
+  plan: Row | null;
+  asn: Row | null;
+  estimatedArrivalDate?: unknown;
+  shipFromAddress?: any;
+  log?: FastifyBaseLogger;
+}) {
+  const link = await findWmsLinkForFacility(params.userId, params.facility);
+  const warehouseCode = link?.warehouse_code || params.facility?.code;
+  const wmsIntermediaryId = link?.metadata?.wmsIntermediaryId;
+  if (!warehouseCode || !wmsIntermediaryId) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'missing_wms_link',
+      message: 'No connected WMS intermediary was found for the selected facility.',
+    };
+  }
+
+  const skus = params.selectedItems.map((item) => String(item?.sku || '').trim()).filter(Boolean);
+  const catalogRows = skus.length
+    ? await rows(
+        `SELECT id, sku, title, description, supplier_id, image, images, upc, ean, asin,
+                category, sub_category, weight, dimensions, archived, metadata
+         FROM catalog_items
+         WHERE user_id = $1
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC
+         FETCH FIRST 5000 ROWS ONLY`,
+        [params.userId],
+      )
+    : [];
+  const catalogBySku = new Map(catalogRows.map((row) => [String(row.sku || ''), row]));
+  const selectedCatalogRows = skus
+    .map((sku) => catalogBySku.get(sku))
+    .filter((item): item is Row => Boolean(item));
+
+  if (params.supplier || selectedCatalogRows.length) {
+    await callWmsInternal('/internal/oms/catalog/sync', {
+      warehouseCode,
+      wmsIntermediaryId,
+      suppliers: params.supplier
+        ? [{
+            id: params.supplier.id,
+            name: params.supplier.name,
+            email: params.supplier.email,
+            phone: params.supplier.phone,
+            status: params.supplier.status,
+            address: json(params.supplier.address, {}),
+            metadata: json(params.supplier.metadata, {}),
+          }]
+        : [],
+      items: selectedCatalogRows.map((item) => ({
+        id: item.id,
+        sku: item.sku,
+        title: item.title,
+        description: item.description,
+        supplierId: item.supplier_id,
+        image: item.image,
+        images: json(item.images, []),
+        upc: item.upc,
+        ean: item.ean,
+        asin: item.asin,
+        category: item.category,
+        subCategory: item.sub_category,
+        weight: item.weight,
+        dimensions: json(item.dimensions, null),
+        archived: Boolean(item.archived),
+        metadata: json(item.metadata, {}),
+      })),
+    });
+  }
+
+  const supplierAddress = json(params.supplier?.address, {});
+  const shipFromAddress = params.shipFromAddress || supplierAddress || {};
+  const wmsAsn = await callWmsInternal('/internal/oms/asn/create', {
+    warehouseCode,
+    wmsIntermediaryId,
+    omsIntermediaryId: link?.metadata?.wmsOmsIntermediaryId,
+    omsSupplierId: params.supplier?.id || null,
+    poNumber: params.asn?.asn_number || params.plan?.internal_shipment_id || `OMS-${Date.now()}`,
+    shipFromAddress: {
+      name: params.supplier?.name || shipFromAddress.name || 'UnieConnect Supplier',
+      addressLine1: shipFromAddress.addressLine1 || shipFromAddress.line1 || shipFromAddress.street || '',
+      city: shipFromAddress.city || '',
+      stateOrProvinceCode: shipFromAddress.state || shipFromAddress.stateOrProvinceCode || '',
+      postalCode: shipFromAddress.zipCode || shipFromAddress.postalCode || '',
+      countryCode: shipFromAddress.countryCode || shipFromAddress.country || 'US',
+    },
+    lineItems: params.selectedItems.map((line) => {
+      const catalog = catalogBySku.get(String(line?.sku || '')) || {};
+      const cartons = number(line?.cartons ?? line?.containersCount, 1);
+      const unitsPerCarton = number(line?.unitsPerCarton ?? line?.unitsPerContainer, shipmentLineQuantity(line) || 1);
+      return {
+        sku: line?.sku,
+        itemName: line?.itemName || line?.title || catalog.title || line?.sku,
+        quantity: shipmentLineQuantity(line) || cartons * unitsPerCarton,
+        unitsPerContainer: unitsPerCarton,
+        containersCount: cartons,
+        image: catalog.image || line?.image,
+        images: json(catalog.images, line?.images || []),
+      };
+    }),
+    eta: params.estimatedArrivalDate || null,
+  });
+
+  return {
+    ok: true,
+    warehouseCode,
+    wmsIntermediaryId,
+    ...wmsAsn,
   };
 }
 
@@ -1362,6 +1534,43 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     ],
   );
 
+  const wmsAsnInput: Parameters<typeof createWmsAsnForShipment>[0] = {
+    userId,
+    draftId,
+    supplier,
+    facility,
+    selectedItems,
+    plan,
+    asn,
+    estimatedArrivalDate: body?.estimatedArrivalDate || null,
+    shipFromAddress: shipFrom?.address || body?.shipFromAddress || {},
+  };
+  if (log) wmsAsnInput.log = log;
+
+  const wmsExecution = await createWmsAsnForShipment(wmsAsnInput).catch((err: any) => ({
+    ok: false,
+    status: err?.status || 502,
+    error: err?.payload?.error || 'wms_asn_create_failed',
+    message: String(err?.message || 'WMS ASN create failed'),
+    details: err?.payload || null,
+  }));
+
+  if (asn?.id) {
+    await pgQuery(
+      `UPDATE asns
+       SET status = $2,
+           payload = payload || $3::jsonb,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $4`,
+      [
+        asn.id,
+        (wmsExecution as any)?.ok ? 'wms_asn_created_waiting_for_receipt' : 'projected_waiting_for_wms_truth',
+        JSON.stringify({ wmsExecution }),
+        userId,
+      ],
+    ).catch((err) => log?.warn({ err, asnId: asn.id }, 'failed to update ASN with WMS execution result'));
+  }
+
   const cortex = await postCortex('/v1/oms/shipment/projected', {
     userId,
     draftId,
@@ -1385,6 +1594,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     requiresBol: body?.requiresBol !== false,
     requiresLabels: Boolean(body?.requiresLabels),
     supplierPickupProfile: supplierPickup,
+    wmsExecution,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
 
   await writeOmsLedgerEvent({
@@ -1393,9 +1603,11 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     entityId: draftId,
     eventType: 'projected_waiting_for_wms_truth',
     sourceSystem: 'oms',
-    summary: 'Shipment wizard created an Aurora shipment plan and projected ASN; final execution waits for WMS truth.',
-    payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, cortex },
-    confidence: 0.74,
+    summary: (wmsExecution as any)?.ok
+      ? 'Shipment wizard created an OMS plan and WMS ASN; receipt still requires WMS truth.'
+      : 'Shipment wizard created an OMS projected ASN; final execution waits for WMS truth.',
+    payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, cortex, wmsExecution },
+    confidence: (wmsExecution as any)?.ok ? 0.82 : 0.74,
   });
 
   await pgQuery(
@@ -1405,7 +1617,13 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     [draftId, plan?.id || null, asn?.id || null, userId],
   ).catch((err) => log?.warn({ err, draftId }, 'failed to update shipment wizard draft'));
 
-  return { status: 'projected_waiting_for_wms_truth', plan, asn: { asn }, cortex, degraded: false };
+  return {
+    status: (wmsExecution as any)?.ok ? 'wms_asn_created_waiting_for_receipt' : 'projected_waiting_for_wms_truth',
+    plan,
+    asn: { asn, wmsExecution },
+    cortex,
+    degraded: !(wmsExecution as any)?.ok,
+  };
 }
 
 export async function getHeatmap(userId: string) {
