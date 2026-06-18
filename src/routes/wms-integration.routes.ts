@@ -441,6 +441,127 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
   return { upserted: inserted?.rows?.[0]?.id || null };
 }
 
+function normalizeSupportStatus(value: unknown): string {
+  const status = String(value || '').trim().toLowerCase();
+  if (status === 'in_progress') return 'in-progress';
+  if (['open', 'in-progress', 'waiting_client', 'resolved', 'closed'].includes(status)) return status;
+  return 'open';
+}
+
+function normalizeSupportPriority(value: unknown): string {
+  const priority = String(value || '').trim().toLowerCase();
+  if (priority === 'medium') return 'med';
+  if (['low', 'med', 'high', 'urgent'].includes(priority)) return priority;
+  return 'med';
+}
+
+async function upsertWmsSupportTicket(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const wmsTicketId = textValue(payload.id, body.entityId, body.entity_id);
+  const subject = textValue(payload.subject, payload.ticketNumber, body.externalReference);
+  if (!wmsTicketId || !subject) return { skipped: true, reason: 'missing_support_ticket_identity' };
+
+  const existing = await pgQuery(
+    `SELECT id FROM support_tickets
+     WHERE user_id=$1 AND entity_type='support_ticket' AND entity_id=$2
+     LIMIT 1`,
+    [userId, wmsTicketId],
+  );
+
+  const ticketValues = [
+    userId,
+    existing?.rows?.[0]?.id || null,
+    subject,
+    textValue(payload.body),
+    wmsTicketId,
+    normalizeSupportPriority(payload.priority),
+    normalizeSupportStatus(payload.status),
+    textValue(payload.owner) || 'WMS',
+  ];
+
+  let ticketId = existing?.rows?.[0]?.id;
+  if (ticketId) {
+    await pgQuery(
+      `UPDATE support_tickets
+       SET subject=$3, body=$4, channel='wms', priority=$6, status=$7, owner=$8, updated_at=now()
+       WHERE user_id=$1 AND id=$2`,
+      ticketValues,
+    );
+  } else {
+    const inserted = await pgQuery(
+      `INSERT INTO support_tickets (user_id, subject, body, entity_type, entity_id, channel, priority, status, owner)
+       VALUES ($1,$3,$4,'support_ticket',$5,'wms',$6,$7,$8)
+       RETURNING id`,
+      ticketValues,
+    );
+    ticketId = inserted?.rows?.[0]?.id;
+  }
+
+  if (ticketId && payload.message) {
+    await upsertWmsSupportTicketMessage(userId, warehouseCode, {
+      ...body,
+      payload: {
+        ...payload,
+        message: payload.message,
+      },
+    });
+  }
+
+  return { upserted: ticketId || null };
+}
+
+async function upsertWmsSupportTicketMessage(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const wmsTicketId = textValue(payload.id, payload.ticketId, payload.ticket_id);
+  const message = payload.message || payload;
+  const text = textValue(message.body);
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (!wmsTicketId || (!text && attachments.length === 0)) return { skipped: true, reason: 'missing_support_message_identity' };
+
+  const ticket = await pgQuery(
+    `SELECT id FROM support_tickets
+     WHERE user_id=$1 AND entity_type='support_ticket' AND entity_id=$2
+     LIMIT 1`,
+    [userId, wmsTicketId],
+  );
+  const ticketId = ticket?.rows?.[0]?.id;
+  if (!ticketId) return { skipped: true, reason: 'missing_parent_support_ticket' };
+
+  const authorName = textValue(message.authorName) || 'WMS';
+  const duplicate = await pgQuery(
+    `SELECT id FROM support_ticket_messages
+     WHERE user_id=$1 AND ticket_id=$2 AND COALESCE(body,'')=$3 AND COALESCE(author_name,'')=$4
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [userId, ticketId, text || '', authorName],
+  );
+  if (duplicate?.rows?.[0]?.id) return { upserted: duplicate.rows[0].id, duplicate: true };
+
+  const inserted = await pgQuery(
+    `INSERT INTO support_ticket_messages (user_id, ticket_id, author_type, author_name, body, attachments)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+     RETURNING id`,
+    [
+      userId,
+      ticketId,
+      textValue(message.authorType) || 'warehouse',
+      authorName,
+      text || null,
+      JSON.stringify(attachments),
+    ],
+  );
+
+  await pgQuery(
+    `UPDATE support_tickets
+     SET status = CASE WHEN status IN ('resolved','closed') THEN status ELSE 'in-progress' END,
+         updated_at = now()
+     WHERE user_id=$1 AND id=$2`,
+    [userId, ticketId],
+  );
+
+  return { upserted: inserted?.rows?.[0]?.id || null };
+}
+
 async function applyEntityEvent(params: { userId: string; warehouseCode: string; body: any }) {
   const entityType = String(params.body.entityType || params.body.entity_type || '').toLowerCase();
   if (!['entity_upsert', 'entity_status', 'entity_archive'].includes(String(params.body.eventType || ''))) return null;
@@ -450,6 +571,8 @@ async function applyEntityEvent(params: { userId: string; warehouseCode: string;
   if (entityType === 'order') return upsertWmsOrder(params.userId, params.warehouseCode, params.body);
   if (entityType === 'asn') return upsertWmsAsn(params.userId, params.warehouseCode, params.body);
   if (entityType === 'invoice') return upsertWmsInvoice(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'support_ticket') return upsertWmsSupportTicket(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'support_ticket_message') return upsertWmsSupportTicketMessage(params.userId, params.warehouseCode, params.body);
   return { skipped: true, reason: `unsupported_entity_type:${entityType}` };
 }
 
@@ -629,6 +752,17 @@ export async function wmsIntegrationRoutes(app: FastifyInstance) {
   });
 
   app.post('/internal/wms/events', async (req, reply) => acceptWmsEvent(req, reply, 'wms_event'));
+  app.post('/internal/wms/support-tickets', async (req, reply) => acceptWmsEvent(req, reply, 'entity_upsert'));
+  app.post('/internal/wms/support-tickets/:externalReference/messages', async (req, reply) => {
+    const body = {
+      ...(req.body || {}),
+      externalReference: (req.params as any)?.externalReference,
+      entityType: 'support_ticket_message',
+      eventType: 'entity_upsert',
+    };
+    (req as any).body = body;
+    return acceptWmsEvent(req, reply, 'entity_upsert');
+  });
   app.post('/internal/wms/order-status', async (req, reply) => acceptWmsEvent(req, reply, 'order_status'));
   app.post('/internal/wms/inventory-snapshot', async (req, reply) => acceptWmsEvent(req, reply, 'inventory_snapshot'));
   app.post('/internal/wms/asn-status', async (req, reply) => acceptWmsEvent(req, reply, 'asn_status'));
