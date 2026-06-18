@@ -783,6 +783,33 @@ async function callWmsInternal<T = AnyRow>(path: string, body: AnyRow): Promise<
   return data as T;
 }
 
+async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
+  if (!config.wmsApiUrl) {
+    const err = new Error('WMS_API_URL is not configured');
+    (err as any).status = 503;
+    throw err;
+  }
+  if (!config.internalApiKey) {
+    const err = new Error('UNIECONNECT_INTERNAL_API_KEY is not configured');
+    (err as any).status = 503;
+    throw err;
+  }
+  const res = await fetch(`${config.wmsApiUrl}/api/v1${path}`, {
+    method: 'GET',
+    headers: {
+      'X-Internal-Api-Key': config.internalApiKey,
+    },
+  });
+  const data = (await res.json().catch(() => ({}))) as AnyRow;
+  if (!res.ok) {
+    const err = new Error(String(data.message || data.error || `WMS request failed with ${res.status}`));
+    (err as any).status = res.status;
+    (err as any).payload = data;
+    throw err;
+  }
+  return data as T;
+}
+
 async function syncOmsCatalogToWms(params: {
   userId: string;
   warehouseCode: string;
@@ -2773,18 +2800,44 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         },
       });
 
+      let wmsWarehouse: AnyRow | null = null;
+      try {
+        const warehouseLookup = await getWmsInternal<{ warehouses?: AnyRow[] }>(`/internal/oms/warehouses?codes=${encodeURIComponent(warehouseCode)}`);
+        wmsWarehouse = Array.isArray(warehouseLookup.warehouses) ? warehouseLookup.warehouses[0] || null : null;
+      } catch (err: any) {
+        req.log?.warn?.({ err: err?.message || err, warehouseCode }, 'WMS warehouse metadata lookup failed during OMS connect');
+      }
+      const facilityAddress = wmsWarehouse
+        ? {
+            street: wmsWarehouse.street || '',
+            addressLine1: wmsWarehouse.street || wmsWarehouse.address || '',
+            city: wmsWarehouse.city || '',
+            state: wmsWarehouse.state || '',
+            zipCode: wmsWarehouse.zipCode || '',
+            country: wmsWarehouse.country || '',
+            latitude: wmsWarehouse.latitude ?? null,
+            longitude: wmsWarehouse.longitude ?? null,
+          }
+        : {};
       const facility =
         (await one('SELECT * FROM facilities WHERE code = $1 AND (user_id = $2 OR user_id IS NULL)', [warehouseCode, userId])) ||
         (await one(
           `INSERT INTO facilities (user_id, code, name, facility_type, status, address, metadata)
-           VALUES ($1, $2, $3, 'warehouse', 'active', '{}'::jsonb, $4::jsonb)
+           VALUES ($1, $2, $3, 'warehouse', 'active', $4::jsonb, $5::jsonb)
            ON CONFLICT (user_id, code) DO UPDATE SET
              name = EXCLUDED.name,
+             address = EXCLUDED.address,
              status = 'active',
              metadata = facilities.metadata || EXCLUDED.metadata,
              updated_at = now()
            RETURNING *`,
-          [userId, warehouseCode, warehouseCode, JSON.stringify({ source: 'wms_internal_bootstrap', generatedBy: 'warehouse_invitation' })],
+          [
+            userId,
+            warehouseCode,
+            trim(wmsWarehouse?.name) || warehouseCode,
+            JSON.stringify(facilityAddress),
+            JSON.stringify({ source: 'wms_internal_bootstrap', generatedBy: 'warehouse_invitation', wmsWarehouse }),
+          ],
         ));
       const link = await one(
         `INSERT INTO oms_warehouse_links (user_id, facility_id, warehouse_code, connection_code, metadata)
