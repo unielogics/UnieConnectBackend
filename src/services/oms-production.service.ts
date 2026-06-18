@@ -1476,12 +1476,36 @@ async function defaultFacility(userId: string) {
 export async function confirmShipmentWizardDraft(userId: string, draftId: string, body: any, log?: FastifyBaseLogger) {
   const selectedItems = Array.isArray(body?.selectedItems) ? body.selectedItems : [];
   const supplierId = body?.supplierId || null;
+  const assignSupplierToSkus = body?.assignSupplierToSkus === true;
   const shipFromLocationId = body?.shipFromLocationId || null;
   if (selectedItems.length === 0) {
     return {
       status: 'needs_input',
       message: 'Selected items are required before shipment confirmation.',
       requires: ['selectedItems'],
+    };
+  }
+
+  const selectedItemIds = Array.from(
+    new Set(selectedItems.map((item: any) => String(item?.itemId || '').trim()).filter(Boolean)),
+  );
+  if (selectedItemIds.length !== selectedItems.length) {
+    return {
+      status: 'needs_input',
+      message: 'Every selected SKU must include a valid item id before shipment confirmation.',
+      requires: ['selectedItems.itemId'],
+    };
+  }
+
+  const ownedItems = await rows<{ id: string }>(
+    'SELECT id::text AS id FROM catalog_items WHERE user_id = $1 AND id::text = ANY($2::text[])',
+    [userId, selectedItemIds],
+  );
+  if (ownedItems.length !== selectedItemIds.length) {
+    return {
+      status: 'needs_input',
+      message: 'One or more selected SKUs are not available for this account.',
+      requires: ['valid_selected_items'],
     };
   }
 
@@ -1495,7 +1519,31 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
   }
   const shipFrom = shipFromLocationId ? await one('SELECT * FROM ship_from_locations WHERE id = $1 AND user_id = $2', [shipFromLocationId, userId]) : null;
   const supplier = supplierId ? await one('SELECT * FROM suppliers WHERE id = $1 AND user_id = $2', [supplierId, userId]) : null;
+  if (supplierId && !supplier) {
+    return {
+      status: 'needs_input',
+      message: 'Selected supplier is not available for this account.',
+      requires: ['valid_supplier'],
+    };
+  }
   const supplierPickup = supplier ? supplierPickupProfile(supplier) : null;
+  let supplierAssignment = {
+    supplierId,
+    updatedSkuCount: 0,
+  };
+  if (assignSupplierToSkus && supplierId && selectedItemIds.length) {
+    const updated = await rows<{ id: string }>(
+      `UPDATE catalog_items
+       SET supplier_id = $3, updated_at = now()
+       WHERE user_id = $1 AND id::text = ANY($2::text[])
+       RETURNING id::text AS id`,
+      [userId, selectedItemIds, supplierId],
+    );
+    supplierAssignment = {
+      supplierId,
+      updatedSkuCount: updated.length,
+    };
+  }
   const plan = await one(
     `INSERT INTO shipment_plans
       (user_id, supplier_id, ship_from_location_id, facility_id, internal_shipment_id, shipment_title, status, prep_services_only, estimated_arrival_date, ship_from_address, items, metadata)
@@ -1519,6 +1567,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
         requiresBol: body?.requiresBol !== false,
         requiresLabels: Boolean(body?.requiresLabels),
         supplierPickupProfile: supplierPickup,
+        supplierAssignment,
       }),
     ],
   );
@@ -1530,7 +1579,15 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
       userId,
       plan?.id || null,
       `ASN-${Date.now().toString(36).toUpperCase()}`,
-      JSON.stringify({ draftId, selectedItems, requiresWmsTruth: true, facilityId: facility?.id || null }),
+      JSON.stringify({
+        draftId,
+        supplierId,
+        supplierName: supplier?.name || null,
+        supplierAssignment,
+        selectedItems,
+        requiresWmsTruth: true,
+        facilityId: facility?.id || null,
+      }),
     ],
   );
 
@@ -1594,8 +1651,22 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     requiresBol: body?.requiresBol !== false,
     requiresLabels: Boolean(body?.requiresLabels),
     supplierPickupProfile: supplierPickup,
+    supplierAssignment,
     wmsExecution,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+
+  if (supplierAssignment.updatedSkuCount > 0) {
+    await writeOmsLedgerEvent({
+      userId,
+      entityType: 'supplier',
+      entityId: supplierId,
+      eventType: 'sku_supplier_assignment',
+      sourceSystem: 'oms',
+      summary: `Assigned ${supplierAssignment.updatedSkuCount} SKU${supplierAssignment.updatedSkuCount === 1 ? '' : 's'} to ${supplier?.name || 'the selected supplier'} from shipment planning.`,
+      payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, itemIds: selectedItemIds, supplierAssignment },
+      confidence: 0.94,
+    });
+  }
 
   await writeOmsLedgerEvent({
     userId,
@@ -1606,7 +1677,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     summary: (wmsExecution as any)?.ok
       ? 'Shipment wizard created an OMS plan and WMS ASN; receipt still requires WMS truth.'
       : 'Shipment wizard created an OMS projected ASN; final execution waits for WMS truth.',
-    payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, cortex, wmsExecution },
+    payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, cortex, wmsExecution, supplierAssignment },
     confidence: (wmsExecution as any)?.ok ? 0.82 : 0.74,
   });
 
@@ -1622,6 +1693,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     plan,
     asn: { asn, wmsExecution },
     cortex,
+    supplierAssignment,
     degraded: !(wmsExecution as any)?.ok,
   };
 }
