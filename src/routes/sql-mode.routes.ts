@@ -219,6 +219,12 @@ function buildAmazonAuthUrl(state: string) {
 }
 
 function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
+  const metadata = json(row.metadata, {});
+  const enrichmentState =
+    metadata.keepaEnrichmentState ||
+    metadata.keepa_enrichment_state ||
+    (row.asin ? 'needs_retry' : 'missing_asin');
+  const keepaUnavailable = enrichmentState === 'keepa_unavailable';
   return {
     _id: row.id,
     id: row.id,
@@ -244,7 +250,10 @@ function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
     dimensions: json(row.dimensions, {}),
     archived: row.archived,
     wmsInventory: json(row.wms_inventory, {}),
-    metadata: json(row.metadata, {}),
+    metadata,
+    enrichmentState,
+    keepaUnavailable,
+    enrichmentMarker: keepaUnavailable ? '*' : '',
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
     ...extra,
