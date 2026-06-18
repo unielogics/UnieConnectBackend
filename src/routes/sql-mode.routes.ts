@@ -2794,7 +2794,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           status = 'connected',
           connection_code = EXCLUDED.connection_code,
           connected_at = now(),
-          metadata = EXCLUDED.metadata
+          metadata = EXCLUDED.metadata,
+          updated_at = now()
          RETURNING *`,
         [
           userId,
@@ -2996,7 +2997,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.delete('/oms/warehouses/:warehouseCode', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    await pgQuery('UPDATE oms_warehouse_links SET status = $3 WHERE user_id = $1 AND warehouse_code = $2', [userId, req.params.warehouseCode, 'removed']);
+    await pgQuery('UPDATE oms_warehouse_links SET status = $3, updated_at = now() WHERE user_id = $1 AND warehouse_code = $2', [userId, req.params.warehouseCode, 'removed']);
     return { success: true };
   });
 
@@ -3051,7 +3052,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     await pgQuery(
       `INSERT INTO oms_warehouse_links (user_id, oms_account_id, facility_id, warehouse_code, status, metadata)
        VALUES ($1, $2, $3, $4, 'connected', $5::jsonb)
-       ON CONFLICT (user_id, warehouse_code) DO UPDATE SET oms_account_id = EXCLUDED.oms_account_id, facility_id = EXCLUDED.facility_id, status = 'connected', connected_at = now()`,
+       ON CONFLICT (user_id, warehouse_code) DO UPDATE SET oms_account_id = EXCLUDED.oms_account_id, facility_id = EXCLUDED.facility_id, status = 'connected', connected_at = now(), updated_at = now()`,
       [account.user_id || req.user.userId, account.id, facility.id, facility.code, JSON.stringify({ linkedBy: req.user.userId })],
     );
     return { success: true, message: 'Linked.' };

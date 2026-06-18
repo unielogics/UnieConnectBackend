@@ -26,16 +26,17 @@ function wmsBillingAddress(address: AnyRow | null | undefined) {
   };
 }
 
-async function hasConnectedWmsLink(userId: string) {
-  const res = await pgQuery<{ exists: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1
-       FROM oms_warehouse_links
-       WHERE user_id = $1 AND status = 'connected'
-     ) AS exists`,
+async function connectedWmsLinks(userId: string) {
+  const res = await pgQuery<{
+    warehouse_code: string | null;
+    metadata: AnyRow | null;
+  }>(
+    `SELECT warehouse_code, metadata
+     FROM oms_warehouse_links
+     WHERE user_id = $1 AND status = 'connected'`,
     [userId],
   );
-  return Boolean(res?.rows[0]?.exists);
+  return res?.rows || [];
 }
 
 export async function syncCurrentUserProfileToWms(userId: string, log?: any) {
@@ -43,11 +44,11 @@ export async function syncCurrentUserProfileToWms(userId: string, log?: any) {
     return { skipped: true, reason: 'wms_internal_api_not_configured' };
   }
 
-  const linked = await hasConnectedWmsLink(userId).catch((err) => {
+  const links = await connectedWmsLinks(userId).catch((err) => {
     log?.warn?.({ err, userId }, 'failed checking WMS profile sync links');
-    return false;
+    return [];
   });
-  if (!linked) return { skipped: true, reason: 'no_connected_wms_link' };
+  if (links.length === 0) return { skipped: true, reason: 'no_connected_wms_link' };
 
   const res = await pgQuery<{
     id: string;
@@ -67,8 +68,19 @@ export async function syncCurrentUserProfileToWms(userId: string, log?: any) {
   const user = res?.rows[0];
   if (!user) return { skipped: true, reason: 'user_not_found' };
 
-  const payload = {
-    externalOmsIntermediaryId: wmsExternalOmsObjectId(userId),
+  const linkedOmsIds = Array.from(
+    new Set(
+      links
+        .map((link) => {
+          const metadata = json(link.metadata, {}) || {};
+          return trim(metadata.wmsOmsIntermediaryId || metadata.omsIntermediaryId || metadata.externalOmsIntermediaryId);
+        })
+        .filter(Boolean),
+    ),
+  );
+  const externalOmsIntermediaryIds = linkedOmsIds.length > 0 ? linkedOmsIds : [wmsExternalOmsObjectId(userId)];
+
+  const basePayload = {
     companyName:
       trim(user.llc_name) ||
       [trim(user.first_name), trim(user.last_name)].filter(Boolean).join(' ') ||
@@ -81,30 +93,34 @@ export async function syncCurrentUserProfileToWms(userId: string, log?: any) {
     billingAddress: wmsBillingAddress(user.billing_address),
   };
 
-  const response = await fetch(`${config.wmsApiUrl}/api/v1/internal/oms/intermediary/sync-profile`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Internal-Api-Key': config.internalApiKey,
-    },
-    body: JSON.stringify(payload),
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const err = new Error(String((body as AnyRow).message || (body as AnyRow).error || `WMS profile sync failed with ${response.status}`));
-    (err as any).status = response.status;
-    (err as any).payload = body;
-    throw err;
+  const responses = [];
+  for (const externalOmsIntermediaryId of externalOmsIntermediaryIds) {
+    const response = await fetch(`${config.wmsApiUrl}/api/v1/internal/oms/intermediary/sync-profile`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Api-Key': config.internalApiKey,
+      },
+      body: JSON.stringify({ externalOmsIntermediaryId, ...basePayload }),
+    });
+    const body = await response.json().catch(() => ({}));
+    responses.push({ externalOmsIntermediaryId, status: response.status, body });
+    if (!response.ok) {
+      const err = new Error(String((body as AnyRow).message || (body as AnyRow).error || `WMS profile sync failed with ${response.status}`));
+      (err as any).status = response.status;
+      (err as any).payload = body;
+      throw err;
+    }
   }
 
   await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
     userId,
     'wms_profile_sync_requested',
     JSON.stringify({
-      externalOmsIntermediaryId: payload.externalOmsIntermediaryId,
-      response: body,
+      externalOmsIntermediaryIds,
+      response: responses,
     }),
   ]).catch((err) => log?.warn?.({ err, userId }, 'failed to log WMS profile sync'));
 
-  return { success: true, response: body };
+  return { success: true, response: responses };
 }
