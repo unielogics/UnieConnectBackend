@@ -14,6 +14,7 @@ import { exchangeCodeForTokens as exchangeAmazonCodeForTokens } from '../service
 import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
 import { applyShopifyWebhook, markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
 import { amazonAppIdKind, getAmazonAccountHealth, getAmazonInboundLabels, pullAmazonSql } from '../services/amazon-spapi';
+import { postCortex } from '../services/cortex-orchestration';
 
 type AnyRow = Record<string, any>;
 
@@ -808,6 +809,222 @@ async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
     throw err;
   }
   return data as T;
+}
+
+async function ensurePricingSnapshotTable() {
+  await pgQuery(`
+    CREATE TABLE IF NOT EXISTS oms_pricing_intelligence_snapshots (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      shipment_plan_id UUID NULL,
+      rate_shop_scope TEXT,
+      network_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      source_quality JSONB NOT NULL DEFAULT '{}'::jsonb,
+      cortex_run_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `).catch(() => null);
+}
+
+function normalizeItemForPricing(line: AnyRow, catalog?: AnyRow | null) {
+  const dimensions = json(line.dimensions, json(catalog?.dimensions, {}));
+  const quantity = number(line.quantity ?? line.qty ?? line.units ?? line.unitsExpected ?? 1, 1);
+  return {
+    itemId: line.itemId || line.id || catalog?.id || null,
+    sku: line.sku || catalog?.sku || '',
+    title: line.itemName || line.title || catalog?.title || line.sku || '',
+    quantity,
+    weightLb: number(line.weightLb ?? line.weight ?? catalog?.weight, 0),
+    dimensions,
+    asin: line.asin || catalog?.asin || null,
+    enrichmentState: json(catalog?.metadata, {})?.keepaEnrichmentState || null,
+  };
+}
+
+async function connectedWarehousesForPricing(userId: string, requestedFacilityId?: string | null) {
+  const values: unknown[] = [userId];
+  const where = [`l.user_id = $1`, `l.status = 'connected'`];
+  if (requestedFacilityId) {
+    values.push(requestedFacilityId);
+    where.push(`l.facility_id::text = $${values.length}`);
+  }
+  const data = await rows(
+    `SELECT l.*, f.code AS facility_code, f.name AS facility_name, f.address AS facility_address, f.metadata AS facility_metadata
+     FROM oms_warehouse_links l
+     LEFT JOIN facilities f ON f.id = l.facility_id
+     WHERE ${where.join(' AND ')}
+     ORDER BY l.connected_at DESC NULLS LAST`,
+    values,
+  );
+  const policies = data
+    .map((row) => json(row.metadata, {})?.networkPolicy)
+    .filter((policy) => policy && typeof policy === 'object');
+  const anchored = policies.find((policy) => policy.multiWarehouseOptimizationEnabled === false);
+  const activePolicy = anchored || policies[0] || {};
+  const warehouses = await Promise.all(data.map(async (row) => {
+    const metadata = json(row.metadata, {});
+    const address = json(row.facility_address, {});
+    const warehouseCode = row.warehouse_code || row.facility_code;
+    let pricingProfile: AnyRow = {};
+    if (warehouseCode) {
+      pricingProfile = await getWmsInternal(`/internal/oms/pricing-profile?warehouseCode=${encodeURIComponent(warehouseCode)}`).catch(() => ({}));
+    }
+    return {
+      warehouseCode,
+      warehouseId: row.facility_id || warehouseCode,
+      name: row.facility_name || metadata?.wmsWarehouse?.name || warehouseCode,
+      postal: address.zipCode || address.postalCode || metadata?.wmsWarehouse?.zipCode || metadata?.wmsWarehouse?.postal || '',
+      state: address.state || metadata?.wmsWarehouse?.state || '',
+      pricingProfileId: pricingProfile?.pricingProfileId || metadata?.pricingProfileId || null,
+      rateCard: pricingProfile || {},
+      isAnchor: activePolicy?.anchorWarehouseCode ? activePolicy.anchorWarehouseCode === warehouseCode : data[0]?.warehouse_code === warehouseCode,
+    };
+  }));
+  return {
+    warehouses: warehouses.filter((warehouse) => warehouse.warehouseCode),
+    networkPolicy: activePolicy,
+  };
+}
+
+async function destinationStateWeights(userId: string) {
+  const data = await rows(
+    `SELECT UPPER(COALESCE(
+        NULLIF(shipping_address->>'stateOrProvinceCode', ''),
+        NULLIF(shipping_address->>'state', ''),
+        NULLIF(shipping_address->>'province', '')
+      )) AS state,
+      COUNT(*)::int AS orders
+     FROM orders
+     WHERE user_id = $1
+       AND shipping_address IS NOT NULL
+     GROUP BY state`,
+    [userId],
+  ).catch(() => []);
+  const out: Record<string, number> = {};
+  for (const row of data) {
+    const state = trim(row.state).toUpperCase();
+    if (/^[A-Z]{2}$/.test(state)) out[state] = number(row.orders, 0);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+async function shipmentPricingPreview(userId: string, input: AnyRow) {
+  const requestItems = Array.isArray(input.items) ? input.items : [];
+  const plan = input.shipmentPlanId
+    ? await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2', [input.shipmentPlanId, userId])
+    : null;
+  const rawItems = requestItems.length ? requestItems : json(plan?.items, []);
+  const skus = Array.from(new Set(rawItems.map((line: AnyRow) => trim(line?.sku)).filter(Boolean)));
+  const catalogRows = skus.length
+    ? await rows(
+      `SELECT id, sku, title, weight, dimensions, asin, metadata
+       FROM catalog_items
+       WHERE user_id = $1 AND sku = ANY($2::text[])`,
+      [userId, skus],
+    )
+    : [];
+  const catalogBySku = new Map(catalogRows.map((row) => [String(row.sku), row]));
+  const items = rawItems.map((line: AnyRow) => normalizeItemForPricing(line, catalogBySku.get(trim(line?.sku))));
+  const requestedFacilityId = input.facilityId || plan?.facility_id || null;
+  const { warehouses, networkPolicy } = await connectedWarehousesForPricing(userId, requestedFacilityId);
+  if (!warehouses.length) {
+    return {
+      ok: false,
+      status: 412,
+      data: {
+        error: 'No connected warehouse is available for pricing.',
+        blockers: ['connected_warehouse_required'],
+      },
+    };
+  }
+  const supplierPickupRequired = Boolean(input.supplierPickupRequired || input.requiresSupplierPickup || input.ltlPickupRequired);
+  const supplierPickupEstimate = input.supplierPickupEstimate || (supplierPickupRequired ? { amount: number(input.supplierPickupAmount, 0) } : null);
+  const payload = {
+    userId,
+    shipmentPlanId: input.shipmentPlanId || plan?.id || null,
+    selectedWarehouseCode: input.warehouseCode || warehouses[0]?.warehouseCode || null,
+    items,
+    warehouses,
+    networkPolicy,
+    orderCount: number(input.orderCount, items.reduce((sum: number, item: AnyRow) => sum + number(item.quantity, 1), 0)),
+    supplierPickupRequired,
+    supplierPickupEstimate,
+    destinationStateWeights: await destinationStateWeights(userId),
+    serviceCode: input.serviceCode || 'GROUND',
+    sourceQuality: { destinationMix: 'oms_orders_or_cortex_48_state_prior', warehousePricing: 'wms_pricing_profile' },
+  };
+  const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', payload, {
+    userId,
+    idempotencyKey: `oms-pricing-${userId}-${payload.shipmentPlanId || randomUUID()}`,
+    allowGlobalApiKey: true,
+  });
+  if (cortex.ok) {
+    await ensurePricingSnapshotTable();
+    await pgQuery(
+      `INSERT INTO oms_pricing_intelligence_snapshots
+        (user_id, shipment_plan_id, rate_shop_scope, network_policy, payload, source_quality, cortex_run_id)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7)`,
+      [
+        userId,
+        payload.shipmentPlanId || null,
+        cortex.data?.rateShopScope || null,
+        JSON.stringify(networkPolicy || {}),
+        JSON.stringify(cortex.data || {}),
+        JSON.stringify(payload.sourceQuality || {}),
+        cortex.data?.cortexRunId || cortex.idempotency_key || null,
+      ],
+    ).catch(() => null);
+  }
+  return cortex;
+}
+
+function fallbackPricingPreview(items: AnyRow[]) {
+  const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
+  const receiving = Math.max(12, units * 0.18);
+  const prep = units * 0.35;
+  const palletization = Math.ceil(units / 80) * 18;
+  const total = receiving + prep + palletization;
+  return {
+    schemaVersion: 'oms_shipment_pricing_estimate_fallback_v1',
+    currency: 'USD',
+    dueToday: 0,
+    dueTodayReason: 'warehouse_fees_billed_when_services_are_performed',
+    feeTimingNotice: 'Warehouse fees are billed when services are performed. Due today is $0.00 unless supplier pickup or paid transportation is selected.',
+    confidence: 0.35,
+    blockers: ['cortex_pricing_unavailable'],
+    sourceLabels: ['local_degraded_fallback'],
+    warehouses: [{
+      warehouseCode: 'fallback',
+      feePreview: {
+        lineItems: [
+          { code: 'receiving', label: 'Receiving', amount: money(receiving), perUnit: money(receiving / Math.max(units, 1)) },
+          { code: 'prep_lab', label: 'Prep services', amount: money(prep), perUnit: money(prep / Math.max(units, 1)) },
+          { code: 'palletization', label: 'Palletization estimate', amount: money(palletization), perUnit: money(palletization / Math.max(units, 1)) },
+        ],
+        total: money(total),
+        perUnit: money(total / Math.max(units, 1)),
+      },
+      weightedLabelCostPerUnit: 0,
+      labelCostByState: [],
+      totalEstimatedCost: money(total),
+      totalEstimatedCostPerUnit: money(total / Math.max(units, 1)),
+    }],
+  };
+}
+
+function firstPricingWarehouse(preview: any) {
+  const warehouses = Array.isArray(preview?.warehouses) ? preview.warehouses : [];
+  return warehouses[0] || null;
+}
+
+function feePreviewFromPricing(preview: any) {
+  const warehouse = firstPricingWarehouse(preview);
+  const fee = warehouse?.feePreview || {};
+  const total = money(fee.total ?? warehouse?.totalEstimatedCost ?? 0);
+  const perUnit = money(fee.perUnit ?? warehouse?.totalEstimatedCostPerUnit ?? warehouse?.estimatedCostPerUnit ?? 0);
+  const lineItems = Array.isArray(fee.lineItems) ? fee.lineItems : [];
+  return { warehouse, fee, total, perUnit, lineItems };
 }
 
 async function syncOmsCatalogToWms(params: {
@@ -2113,17 +2330,41 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
+    const previewResult = await shipmentPricingPreview(userId, {
+      ...req.body,
+      items,
+      facilityId: req.body?.facilityId || null,
+    }).catch((error) => ({ ok: false, error }));
+    const pricingPreview = (previewResult as any)?.ok
+      ? (previewResult as any).data
+      : fallbackPricingPreview(items);
+    const normalized = feePreviewFromPricing(pricingPreview);
     return {
       currency: 'USD',
-      lineItems: [
-        { code: 'receiving', label: 'Receiving', amount: money(Math.max(12, units * 0.18)) },
-        { code: 'prep', label: 'Prep services', amount: money(units * 0.35) },
-        { code: 'palletization', label: 'Palletization estimate', amount: money(Math.ceil(units / 80) * 18) },
-      ],
-      total: money(Math.max(12, units * 0.18) + units * 0.35 + Math.ceil(units / 80) * 18),
-      source: 'aurora_sql_estimate',
+      lineItems: normalized.lineItems,
+      total: normalized.total,
+      perUnit: normalized.perUnit,
+      warehouseCode: normalized.warehouse?.warehouseCode || null,
+      dueToday: money(pricingPreview.dueToday || 0),
+      feeTimingNotice: pricingPreview.feeTimingNotice,
+      confidence: pricingPreview.confidence,
+      blockers: pricingPreview.blockers || [],
+      pricingPreview,
+      source: (previewResult as any)?.ok ? 'cortex_shipment_pricing_estimate' : 'local_degraded_fallback',
     };
+  });
+
+  app.post('/shipment-plans/pricing-preview', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const result = await shipmentPricingPreview(userId, req.body || {}).catch((error) => ({ ok: false, error }));
+    if ((result as any).ok) return (result as any).data;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const fallback = fallbackPricingPreview(items);
+    return reply.code((result as any).status || 200).send({
+      ...fallback,
+      error: (result as any)?.data?.error || (result as any)?.error?.message || 'Cortex pricing preview is unavailable.',
+    });
   });
 
   app.get('/shipment-plans/closest-facility-preview', async (req: any, reply) => {
@@ -2369,17 +2610,28 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const plan = await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     if (!plan) return reply.code(404).send({ error: 'Not found' });
     const items = Array.isArray(plan.items) ? plan.items : [];
-    const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
-    const base = Math.max(125, units * 1.85);
+    const previewResult = await shipmentPricingPreview(userId, { shipmentPlanId: plan.id }).catch((error) => ({ ok: false, error }));
+    const pricingPreview = (previewResult as any)?.ok ? (previewResult as any).data : fallbackPricingPreview(items);
+    const warehouses = Array.isArray(pricingPreview.warehouses) ? pricingPreview.warehouses : [];
+    const rates = warehouses.map((warehouse: any) => ({
+      serviceTier: 'standard',
+      carrier: warehouse.source === 'cortex_modeled_estimate' ? 'Cortex modeled estimate' : 'Cortex OMS pricing',
+      warehouseCode: warehouse.warehouseCode,
+      amount: money(warehouse.totalEstimatedCost ?? warehouse.feePreview?.total ?? 0),
+      transitDays: null,
+      recommendation: `${warehouse.warehouseCode || 'Warehouse'} pricing includes fulfillment, label, storage, and transportation intelligence where available.`,
+      source: warehouse.source || 'cortex',
+      confidence: warehouse.confidence ?? pricingPreview.confidence,
+    }));
     return {
       planId: plan.id,
       currency: 'USD',
-      rates: [
-        { serviceTier: 'economy', carrier: 'Cortex LTL', amount: money(base * 0.86), transitDays: 5, recommendation: 'Best cost when consolidation is allowed.' },
-        { serviceTier: 'standard', carrier: 'Cortex LTL', amount: money(base), transitDays: 3, recommendation: 'Balanced speed and utilization.' },
-        { serviceTier: 'priority', carrier: 'Cortex LTL', amount: money(base * 1.28), transitDays: 2, recommendation: 'Faster movement with lower consolidation tolerance.' },
-      ],
-      source: 'aurora_sql_rate_model',
+      rates,
+      parcel: rates,
+      ltl: [],
+      ftl: [],
+      pricingPreview,
+      source: (previewResult as any)?.ok ? 'cortex_shipment_pricing_estimate' : 'local_degraded_fallback',
     };
   });
 
@@ -2388,8 +2640,26 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const plan = await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     if (!plan) return reply.code(404).send({ error: 'Not found' });
-    const units = Array.isArray(plan.items) ? plan.items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0) : 0;
-    return { currency: 'USD', total: money(95 + units * 1.1), source: 'aurora_sql_estimate', facilityId: plan.facility_id };
+    const items = Array.isArray(plan.items) ? plan.items : [];
+    const previewResult = await shipmentPricingPreview(userId, { shipmentPlanId: plan.id }).catch((error) => ({ ok: false, error }));
+    const pricingPreview = (previewResult as any)?.ok ? (previewResult as any).data : fallbackPricingPreview(items);
+    const normalized = feePreviewFromPricing(pricingPreview);
+    const breakdown = normalized.lineItems.reduce((acc: Record<string, number>, line: any) => {
+      acc[line.code || line.label || 'fee'] = money(line.amount || 0);
+      return acc;
+    }, {});
+    breakdown.label = money(normalized.warehouse?.weightedLabelCostPerUnit || 0);
+    breakdown.storage = money(normalized.warehouse?.storageEstimate?.monthlyTotal || 0);
+    breakdown.dueToday = money(pricingPreview.dueToday || 0);
+    return {
+      currency: 'USD',
+      total: normalized.warehouse ? money(normalized.warehouse.totalEstimatedCost ?? normalized.total) : normalized.total,
+      perUnit: normalized.warehouse ? money(normalized.warehouse.totalEstimatedCostPerUnit ?? normalized.perUnit) : normalized.perUnit,
+      breakdown,
+      source: (previewResult as any)?.ok ? 'cortex_shipment_pricing_estimate' : 'local_degraded_fallback',
+      facilityId: plan.facility_id,
+      pricingPreview,
+    };
   });
 
   app.get('/invoices', async (req: any, reply) => {

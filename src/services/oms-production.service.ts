@@ -785,6 +785,7 @@ async function getAmazonProfilesForItems(userId: string, itemIds: string[]) {
 }
 
 function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>, facilitiesCount: number, filter: MarketplaceFilter = {}) {
+  const metadata = json(item.metadata, {});
   const inv = itemInventory(item, filter);
   const available = number(inv.available);
   const velocity = Math.max(0, number(velocityBySku.get(item.sku)));
@@ -794,11 +795,21 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
   const cube = (number(dim.length) * number(dim.width) * number(dim.height)) / 1728;
   const weight = number(item.weight);
   const risk = velocity === 0 ? 'needs_sales_data' : daysOfCover < 14 ? 'high' : daysOfCover < 30 ? 'medium' : 'low';
+  const asin = String(item.asin || '').trim();
+  const keepaEnrichmentState =
+    metadata.keepaEnrichmentState ||
+    metadata.keepa_enrichment_state ||
+    (asin ? 'needs_retry' : 'missing_asin');
+  const keepaUnavailable = keepaEnrichmentState === 'keepa_unavailable';
   return {
     id: String(item.id),
     sku: item.sku,
     title: item.title,
     supplierId: item.supplier_id || null,
+    asin: asin || null,
+    enrichmentState: keepaEnrichmentState,
+    keepaUnavailable,
+    enrichmentMarker: keepaUnavailable ? '*' : '',
     available,
     inbound: number(inv.inbound),
     velocity30d: velocity,
@@ -1064,8 +1075,15 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
         [userId, item.id],
       )
     : null;
-  // (paste-replace) Keepa enrichment: best-effort, never fails the response.
+  // Keepa enrichment is best-effort and never fails the SKU response.
   const asin = (item.asin || '').trim().toUpperCase() || null;
+  const metadata = json(item.metadata, {});
+  const existingKeepaState = metadata.keepaEnrichmentState || metadata.keepa_enrichment_state;
+  let keepaEnrichmentState = existingKeepaState === 'manual_override'
+    ? 'manual_override'
+    : asin
+      ? 'needs_retry'
+      : 'missing_asin';
   let keepa: any = null;
   if (asin) {
     try {
@@ -1089,10 +1107,35 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
           fetchedAt: snap.fetched_at,
           expiresAt: snap.expires_at,
         };
+        if (keepaEnrichmentState !== 'manual_override') keepaEnrichmentState = 'keepa_enriched';
+      } else if (keepaEnrichmentState !== 'manual_override') {
+        keepaEnrichmentState = 'keepa_unavailable';
       }
     } catch {
-      // ignore; UI shows local fields only when Keepa is unreachable
+      if (keepaEnrichmentState !== 'manual_override') keepaEnrichmentState = 'keepa_unavailable';
     }
+  }
+  if (
+    metadata.keepaEnrichmentState !== keepaEnrichmentState ||
+    metadata.keepaEnrichmentMarker !== (keepaEnrichmentState === 'keepa_unavailable' ? '*' : '')
+  ) {
+    metadata.keepaEnrichmentState = keepaEnrichmentState;
+    metadata.keepaEnrichmentMarker = keepaEnrichmentState === 'keepa_unavailable' ? '*' : '';
+    metadata.keepaEnrichmentUpdatedAt = new Date().toISOString();
+    await pgQuery(
+      `UPDATE catalog_items
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb
+       WHERE id = $1 AND user_id = $2`,
+      [
+        item.id,
+        userId,
+        JSON.stringify({
+          keepaEnrichmentState: metadata.keepaEnrichmentState,
+          keepaEnrichmentMarker: metadata.keepaEnrichmentMarker,
+          keepaEnrichmentUpdatedAt: metadata.keepaEnrichmentUpdatedAt,
+        }),
+      ],
+    ).catch(() => null);
   }
   // Fallbacks for missing local dims/weight when Keepa has them
   const dimsLocal = itemDimensions(item);
@@ -1102,7 +1145,6 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     height: dimsLocal?.height || keepa?.dimensions?.heightIn || null,
   };
   const weight = (item.weight && Number(item.weight) > 0) ? Number(item.weight) : (keepa?.weightLb || null);
-  const metadata = json(item.metadata, {});
   const attributes = json(item.attributes, {});
   const images = Array.isArray(item.images) ? item.images : Array.isArray(metadata.images) ? metadata.images : [];
   const description = item.description || metadata.description || attributes.description || keepa?.description || '';
@@ -1123,6 +1165,9 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     image: item.image || null,
     images: images.filter(Boolean),
     supplierId: item.supplier_id || null,
+    enrichmentState: keepaEnrichmentState,
+    keepaUnavailable: keepaEnrichmentState === 'keepa_unavailable',
+    enrichmentMarker: keepaEnrichmentState === 'keepa_unavailable' ? '*' : '',
     dimensions: dims,
     weight,
     price: item.price ?? metadata.price ?? metadata.shopifyPrice ?? keepa?.buyboxPrice ?? null,
@@ -1131,7 +1176,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     metadata,
     intelligence,
     amazon: mapAmazonProfile(amazonProfile),
-    keepa,    // NEW field — null when ASIN absent or cache empty
+    keepa,
     nextShipments: activityPlans.slice(0, 6).map((plan, i) => ({
       id: plan.internal_shipment_id || String(plan.id),
       date: iso(plan.estimated_arrival_date || plan.order_date || plan.created_at),
@@ -1210,6 +1255,13 @@ export async function updateOmsSkuEnrichment(userId: string, skuOrId: string, in
   setMeta('price', price);
   setMeta('source', marketplaceSource);
   setAttr('size', size);
+
+  if (asin !== undefined && metadata.keepaEnrichmentState !== 'manual_override') {
+    const nextAsin = asin || null;
+    metadata.keepaEnrichmentState = nextAsin ? 'needs_retry' : 'missing_asin';
+    metadata.keepaEnrichmentMarker = '';
+    metadata.keepaEnrichmentUpdatedAt = new Date().toISOString();
+  }
 
   if (input.dimensions && typeof input.dimensions === 'object') {
     const length = cleanNumber(input.dimensions.length);
