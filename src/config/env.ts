@@ -97,6 +97,15 @@ export const config = {
   geoapify: {
     apiKey: process.env.GEOAPIFY_API_KEY || '',
   },
+  email: {
+    smtpHost: process.env.SMTP_HOST || '',
+    smtpPort: Number(process.env.SMTP_PORT || 587),
+    smtpUser: process.env.SMTP_USER || '',
+    smtpPass: process.env.SMTP_PASS || '',
+    smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+    from: process.env.EMAIL_FROM || process.env.SMTP_FROM || '',
+    queueOnly: String(process.env.EMAIL_QUEUE_ONLY || '').toLowerCase() === 'true',
+  },
   uploads: {
     s3Bucket: process.env.S3_UPLOAD_BUCKET || process.env.UPLOADS_S3_BUCKET || '',
     s3Region: process.env.S3_UPLOAD_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1',

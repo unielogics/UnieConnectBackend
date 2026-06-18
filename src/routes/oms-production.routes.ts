@@ -23,6 +23,8 @@ import {
   getOmsSuppliers,
   getWarehouseDetail,
   getWarehouseOverview,
+  generateShipmentPalletLabelsPdf,
+  retryShipmentVendorEmail,
   updateOmsSkuEnrichment,
 } from '../services/oms-production.service';
 import { getKeepaSnapshot, peekKeepaSnapshot } from '../services/keepa';
@@ -132,6 +134,23 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return confirmShipmentWizardDraft(userId, String(req.params?.draftId || ''), req.body || {}, req.log);
+  });
+
+  fastify.get('/oms/shipment-wizard/drafts/:draftId/pallet-labels.pdf', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const pdf = await generateShipmentPalletLabelsPdf(userId, String(req.params?.draftId || ''));
+    if (!pdf) return reply.code(404).send({ error: 'Pallet labels not found' });
+    reply
+      .header('Content-Type', 'application/pdf')
+      .header('Content-Disposition', `attachment; filename="${pdf.filename}"`);
+    return reply.send(pdf.buffer);
+  });
+
+  fastify.post('/oms/shipment-wizard/drafts/:draftId/vendor-email/retry', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return retryShipmentVendorEmail(userId, String(req.params?.draftId || ''), req.log);
   });
 
   fastify.get('/oms/heatmap', async (req: any, reply) => {

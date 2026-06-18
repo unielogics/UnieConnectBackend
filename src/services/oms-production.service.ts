@@ -2,6 +2,9 @@ import { getKeepaSnapshot } from "./keepa";
 import { randomUUID } from 'crypto';
 import { FastifyBaseLogger } from 'fastify';
 import fetch from 'node-fetch';
+import PDFDocument from 'pdfkit';
+import bwipjs from 'bwip-js';
+import nodemailer from 'nodemailer';
 import { config } from '../config/env';
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
@@ -14,6 +17,7 @@ type MarketplaceFilter = {
   channel?: string;
   channelAccountId?: string;
 };
+type VendorEmailStatus = 'sent' | 'queued' | 'failed' | 'not_configured';
 
 const number = (value: unknown, fallback = 0) => {
   const n = Number(value);
@@ -26,6 +30,16 @@ const money = (value: unknown) => {
 };
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
+
+const addressLine = (address: any = {}) => {
+  const line1 = address.addressLine1 || address.line1 || address.street1 || address.street || '';
+  const line2 = address.addressLine2 || address.line2 || address.street2 || '';
+  const city = address.city || '';
+  const state = address.stateOrProvinceCode || address.state || '';
+  const postal = address.postalCode || address.postal || address.zip || address.zipCode || '';
+  const country = address.countryCode || address.country || '';
+  return [line1, line2, [city, state, postal].filter(Boolean).join(', '), country].filter(Boolean).join(' · ');
+};
 
 function sumSelectedQuantity(items: unknown): number {
   if (!Array.isArray(items)) return 0;
@@ -318,6 +332,200 @@ async function rows<T extends Row = Row>(sql: string, values: unknown[] = []): P
 async function one<T extends Row = Row>(sql: string, values: unknown[] = []): Promise<T | null> {
   const data = await rows<T>(sql, values);
   return data[0] || null;
+}
+
+async function barcodePng(text: string) {
+  return bwipjs.toBuffer({
+    bcid: 'code128',
+    text: text || 'UNKNOWN',
+    scale: 2,
+    height: 8,
+    includetext: false,
+    paddingwidth: 2,
+    paddingheight: 2,
+  });
+}
+
+async function shipmentDocumentContext(userId: string, draftId: string) {
+  const draft = await one('SELECT * FROM oms_shipment_wizard_drafts WHERE id = $1 AND user_id = $2 LIMIT 1', [draftId, userId]);
+  if (!draft) return null;
+  const plan = draft.shipment_plan_id
+    ? await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2 LIMIT 1', [draft.shipment_plan_id, userId])
+    : null;
+  const asn = draft.asn_id
+    ? await one('SELECT * FROM asns WHERE id = $1 AND user_id = $2 LIMIT 1', [draft.asn_id, userId])
+    : null;
+  const supplierId = draft.supplier_id || plan?.supplier_id || null;
+  const supplier = supplierId ? await one('SELECT * FROM suppliers WHERE id = $1 AND user_id = $2 LIMIT 1', [supplierId, userId]) : null;
+  const facility = plan?.facility_id ? await one('SELECT * FROM facilities WHERE id = $1 LIMIT 1', [plan.facility_id]) : null;
+  return { draft, plan, asn, supplier, facility };
+}
+
+function labelFilename(ctx: NonNullable<Awaited<ReturnType<typeof shipmentDocumentContext>>>) {
+  const asnNo = String(ctx.asn?.asn_number || ctx.plan?.internal_shipment_id || ctx.draft.id || 'shipment').replace(/[^a-z0-9_-]/gi, '-');
+  return `${asnNo}-pallet-labels.pdf`;
+}
+
+function selectedLinesForLabels(ctx: NonNullable<Awaited<ReturnType<typeof shipmentDocumentContext>>>) {
+  const raw = itemLines(ctx.draft.selected_items || ctx.plan?.items || []);
+  return raw.map((line) => {
+    const cartons = Math.max(1, number(line?.cartons ?? line?.containersCount, 1));
+    const unitsPerCarton = Math.max(1, number(line?.unitsPerCarton ?? line?.unitsPerContainer, 1));
+    const units = shipmentLineQuantity(line) || cartons * unitsPerCarton;
+    return {
+      sku: String(line?.sku || line?.itemName || 'SKU'),
+      title: String(line?.title || line?.itemName || line?.name || line?.sku || 'Item'),
+      cartons,
+      units,
+    };
+  });
+}
+
+export async function generateShipmentPalletLabelsPdf(userId: string, draftId: string) {
+  const ctx = await shipmentDocumentContext(userId, draftId);
+  if (!ctx) return null;
+  const packagePlan = json(ctx.draft.package_plan || ctx.plan?.metadata?.packagePlan, {});
+  const lines = selectedLinesForLabels(ctx);
+  const totalCartons = Math.max(1, number(packagePlan.totalCartons ?? lines.reduce((sum, line) => sum + line.cartons, 0), 1));
+  const totalUnits = Math.max(1, number(packagePlan.totalUnits ?? lines.reduce((sum, line) => sum + line.units, 0), 1));
+  const palletCount = Math.max(1, number(packagePlan.pallets, 1));
+  const asnNumber = String(ctx.asn?.asn_number || ctx.plan?.internal_shipment_id || `ASN-${draftId.slice(0, 8)}`);
+  const planId = String(ctx.plan?.internal_shipment_id || ctx.plan?.id || draftId);
+  const supplierAddress = addressLine(json(ctx.supplier?.address, {}));
+  const facilityAddress = addressLine(json(ctx.facility?.address, {}));
+  const facilityName = String(ctx.facility?.name || ctx.facility?.code || 'Receiving warehouse');
+  const doc = new PDFDocument({ size: [288, 432], margin: 18, autoFirstPage: false });
+  const chunks: Buffer[] = [];
+  doc.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+  const done = new Promise<Buffer>((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+  const asnBarcode = await barcodePng(asnNumber);
+
+  for (let i = 1; i <= palletCount; i += 1) {
+    const palletId = `${asnNumber}-PALLET-${String(i).padStart(2, '0')}`;
+    const palletBarcode = await barcodePng(palletId);
+    doc.addPage();
+    doc.fontSize(14).font('Helvetica-Bold').text('UnieConnect ASN Pallet Label', { align: 'center' });
+    doc.moveDown(0.35);
+    doc.fontSize(9).font('Helvetica').text('Vendor: place this label on the pallet before pickup.', { align: 'center' });
+    doc.moveDown(0.6);
+    doc.fontSize(10).font('Helvetica-Bold').text(`ASN: ${asnNumber}`);
+    doc.fontSize(9).font('Helvetica').text(`Shipment plan: ${planId}`);
+    doc.text(`Pallet: ${i} of ${palletCount}`);
+    doc.text(`Cartons / units: ${totalCartons.toLocaleString()} / ${totalUnits.toLocaleString()}`);
+    doc.moveDown(0.45);
+    doc.font('Helvetica-Bold').text('Supplier');
+    doc.font('Helvetica').text(String(ctx.supplier?.name || 'Supplier not assigned'));
+    if (supplierAddress) doc.text(supplierAddress, { width: 252 });
+    doc.moveDown(0.45);
+    doc.font('Helvetica-Bold').text('Receiving warehouse');
+    doc.font('Helvetica').text(facilityName);
+    if (facilityAddress) doc.text(facilityAddress, { width: 252 });
+    doc.moveDown(0.45);
+    doc.font('Helvetica-Bold').text('SKU summary');
+    doc.font('Helvetica').fontSize(8);
+    lines.slice(0, 5).forEach((line) => {
+      doc.text(`${line.sku} · ${line.cartons} ctn · ${line.units} u`, { width: 252 });
+    });
+    if (lines.length > 5) doc.text(`+ ${lines.length - 5} more SKU lines`);
+    doc.moveDown(0.45);
+    doc.image(asnBarcode, 34, 292, { width: 220, height: 42 });
+    doc.fontSize(7).text(asnNumber, 18, 334, { align: 'center', width: 252 });
+    doc.image(palletBarcode, 34, 352, { width: 220, height: 42 });
+    doc.fontSize(7).text(palletId, 18, 394, { align: 'center', width: 252 });
+  }
+  doc.end();
+  return {
+    buffer: await done,
+    filename: labelFilename(ctx),
+    pageCount: palletCount,
+    context: ctx,
+  };
+}
+
+async function mergeShipmentDocumentMetadata(params: {
+  userId: string;
+  draftId: string;
+  documents: Row;
+}) {
+  const ctx = await shipmentDocumentContext(params.userId, params.draftId);
+  if (!ctx) return;
+  const patch = JSON.stringify({ documents: params.documents });
+  if (ctx.plan?.id) {
+    await pgQuery(
+      `UPDATE shipment_plans
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $2`,
+      [ctx.plan.id, params.userId, patch],
+    ).catch(() => null);
+  }
+  if (ctx.asn?.id) {
+    await pgQuery(
+      `UPDATE asns
+       SET payload = COALESCE(payload, '{}'::jsonb) || $3::jsonb,
+           updated_at = now()
+       WHERE id = $1 AND user_id = $2`,
+      [ctx.asn.id, params.userId, patch],
+    ).catch(() => null);
+  }
+}
+
+export async function attemptShipmentVendorEmail(userId: string, draftId: string, log?: FastifyBaseLogger) {
+  const pdf = await generateShipmentPalletLabelsPdf(userId, draftId);
+  if (!pdf) return { status: 'failed' as VendorEmailStatus, reason: 'shipment_not_found', recipient: null };
+  const recipient = String(pdf.context.supplier?.email || '').trim();
+  if (!recipient) return { status: 'failed' as VendorEmailStatus, reason: 'supplier_email_missing', recipient: null };
+  if (!config.email.smtpHost || !config.email.from) {
+    return { status: 'not_configured' as VendorEmailStatus, reason: 'email_provider_not_configured', recipient };
+  }
+  if (config.email.queueOnly) {
+    return { status: 'queued' as VendorEmailStatus, recipient };
+  }
+  try {
+    const transport = nodemailer.createTransport({
+      host: config.email.smtpHost,
+      port: config.email.smtpPort,
+      secure: config.email.smtpSecure,
+      auth: config.email.smtpUser ? { user: config.email.smtpUser, pass: config.email.smtpPass } : undefined,
+    });
+    await transport.sendMail({
+      from: config.email.from,
+      to: recipient,
+      subject: `Required pallet labels for ${pdf.context.asn?.asn_number || 'your UnieConnect shipment'}`,
+      text: [
+        'Attached are the required UnieConnect ASN pallet labels.',
+        'Please print the PDF and place one label on each pallet before pickup.',
+        'The shipment ASN has already been created in UnieConnect.',
+      ].join('\n\n'),
+      attachments: [{ filename: pdf.filename, content: pdf.buffer, contentType: 'application/pdf' }],
+    });
+    return { status: 'sent' as VendorEmailStatus, recipient };
+  } catch (err: any) {
+    log?.warn({ err, draftId, recipient }, 'shipment vendor email failed');
+    return { status: 'failed' as VendorEmailStatus, reason: err?.message || 'email_send_failed', recipient };
+  }
+}
+
+export async function retryShipmentVendorEmail(userId: string, draftId: string, log?: FastifyBaseLogger) {
+  const vendorEmail = await attemptShipmentVendorEmail(userId, draftId, log);
+  const documents = {
+    vendorEmail: { ...vendorEmail, attemptedAt: new Date().toISOString() },
+  };
+  await mergeShipmentDocumentMetadata({ userId, draftId, documents });
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'shipment_wizard',
+    entityId: draftId,
+    eventType: 'vendor_pallet_label_email_retry',
+    sourceSystem: 'oms',
+    summary: `Vendor pallet label email ${vendorEmail.status}.`,
+    payload: documents,
+    confidence: vendorEmail.status === 'sent' || vendorEmail.status === 'queued' ? 0.9 : 0.5,
+  });
+  return vendorEmail;
 }
 
 function rangeStart(range: RangeKey): Date {
@@ -1437,7 +1645,7 @@ export async function createShipmentWizardDraft(userId: string, body: any) {
     supplierId: body?.supplierId || null,
     status: 'draft',
     requiresBol: body?.requiresBol !== false,
-    requiresLabels: Boolean(body?.requiresLabels),
+    requiresLabels: true,
     selectedItems: Array.isArray(body?.selectedItems) ? body.selectedItems : [],
     packagePlan: body?.packagePlan || {},
     cortexRouting: {
@@ -1504,6 +1712,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
   const selectedItems = Array.isArray(body?.selectedItems) ? body.selectedItems : [];
   const supplierId = body?.supplierId || null;
   const assignSupplierToSkus = body?.assignSupplierToSkus === true;
+  const requiresLabels = true;
   const shipFromLocationId = body?.shipFromLocationId || null;
   const requestedFacilityId = body?.facilityId || null;
   const warehouseRoutingMode = body?.warehouseRoutingMode || null;
@@ -1596,7 +1805,8 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
         warehouseSelectionHiddenFromClient: !connectedFacility,
         requiresWmsTruth: true,
         requiresBol: body?.requiresBol !== false,
-        requiresLabels: Boolean(body?.requiresLabels),
+        requiresLabels,
+        packagePlan: body?.packagePlan || {},
         supplierPickupProfile: supplierPickup,
         supplierAssignment,
       }),
@@ -1616,8 +1826,10 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
         supplierName: supplier?.name || null,
         supplierAssignment,
         warehouseRoutingMode: connectedFacility ? 'connected_warehouse' : warehouseRoutingMode || 'national_network',
+        packagePlan: body?.packagePlan || {},
         selectedItems,
         requiresWmsTruth: true,
+        requiresLabels,
         facilityId: facility?.id || null,
       }),
     ],
@@ -1660,6 +1872,13 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     ).catch((err) => log?.warn({ err, asnId: asn.id }, 'failed to update ASN with WMS execution result'));
   }
 
+  await pgQuery(
+    `UPDATE oms_shipment_wizard_drafts
+     SET shipment_plan_id = $2, asn_id = $3, updated_at = now()
+     WHERE id = $1 AND user_id = $4`,
+    [draftId, plan?.id || null, asn?.id || null, userId],
+  ).catch((err) => log?.warn({ err, draftId }, 'failed to link shipment wizard draft documents'));
+
   const cortex = await postCortex('/v1/oms/shipment/projected', {
     userId,
     draftId,
@@ -1682,11 +1901,28 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     skuPlan: selectedItems,
     decisionLifecycle: 'waiting_for_wms_truth',
     requiresBol: body?.requiresBol !== false,
-    requiresLabels: Boolean(body?.requiresLabels),
+    requiresLabels,
     supplierPickupProfile: supplierPickup,
     supplierAssignment,
     wmsExecution,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+
+  const labelPdf = await generateShipmentPalletLabelsPdf(userId, draftId);
+  const vendorEmail = await attemptShipmentVendorEmail(userId, draftId, log);
+  const documents = {
+    palletLabels: {
+      status: labelPdf ? 'ready' : 'failed',
+      downloadUrl: `/api/v1/oms/shipment-wizard/drafts/${encodeURIComponent(draftId)}/pallet-labels.pdf`,
+      filename: labelPdf?.filename || null,
+      pageCount: labelPdf?.pageCount || 0,
+      generatedAt: new Date().toISOString(),
+    },
+    vendorEmail: {
+      ...vendorEmail,
+      attemptedAt: new Date().toISOString(),
+    },
+  };
+  await mergeShipmentDocumentMetadata({ userId, draftId, documents });
 
   if (supplierAssignment.updatedSkuCount > 0) {
     await writeOmsLedgerEvent({
@@ -1710,8 +1946,21 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     summary: (wmsExecution as any)?.ok
       ? 'Shipment wizard created an OMS plan and WMS ASN; receipt still requires WMS truth.'
       : 'Shipment wizard created an OMS projected ASN; final execution waits for WMS truth.',
-    payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, cortex, wmsExecution, supplierAssignment },
+    payload: { draftId, shipmentPlanId: plan?.id || null, asnId: asn?.id || null, cortex, wmsExecution, supplierAssignment, documents },
     confidence: (wmsExecution as any)?.ok ? 0.82 : 0.74,
+  });
+
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'shipment_wizard',
+    entityId: draftId,
+    eventType: 'pallet_labels_generated',
+    sourceSystem: 'oms',
+    summary: labelPdf
+      ? `Generated ${labelPdf.pageCount} required pallet label page${labelPdf.pageCount === 1 ? '' : 's'} for vendor printing.`
+      : 'Required pallet label PDF generation failed.',
+    payload: { documents },
+    confidence: labelPdf ? 0.95 : 0.4,
   });
 
   await pgQuery(
@@ -1727,6 +1976,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     asn: { asn, wmsExecution },
     cortex,
     supplierAssignment,
+    documents,
     degraded: !(wmsExecution as any)?.ok,
   };
 }
