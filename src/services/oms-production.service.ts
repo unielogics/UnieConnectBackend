@@ -666,6 +666,58 @@ async function recentLedger(userId: string, limit = 30) {
   );
 }
 
+async function latestSellerOptimizationSnapshot(userId: string) {
+  if (!(await tableExists('oms_seller_optimization_runs'))) return null;
+  const row = await one(
+    `SELECT sor.*, r.cortex_run_id, r.cortex_status
+     FROM oms_seller_optimization_runs sor
+     LEFT JOIN oms_intelligence_runs r ON r.id = sor.run_id
+     WHERE sor.user_id = $1
+     ORDER BY sor.created_at DESC
+     LIMIT 1`,
+    [userId],
+  ).catch(() => null);
+  if (!row) return null;
+  const sourceSummary = json(row.source_summary, {});
+  const summary = json(row.summary, {});
+  const source = sourceSummary?.source === 'cortex_webhook' || sourceSummary?.from_cortex || summary?.from_cortex
+    ? 'cortex_seller_optimization'
+    : 'oms_cached_seller_optimization';
+  return {
+    id: row.id,
+    runId: row.run_id,
+    cortexRunId: row.cortex_run_id || sourceSummary?.cortexRunId || null,
+    status: row.status,
+    summary,
+    businessDouble: json(row.business_double, {}),
+    inventoryPlan: json(row.inventory_plan, {}),
+    sourceSummary,
+    confidence: row.confidence == null ? null : Number(row.confidence),
+    source,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+function hasPlanPayload(value: any) {
+  return value && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
+function attachCortexSource<T extends Row>(payload: T, snapshot: Awaited<ReturnType<typeof latestSellerOptimizationSnapshot>> | null, fallbackSource: string): T {
+  return {
+    ...payload,
+    source: {
+      ...(payload as any).source,
+      authority: snapshot?.source || fallbackSource,
+      cortexRunId: snapshot?.cortexRunId || null,
+      sellerOptimizationRunId: snapshot?.id || null,
+      sellerOptimizationStatus: snapshot?.status || null,
+      confidence: snapshot?.confidence ?? null,
+      generatedAt: snapshot?.updatedAt || snapshot?.createdAt || (payload as any).generatedAt || new Date().toISOString(),
+    },
+  };
+}
+
 export async function writeOmsLedgerEvent(params: {
   userId: string;
   entityType: string;
@@ -960,11 +1012,14 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
 }
 
 export async function getBusinessDouble(userId: string) {
-  const counts = await baseCounts(userId);
-  const thirty = await orderSummary(userId, rangeStart('30d'));
+  const [counts, thirty, snapshot] = await Promise.all([
+    baseCounts(userId),
+    orderSummary(userId, rangeStart('30d')),
+    latestSellerOptimizationSnapshot(userId),
+  ]);
   const currentMonthlyCost = money(counts.items * 2.75 + counts.orders * 1.35 + counts.shipmentPlans * 42);
   const optimizedMonthlyCost = money(currentMonthlyCost * 0.82);
-  const plan = {
+  const localPlan = {
     id: `generated-${userId}`,
     status: 'draft',
     title: 'Six-month multi-warehouse operating plan',
@@ -994,6 +1049,21 @@ export async function getBusinessDouble(userId: string) {
     autonomousAfterApproval: ['WMS work prioritization', 'ASN routing', 'TMS consolidation', 'label audit claims', 'seller inventory nudges'],
     approvalRequiredFor: ['Business Double operating model changes', 'low-confidence cross-system dispatch', 'policy/compliance exceptions'],
   };
+  const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
+    ? {
+        ...localPlan,
+        ...snapshot?.businessDouble,
+        id: snapshot?.businessDouble?.id || `cortex-${snapshot?.id}`,
+        status: snapshot?.businessDouble?.status || 'draft',
+        title: snapshot?.businessDouble?.title || localPlan.title,
+        summary: snapshot?.businessDouble?.summary || localPlan.summary,
+        forecastHorizonMonths: snapshot?.businessDouble?.forecastHorizonMonths || snapshot?.businessDouble?.forecast_horizon_months || localPlan.forecastHorizonMonths,
+        currentMetrics: snapshot?.businessDouble?.currentMetrics || snapshot?.businessDouble?.current_metrics || localPlan.currentMetrics,
+        optimizedMetrics: snapshot?.businessDouble?.optimizedMetrics || snapshot?.businessDouble?.optimized_metrics || localPlan.optimizedMetrics,
+        savings: snapshot?.businessDouble?.savings || localPlan.savings,
+      }
+    : null;
+  const plan = attachCortexSource(cortexBusinessDouble || localPlan, snapshot, cortexBusinessDouble ? 'cortex_seller_optimization' : 'local_fallback_business_double');
 
   const approved = await rows(
     'SELECT id, title, approved_at, approved_by, current_metrics, optimized_metrics, savings FROM oms_business_plans WHERE user_id = $1 AND status = $2 ORDER BY approved_at DESC LIMIT 1',
@@ -1072,7 +1142,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
   } else if (filter.channel === 'unmapped') {
     velocityClauses.push('o.channel_connection_id IS NULL');
   }
-  const [items, facilities, velocityRows] = await Promise.all([
+  const [items, facilities, velocityRows, snapshot] = await Promise.all([
     getItems(userId, 200, filter),
     getFacilities(userId),
     rows<{ sku: string; units: string }>(
@@ -1084,6 +1154,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
        GROUP BY ol.sku`,
       velocityValues,
     ),
+    latestSellerOptimizationSnapshot(userId),
   ]);
   const velocityBySku = new Map(velocityRows.map((row) => [String(row.sku || ''), number(row.units)]));
   const planSkus = items.map((item, index) => mapSkuPlan(item, index, velocityBySku, facilities.length, filter));
@@ -1098,7 +1169,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
     };
   });
 
-  return {
+  const localPlan = {
     horizon,
     generatedAt: new Date().toISOString(),
     current: {
@@ -1123,12 +1194,27 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
       state: f.address?.stateOrProvinceCode || f.address?.state,
     })),
   };
+  const cortexInventoryPlan = hasPlanPayload(snapshot?.inventoryPlan)
+    ? {
+        ...localPlan,
+        ...snapshot?.inventoryPlan,
+        horizon: snapshot?.inventoryPlan?.horizon || horizon,
+        generatedAt: snapshot?.updatedAt || snapshot?.createdAt || localPlan.generatedAt,
+        current: snapshot?.inventoryPlan?.current || localPlan.current,
+        proposed: snapshot?.inventoryPlan?.proposed || localPlan.proposed,
+        months: Array.isArray(snapshot?.inventoryPlan?.months) ? snapshot?.inventoryPlan?.months : localPlan.months,
+        skus: Array.isArray(snapshot?.inventoryPlan?.skus) && snapshot?.inventoryPlan?.skus.length ? snapshot?.inventoryPlan?.skus : localPlan.skus,
+        warehouses: Array.isArray(snapshot?.inventoryPlan?.warehouses) ? snapshot?.inventoryPlan?.warehouses : localPlan.warehouses,
+      }
+    : null;
+  return attachCortexSource(cortexInventoryPlan || localPlan, snapshot, cortexInventoryPlan ? 'cortex_seller_optimization' : 'local_fallback_inventory_plan');
 }
 
 export async function getOmsSkus(userId: string, filter: MarketplaceFilter = {}) {
   const plan = await getInventoryPlan(userId, '6m', filter);
-  const amazonProfiles = await getAmazonProfilesForItems(userId, plan.skus.map((sku: any) => String(sku.id)).filter(Boolean));
-  const skus = plan.skus.map((sku: any) => ({
+  const planSkus = Array.isArray((plan as any).skus) ? (plan as any).skus : [];
+  const amazonProfiles = await getAmazonProfilesForItems(userId, planSkus.map((sku: any) => String(sku.id)).filter(Boolean));
+  const skus = planSkus.map((sku: any) => ({
     ...sku,
     amazon: amazonProfiles.get(String(sku.id)) || null,
   }));
@@ -1141,7 +1227,8 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     [userId, skuOrId],
   )) as Row | null;
   if (!item) return null;
-  const intelligence = (await getInventoryPlan(userId)).skus.find((s) => s.sku === item.sku);
+  const plan = await getInventoryPlan(userId);
+  const intelligence = (Array.isArray((plan as any).skus) ? (plan as any).skus : []).find((s: any) => s.sku === item.sku);
   const activityPlans = await rows(
     `SELECT * FROM shipment_plans
      WHERE user_id = $1 AND items::text ILIKE $2
@@ -2204,7 +2291,8 @@ export async function getHeatmap(userId: string) {
       [userId],
     ),
   ]);
-  const totalInventory = plan.skus.reduce((sum, sku) => sum + number(sku.available), 0);
+  const planSkus = Array.isArray((plan as any).skus) ? (plan as any).skus : [];
+  const totalInventory = planSkus.reduce((sum: number, sku: any) => sum + number(sku.available), 0);
   const inventoryPerFacility = facilities.length ? Math.round(totalInventory / facilities.length) : 0;
   return {
     states: stateRows.map((row) => ({
