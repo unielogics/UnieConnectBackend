@@ -936,17 +936,28 @@ async function shipmentPricingPreview(userId: string, input: AnyRow) {
   const catalogBySku = new Map(catalogRows.map((row) => [String(row.sku), row]));
   const items = rawItems.map((line: AnyRow) => normalizeItemForPricing(line, catalogBySku.get(trim(line?.sku))));
   const requestedFacilityId = input.facilityId || plan?.facility_id || null;
-  const { warehouses, networkPolicy } = await connectedWarehousesForPricing(userId, requestedFacilityId);
-  if (!warehouses.length) {
-    return {
-      ok: false,
-      status: 412,
-      data: {
-        error: 'No connected warehouse is available for pricing.',
-        blockers: ['connected_warehouse_required'],
-      },
-    };
-  }
+  const connected = await connectedWarehousesForPricing(userId, requestedFacilityId);
+  const networkPolicy = Object.keys(connected.networkPolicy || {}).length
+    ? connected.networkPolicy
+    : {
+        multiWarehouseOptimizationEnabled: true,
+        rateShopScope: 'full_network',
+        source: 'self_service_default',
+        executablePlan: 'network_modeled_until_wms_connected',
+      };
+  const warehouses = connected.warehouses.length
+    ? connected.warehouses
+    : [{
+        warehouseCode: 'CORTEX-NETWORK',
+        warehouseId: 'cortex-network',
+        name: 'Cortex national network',
+        postal: '',
+        state: '',
+        pricingProfileId: null,
+        rateCard: {},
+        isAnchor: false,
+        modeledOnly: true,
+      }];
   const supplierPickupRequired = Boolean(input.supplierPickupRequired || input.requiresSupplierPickup || input.ltlPickupRequired);
   const supplierPickupEstimate = input.supplierPickupEstimate || (supplierPickupRequired ? { amount: number(input.supplierPickupAmount, 0) } : null);
   const payload = {
@@ -961,7 +972,10 @@ async function shipmentPricingPreview(userId: string, input: AnyRow) {
     supplierPickupEstimate,
     destinationStateWeights: await destinationStateWeights(userId),
     serviceCode: input.serviceCode || 'GROUND',
-    sourceQuality: { destinationMix: 'oms_orders_or_cortex_48_state_prior', warehousePricing: 'wms_pricing_profile' },
+    sourceQuality: {
+      destinationMix: 'oms_orders_or_cortex_48_state_prior',
+      warehousePricing: connected.warehouses.length ? 'wms_pricing_profile' : 'cortex_network_modeled',
+    },
   };
   const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', payload, {
     userId,
