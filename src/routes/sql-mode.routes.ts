@@ -641,6 +641,72 @@ function wmsExternalOmsObjectId(userId: string) {
   return createHash('sha1').update(`unieconnect:app_user:${normalized}`).digest('hex').slice(0, 24);
 }
 
+function connectionCodeHash(code: string) {
+  return createHash('sha256').update(trim(code).toUpperCase()).digest('hex');
+}
+
+function connectionAttemptId(input: { userId: string; code?: string; warehouseCode?: string }) {
+  return `omsconn_${createHash('sha256')
+    .update([input.userId, trim(input.code).toUpperCase(), trim(input.warehouseCode).toUpperCase()].join('|'))
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function connectionStatusForStage(stage: string) {
+  if (stage === 'connected') return 'connected';
+  if (stage === 'degraded' || stage === 'repair_required') return 'degraded';
+  if (stage === 'profile_blocked') return 'blocked';
+  if (stage === 'failed') return 'failed';
+  return 'pending';
+}
+
+async function recordOmsWmsConnectionAttempt(input: {
+  id: string;
+  userId: string;
+  code?: string;
+  warehouseCode?: string;
+  omsIntermediaryId?: string;
+  wmsIntermediaryId?: string;
+  stage: string;
+  lastError?: string;
+  missingFields?: string[];
+  metadata?: AnyRow;
+}) {
+  await pgQuery(
+    `INSERT INTO oms_wms_connection_attempts (
+      id, user_id, connection_code_hash, warehouse_code, oms_intermediary_id, wms_intermediary_id,
+      stage, status, last_error, missing_fields, metadata, completed_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb,
+      CASE WHEN $8 IN ('connected','degraded','failed','blocked') THEN now() ELSE NULL END)
+    ON CONFLICT (id) DO UPDATE SET
+      connection_code_hash = COALESCE(EXCLUDED.connection_code_hash, oms_wms_connection_attempts.connection_code_hash),
+      warehouse_code = COALESCE(EXCLUDED.warehouse_code, oms_wms_connection_attempts.warehouse_code),
+      oms_intermediary_id = COALESCE(EXCLUDED.oms_intermediary_id, oms_wms_connection_attempts.oms_intermediary_id),
+      wms_intermediary_id = COALESCE(EXCLUDED.wms_intermediary_id, oms_wms_connection_attempts.wms_intermediary_id),
+      stage = EXCLUDED.stage,
+      status = EXCLUDED.status,
+      last_error = EXCLUDED.last_error,
+      missing_fields = EXCLUDED.missing_fields,
+      metadata = oms_wms_connection_attempts.metadata || EXCLUDED.metadata,
+      completed_at = COALESCE(EXCLUDED.completed_at, oms_wms_connection_attempts.completed_at),
+      updated_at = now()`,
+    [
+      input.id,
+      input.userId,
+      input.code ? connectionCodeHash(input.code) : null,
+      input.warehouseCode || null,
+      input.omsIntermediaryId || null,
+      input.wmsIntermediaryId || null,
+      input.stage,
+      connectionStatusForStage(input.stage),
+      input.lastError || null,
+      JSON.stringify(input.missingFields || []),
+      JSON.stringify(input.metadata || {}),
+    ],
+  ).catch(() => null);
+}
+
 async function buildWmsOmsProfile(userId: string) {
   const user = await one(
     `SELECT id, email, first_name, last_name, phone, llc_name, billing_address
@@ -2545,44 +2611,102 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const code = trim(req.body?.connectionCode || req.body?.warehouseCode).toUpperCase();
     if (!code) return reply.code(400).send({ error: 'connectionCode required' });
+    const attemptId = connectionAttemptId({ userId, code });
+    await recordOmsWmsConnectionAttempt({
+      id: attemptId,
+      userId,
+      code,
+      stage: 'code_issued',
+      metadata: { source: 'unieconnect_oms_connect' },
+    });
     const { profile, missing } = await buildWmsOmsProfile(userId);
     if (!profile) {
+      await recordOmsWmsConnectionAttempt({
+        id: attemptId,
+        userId,
+        code,
+        stage: 'failed',
+        lastError: 'Could not find the current OMS user profile.',
+        missingFields: missing,
+      });
       return reply.code(400).send({
         error: 'profile_not_found',
         message: 'Could not find the current OMS user profile.',
         missingFields: missing,
+        connectionAttemptId: attemptId,
       });
     }
     if (missing.length > 0) {
       req.log?.warn?.({ userId, missing }, 'OMS-WMS connect blocked by incomplete OMS profile');
+      await recordOmsWmsConnectionAttempt({
+        id: attemptId,
+        userId,
+        code,
+        omsIntermediaryId: profile.omsIntermediaryId,
+        stage: 'profile_blocked',
+        lastError: 'OMS profile is missing fields required by WMS.',
+        missingFields: missing,
+        metadata: { profileSettingsPath: '/settings/profile' },
+      });
       return reply.code(400).send({
         error: 'profile_incomplete',
         message:
           'Complete your OMS profile before connecting a warehouse. WMS requires first name, last name, email, phone, LLC name, and full billing address.',
         missingFields: missing,
+        profileSettingsPath: '/settings/profile',
+        connectionAttemptId: attemptId,
       });
     }
 
+    let connected: {
+      warehouseCode: string;
+      omsIntermediaryId?: string;
+      wmsIntermediaryId: string;
+      message?: string;
+      connectionAttemptId?: string;
+    } | null = null;
     try {
-      const connected = await callWmsInternal<{
+      connected = await callWmsInternal<{
         warehouseCode: string;
         omsIntermediaryId?: string;
         wmsIntermediaryId: string;
         message?: string;
+        connectionAttemptId?: string;
       }>('/internal/oms/connect', {
         connectionCode: code,
+        connectionAttemptId: attemptId,
         ...profile,
       });
 
-      const warehouseCode = trim(connected.warehouseCode);
-      const wmsOmsIntermediaryId = trim(connected.omsIntermediaryId);
-      const wmsIntermediaryId = trim(connected.wmsIntermediaryId);
+      const warehouseCode = trim(connected?.warehouseCode);
+      const wmsOmsIntermediaryId = trim(connected?.omsIntermediaryId);
+      const wmsIntermediaryId = trim(connected?.wmsIntermediaryId);
       if (!warehouseCode || !wmsOmsIntermediaryId || !wmsIntermediaryId) {
+        await recordOmsWmsConnectionAttempt({
+          id: attemptId,
+          userId,
+          code,
+          stage: 'degraded',
+          omsIntermediaryId: profile.omsIntermediaryId,
+          lastError: 'WMS did not return a warehouse/intermediary identity.',
+          metadata: { connected },
+        });
         return reply.code(502).send({
           error: 'wms_connect_invalid_response',
           message: 'WMS connected the code but did not return a warehouse/intermediary identity.',
+          connectionAttemptId: attemptId,
         });
       }
+
+      await recordOmsWmsConnectionAttempt({
+        id: attemptId,
+        userId,
+        code,
+        warehouseCode,
+        omsIntermediaryId: wmsOmsIntermediaryId,
+        wmsIntermediaryId,
+        stage: 'wms_client_linked',
+      });
 
       const credentialResponse = await callWmsInternal<{
         clientId: string;
@@ -2605,11 +2729,34 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       });
 
       if (!credentialResponse.clientId || !credentialResponse.passkey) {
+        await recordOmsWmsConnectionAttempt({
+          id: attemptId,
+          userId,
+          code,
+          warehouseCode,
+          omsIntermediaryId: wmsOmsIntermediaryId,
+          wmsIntermediaryId,
+          stage: 'degraded',
+          lastError: 'WMS did not return bridge credentials.',
+          metadata: { credentialClientId: credentialResponse.clientId || null },
+        });
         return reply.code(502).send({
           error: 'wms_credential_invalid_response',
           message: 'WMS connected the warehouse but did not return bridge credentials.',
+          connectionAttemptId: attemptId,
         });
       }
+
+      await recordOmsWmsConnectionAttempt({
+        id: attemptId,
+        userId,
+        code,
+        warehouseCode,
+        omsIntermediaryId: wmsOmsIntermediaryId,
+        wmsIntermediaryId,
+        stage: 'credentials_created',
+        metadata: { clientId: credentialResponse.clientId, reused: Boolean((credentialResponse as any).reused) },
+      });
 
       await registerWmsCredential({
         userId,
@@ -2688,12 +2835,24 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         },
       });
 
+      await recordOmsWmsConnectionAttempt({
+        id: attemptId,
+        userId,
+        code,
+        warehouseCode,
+        omsIntermediaryId: wmsOmsIntermediaryId,
+        wmsIntermediaryId,
+        stage: 'connected',
+        metadata: { linkId: link?.id, catalogSync },
+      });
+
       return {
         success: true,
         message: connected.message || 'Warehouse connected.',
         warehouseCode,
         wmsOmsIntermediaryId,
         wmsIntermediaryId,
+        connectionAttemptId: attemptId,
         credential: {
           clientId: credentialResponse.clientId,
           scopes: credentialResponse.credential?.scopes || DEFAULT_WMS_BRIDGE_SCOPES,
@@ -2706,10 +2865,25 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       const payload = err?.payload || {};
       const message = String(err?.message || 'WMS connection failed');
       req.log?.warn?.({ err: message, status, payload }, 'OMS-WMS connect failed');
+      await recordOmsWmsConnectionAttempt({
+        id: attemptId,
+        userId,
+        code,
+        warehouseCode: trim(connected?.warehouseCode),
+        omsIntermediaryId: trim(connected?.omsIntermediaryId) || profile?.omsIntermediaryId,
+        wmsIntermediaryId: trim(connected?.wmsIntermediaryId),
+        stage: connected?.warehouseCode ? 'degraded' : (payload.error === 'profile_incomplete' ? 'profile_blocked' : 'failed'),
+        lastError: message,
+        missingFields: Array.isArray(payload.missingFields) ? payload.missingFields : undefined,
+        metadata: { wmsPayload: payload },
+      });
       return reply.code(status >= 400 && status < 600 ? status : 502).send({
         error: payload.error || 'wms_connect_failed',
         message,
         details: payload,
+        connectionAttemptId: attemptId,
+        missingFields: Array.isArray(payload.missingFields) ? payload.missingFields : undefined,
+        profileSettingsPath: payload.error === 'profile_incomplete' ? '/settings/profile' : undefined,
       });
     }
   });
@@ -2738,6 +2912,85 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         };
       }),
     };
+  });
+
+  app.get('/oms/warehouses/:warehouseCode/diagnostics', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const warehouseCode = trim(req.params.warehouseCode).toUpperCase();
+    const link = await one(
+      `SELECT l.*, f.name, f.address
+       FROM oms_warehouse_links l
+       LEFT JOIN facilities f ON f.id = l.facility_id
+       WHERE l.user_id = $1 AND l.warehouse_code = $2
+       ORDER BY l.connected_at DESC NULLS LAST, l.created_at DESC
+       LIMIT 1`,
+      [userId, warehouseCode],
+    );
+    if (!link) return reply.code(404).send({ error: 'warehouse_connection_not_found' });
+    const metadata = json(link.metadata, {});
+    const latestAttempt = await one(
+      `SELECT * FROM oms_wms_connection_attempts
+       WHERE user_id = $1 AND warehouse_code = $2
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [userId, warehouseCode],
+    ).catch(() => null);
+    let diagnostics: AnyRow | null = null;
+    try {
+      diagnostics = await callWmsInternal('/internal/oms/connection-diagnostics', {
+        warehouseCode,
+        omsIntermediaryId: trim(metadata.wmsOmsIntermediaryId),
+        wmsIntermediaryId: trim(metadata.wmsIntermediaryId),
+      });
+    } catch (err: any) {
+      diagnostics = {
+        healthy: false,
+        status: 'degraded',
+        failures: ['wms_diagnostics_unavailable'],
+        message: err?.message || 'WMS diagnostics unavailable',
+      };
+    }
+    return {
+      warehouseCode,
+      connection: {
+        status: link.status,
+        connectedAt: iso(link.connected_at),
+        metadata,
+      },
+      latestAttempt,
+      diagnostics,
+    };
+  });
+
+  app.post('/oms/warehouses/:warehouseCode/repair', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const warehouseCode = trim(req.params.warehouseCode).toUpperCase();
+    const link = await one(
+      `SELECT * FROM oms_warehouse_links
+       WHERE user_id = $1 AND warehouse_code = $2
+       ORDER BY connected_at DESC NULLS LAST, created_at DESC
+       LIMIT 1`,
+      [userId, warehouseCode],
+    );
+    if (!link) return reply.code(404).send({ error: 'warehouse_connection_not_found' });
+    const metadata = json(link.metadata, {});
+    const repair = await callWmsInternal('/internal/oms/connection-repair', {
+      warehouseCode,
+      omsIntermediaryId: trim(metadata.wmsOmsIntermediaryId),
+      wmsIntermediaryId: trim(metadata.wmsIntermediaryId),
+    });
+    await recordOmsWmsConnectionAttempt({
+      id: connectionAttemptId({ userId, warehouseCode }),
+      userId,
+      warehouseCode,
+      omsIntermediaryId: trim(metadata.wmsOmsIntermediaryId),
+      wmsIntermediaryId: trim(metadata.wmsIntermediaryId),
+      stage: repair?.after?.healthy ? 'connected' : 'repair_required',
+      metadata: { repair },
+    });
+    return { warehouseCode, repair };
   });
 
   app.delete('/oms/warehouses/:warehouseCode', async (req: any, reply) => {
