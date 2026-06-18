@@ -1822,6 +1822,12 @@ export async function getHeatmap(userId: string) {
 function mapWarehouseLink(row: Row) {
   const address = json(row.address, {});
   const metadata = json(row.metadata, {});
+  const addressLine1 = address.addressLine1 || address.line1 || address.street1 || address.street || null;
+  const addressLine2 = address.addressLine2 || address.line2 || address.street2 || null;
+  const city = address.city || null;
+  const state = address.stateOrProvinceCode || address.state || null;
+  const postalCode = address.postalCode || address.postal || address.zip || null;
+  const countryCode = address.countryCode || address.country || null;
   return {
     id: String(row.id),
     warehouseCode: String(row.warehouse_code || row.code || ''),
@@ -1832,9 +1838,14 @@ function mapWarehouseLink(row: Row) {
     facilityId: row.facility_id || null,
     facilityCode: row.facility_code || row.code || null,
     facilityName: row.facility_name || row.name || null,
-    city: address.city || null,
-    state: address.stateOrProvinceCode || address.state || null,
-    region: address.stateOrProvinceCode || address.state || address.city || null,
+    addressLine1,
+    addressLine2,
+    city,
+    state,
+    postalCode,
+    countryCode,
+    address,
+    region: state || city || null,
     connectedAt: iso(row.connected_at),
     metadata,
   };
