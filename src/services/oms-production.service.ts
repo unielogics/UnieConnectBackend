@@ -1286,6 +1286,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     dimensions: dims,
     weight,
     price: itemPrice(item) || keepa?.buyboxPrice || null,
+    cost: itemCost(item),
     margin: metadata.margin ?? attributes.margin ?? null,
     attributes,
     metadata,
@@ -1363,11 +1364,13 @@ export async function updateOmsSkuEnrichment(userId: string, skuOrId: string, in
   const supplierId = cleanText(input.supplierId);
   const marketplaceSource = cleanText(input.marketplaceSource);
   const price = cleanNumber(input.price);
+  const cost = cleanNumber(input.cost);
   const weight = cleanNumber(input.weight);
 
   setMeta('subtitle', subtitle);
   setMeta('brand', brand);
   setMeta('price', price);
+  setMeta('cost', cost);
   setMeta('source', marketplaceSource);
   setAttr('size', size);
 

@@ -1012,22 +1012,87 @@ export async function getRecommendations(userId: string, query: any = {}) {
     values,
   );
   const seen = new Set<string>();
-  const recommendations = data
-    .map(mapRecommendation)
+  const mapped = await Promise.all(data.map((row) => reconcileRecommendationWithCurrentItem(userId, mapRecommendation(row))));
+  const recommendations = mapped
     .filter(Boolean)
     .filter((rec: any) => {
+      const missingFields = [
+        ...(Array.isArray(rec.currentValue?.missingFields) ? rec.currentValue.missingFields : []),
+        ...(Array.isArray(rec.optimizedValue?.requiredFields) ? rec.optimizedValue.requiredFields : []),
+      ]
+        .map((field) => String(field || '').trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+      const isSkuBaselineBlocker =
+        String(rec.entityType || '').toLowerCase() === 'sku' &&
+        String(rec.requiredAction || '').toLowerCase() === 'complete_missing_product_data';
       const key = [
-        rec.recommendationType || '',
+        isSkuBaselineBlocker ? 'sku_baseline_blocker' : rec.recommendationType || '',
         rec.entityType || '',
         rec.entityId || '',
-        String(rec.title || '').toLowerCase(),
+        rec.requiredAction || '',
+        rec.approvalState || '',
         rec.status || '',
+        missingFields.join(','),
       ].join('|');
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
   return { recommendations };
+}
+
+async function reconcileRecommendationWithCurrentItem(userId: string, rec: any) {
+  if (!rec || String(rec.entityType || '').toLowerCase() !== 'sku') return rec;
+  const recType = String(rec.recommendationType || '').toLowerCase();
+  const action = String(rec.requiredAction || '').toLowerCase();
+  if (!recType.includes('data_readiness') && !recType.includes('product_research') && !action.includes('missing')) return rec;
+
+  const item = await one('SELECT * FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1', [userId, rec.entityId]);
+  if (!item) return rec;
+
+  const metadata = json(item.metadata, {});
+  const attributes = json(item.attributes, {});
+  const hasDimsWeight = dimensionsCubeFt(item, {}) > 0 && number(item.weight) > 0;
+  const hasPrice = number(attributes.price ?? metadata.price ?? metadata.shopifyPrice ?? metadata.sellingPrice) > 0;
+  const hasCost = number(attributes.cost ?? metadata.cost ?? metadata.unitCost) > 0;
+  const missing: string[] = [];
+  if (!hasDimsWeight) missing.push('dimensions weight');
+  if (!hasCost) missing.push('cost');
+  if (!hasPrice) missing.push('selling price');
+
+  const dataCompleteness = Math.max(0, 100 - missing.length * 20);
+  const marketplaceReadiness = (rec.currentValue || {}).marketplaceReadiness || (rec as any).marketplaceReadiness || 'marketplace enriched';
+  const summary = missing.length
+    ? `Complete ${missing.join(', ')} before high-confidence optimization.`
+    : 'SKU baseline is ready for Cortex optimization.';
+
+  return {
+    ...rec,
+    entityId: item.id,
+    title: missing.length ? `${item.sku}: ${missing.join(', ')} needed for Cortex optimization` : `${item.sku}: Cortex baseline ready`,
+    summary,
+    currentValue: {
+      ...(rec.currentValue || {}),
+      dataCompleteness,
+      marketplaceReadiness,
+      missingFields: missing,
+    },
+    optimizedValue: missing.length
+      ? {
+          action: 'Complete the missing baseline fields before Cortex creates an optimization decision.',
+          requiredFields: missing,
+        }
+      : {
+          action: 'Use this SKU in Optimize Suite when reviewing inventory placement and replenishment.',
+          requiredFields: [],
+        },
+    estimatedImpact: missing.length
+      ? { ...(rec.estimatedImpact || {}), confidenceGain: Math.max(0, 90 - dataCompleteness) }
+      : { ...(rec.estimatedImpact || {}), confidence: rec.confidence || 0.8 },
+    requiredAction: missing.length ? 'complete_missing_product_data' : 'feed_optimize_suite',
+    approvalState: missing.length ? 'blocked' : 'not_required',
+  };
 }
 
 function closedLoopNumber(...values: any[]): number | null {
