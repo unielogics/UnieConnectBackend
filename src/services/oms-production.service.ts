@@ -1473,11 +1473,40 @@ async function defaultFacility(userId: string) {
   );
 }
 
+async function connectedShipmentFacility(userId: string, facilityId?: string | null) {
+  if (facilityId) {
+    const verified = await one(
+      `SELECT f.*
+       FROM oms_warehouse_links l
+       JOIN facilities f ON f.id = l.facility_id
+       WHERE l.user_id = $1
+         AND l.status = 'connected'
+         AND l.facility_id = $2
+       ORDER BY l.connected_at DESC NULLS LAST
+       LIMIT 1`,
+      [userId, facilityId],
+    );
+    if (verified) return verified;
+  }
+  return one(
+    `SELECT f.*
+     FROM oms_warehouse_links l
+     JOIN facilities f ON f.id = l.facility_id
+     WHERE l.user_id = $1
+       AND l.status = 'connected'
+     ORDER BY l.connected_at DESC NULLS LAST
+     LIMIT 1`,
+    [userId],
+  );
+}
+
 export async function confirmShipmentWizardDraft(userId: string, draftId: string, body: any, log?: FastifyBaseLogger) {
   const selectedItems = Array.isArray(body?.selectedItems) ? body.selectedItems : [];
   const supplierId = body?.supplierId || null;
   const assignSupplierToSkus = body?.assignSupplierToSkus === true;
   const shipFromLocationId = body?.shipFromLocationId || null;
+  const requestedFacilityId = body?.facilityId || null;
+  const warehouseRoutingMode = body?.warehouseRoutingMode || null;
   if (selectedItems.length === 0) {
     return {
       status: 'needs_input',
@@ -1509,7 +1538,8 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     };
   }
 
-  const facility = await defaultFacility(userId);
+  const connectedFacility = await connectedShipmentFacility(userId, requestedFacilityId);
+  const facility = connectedFacility || (await defaultFacility(userId));
   if (!facility) {
     return {
       status: 'needs_setup',
@@ -1562,7 +1592,8 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
       JSON.stringify({
         draftId,
         autoRoutedBy: 'cortex_oms',
-        warehouseSelectionHiddenFromClient: true,
+        warehouseRoutingMode: connectedFacility ? 'connected_warehouse' : warehouseRoutingMode || 'national_network',
+        warehouseSelectionHiddenFromClient: !connectedFacility,
         requiresWmsTruth: true,
         requiresBol: body?.requiresBol !== false,
         requiresLabels: Boolean(body?.requiresLabels),
@@ -1584,6 +1615,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
         supplierId,
         supplierName: supplier?.name || null,
         supplierAssignment,
+        warehouseRoutingMode: connectedFacility ? 'connected_warehouse' : warehouseRoutingMode || 'national_network',
         selectedItems,
         requiresWmsTruth: true,
         facilityId: facility?.id || null,
@@ -1643,7 +1675,8 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     warehousePlan: {
       facility_id: facility?.id || null,
       facility_name: facility?.name || null,
-      hidden_from_client: true,
+      routing_mode: connectedFacility ? 'connected_warehouse' : warehouseRoutingMode || 'national_network',
+      hidden_from_client: !connectedFacility,
       requires_wms_truth: true,
     },
     skuPlan: selectedItems,
