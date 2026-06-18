@@ -224,7 +224,7 @@ function mapItem(row: AnyRow, extra: Record<string, unknown> = {}) {
     metadata.keepaEnrichmentState ||
     metadata.keepa_enrichment_state ||
     (row.asin ? 'needs_retry' : 'missing_asin');
-  const keepaUnavailable = enrichmentState === 'keepa_unavailable';
+  const keepaUnavailable = ['keepa_unavailable', 'missing_asin'].includes(String(enrichmentState || '').toLowerCase());
   return {
     _id: row.id,
     id: row.id,

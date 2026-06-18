@@ -1154,7 +1154,7 @@ export async function getIntelligenceRun(userId: string, runId: string) {
 }
 
 export async function getProductResearchResultForSku(userId: string, skuId: string) {
-  const item = await one('SELECT id, sku FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1', [userId, skuId]);
+  const item = await one('SELECT * FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1', [userId, skuId]);
   const sku = item?.sku || skuId;
   const result = await one(
     `SELECT * FROM oms_product_research_results
@@ -1162,7 +1162,7 @@ export async function getProductResearchResultForSku(userId: string, skuId: stri
      ORDER BY created_at DESC LIMIT 1`,
     [userId, sku, item?.id || skuId],
   );
-  return result ? mapProductResult(result) : null;
+  return result ? reconcileProductResultWithCurrentItem(mapProductResult(result), item) : null;
 }
 
 export async function getSellerOptimizationRuns(userId: string, limit = 20) {
@@ -1786,6 +1786,50 @@ function mapProductResult(row: any) {
     sourceSummary: json(row.source_summary, {}),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
+  };
+}
+
+function reconcileProductResultWithCurrentItem(mapped: any, item: Row | null) {
+  if (!mapped || !item) return mapped;
+  const result = { ...(mapped.result || {}) };
+  const missing = new Set(Array.isArray(result.missingData) ? result.missingData : []);
+  const metadata = json(item.metadata, {});
+  const attributes = json(item.attributes, {});
+  const price = number(attributes.price ?? metadata.price ?? metadata.shopifyPrice ?? metadata.sellingPrice);
+  const cost = number(attributes.cost ?? metadata.cost ?? metadata.unitCost);
+  const cubeFt = dimensionsCubeFt(item, {});
+  const weight = number(item.weight);
+
+  if (cubeFt > 0 && weight > 0) missing.delete('dimensions_weight');
+  if (price > 0) missing.delete('selling_price');
+  if (cost > 0) missing.delete('cost');
+
+  result.missingData = Array.from(missing);
+  result.fulfillment = {
+    ...(result.fulfillment || {}),
+    cubeFt: cubeFt || result.fulfillment?.cubeFt || 0,
+    weightLbs: weight || result.fulfillment?.weightLbs || 0,
+    estimatedUnitsPerPallet: cubeFt > 0 ? Math.max(1, Math.floor(52 / cubeFt)) : (result.fulfillment?.estimatedUnitsPerPallet || 0),
+  };
+  result.margin = {
+    ...(result.margin || {}),
+    price: price || result.margin?.price || 0,
+    cost: cost || result.margin?.cost || 0,
+  };
+  if (result.margin.price > 0 && result.margin.cost > 0) {
+    result.margin.marginPct = Math.round(((result.margin.price - result.margin.cost) / result.margin.price) * 1000) / 1000;
+    result.margin.status = result.margin.marginPct > 0.3 ? 'healthy' : result.margin.marginPct > 0.18 ? 'thin' : 'at_risk';
+  } else {
+    result.margin.status = 'needs_price_cost';
+  }
+  result.recommendedAction = result.missingData.length
+    ? `Complete ${result.missingData.map((m: string) => m.replace(/_/g, ' ')).join(', ')} before high-confidence optimization.`
+    : 'Feed this SKU into Optimize Suite for warehouse placement and replenishment planning.';
+
+  return {
+    ...mapped,
+    status: result.missingData.length ? mapped.status : 'completed',
+    result,
   };
 }
 

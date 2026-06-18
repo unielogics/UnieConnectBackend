@@ -800,7 +800,8 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     metadata.keepaEnrichmentState ||
     metadata.keepa_enrichment_state ||
     (asin ? 'needs_retry' : 'missing_asin');
-  const keepaUnavailable = keepaEnrichmentState === 'keepa_unavailable';
+  const keepaMarker = keepaMarkerForState(keepaEnrichmentState);
+  const keepaUnavailable = Boolean(keepaMarker);
   return {
     id: String(item.id),
     sku: item.sku,
@@ -809,7 +810,7 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     asin: asin || null,
     enrichmentState: keepaEnrichmentState,
     keepaUnavailable,
-    enrichmentMarker: keepaUnavailable ? '*' : '',
+    enrichmentMarker: keepaMarker,
     available,
     inbound: number(inv.inbound),
     velocity30d: velocity,
@@ -825,6 +826,88 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     serviceTier: velocity === 0 ? 'needs_data' : daysOfCover < 14 ? 'priority' : daysOfCover < 30 ? 'standard' : 'economy',
     recommendation: velocity === 0 ? 'Connect marketplace/order history to score demand' : daysOfCover < 14 ? 'Move now to avoid stockout' : 'Consolidate into next economical pallet',
   };
+}
+
+function keepaMarkerForState(state: unknown) {
+  const normalized = String(state || '').toLowerCase();
+  return normalized === 'keepa_unavailable' || normalized === 'missing_asin' ? '*' : '';
+}
+
+function itemHasCompleteDimensions(item: Row | null) {
+  const dim = itemDimensions(item || {});
+  return number(dim.length) > 0 && number(dim.width) > 0 && number(dim.height) > 0;
+}
+
+function itemPrice(item: Row | null) {
+  const metadata = json(item?.metadata, {});
+  const attributes = json(item?.attributes, {});
+  return number(attributes.price ?? metadata.price ?? metadata.shopifyPrice ?? metadata.sellingPrice);
+}
+
+function itemCost(item: Row | null) {
+  const metadata = json(item?.metadata, {});
+  const attributes = json(item?.attributes, {});
+  return number(attributes.cost ?? metadata.cost ?? metadata.unitCost);
+}
+
+function skuHistoryTimeline(item: Row, shipmentPlans: Row[], asns: Row[], activityLogs: Row[], ledgerRows: Row[]) {
+  const records: Array<{ ts: string; type: string; actor: string; subject: string; impact?: number | null }> = [];
+
+  shipmentPlans.forEach((plan) => {
+    const lines = itemLines(plan.items);
+    const units = sumItemUnits(lines.filter((line) => String(line.sku || line.wmsSku || '').toLowerCase() === String(item.sku).toLowerCase()));
+    records.push({
+      ts: iso(plan.created_at) || '',
+      type: 'shipment',
+      actor: plan.created_by || 'OMS shipment planner',
+      subject: `${plan.internal_shipment_id || plan.shipment_title || 'Shipment plan'} created${units ? ` · ${units} units` : ''}`,
+      impact: null,
+    });
+  });
+
+  asns.forEach((asn) => {
+    const payload = json(asn.payload, {});
+    const lines = itemLines(payload.selectedItems || payload.items);
+    const units = sumItemUnits(lines.filter((line) => String(line.sku || line.wmsSku || '').toLowerCase() === String(item.sku).toLowerCase()));
+    const wms = payload.wmsExecution || {};
+    records.push({
+      ts: iso(asn.created_at) || '',
+      type: 'shipment',
+      actor: wms.warehouseCode ? `WMS ${wms.warehouseCode}` : 'OMS/WMS',
+      subject: `${asn.asn_number || wms.asnNumber || 'ASN'} ${asn.status || 'created'}${units ? ` · ${units} units` : ''}`,
+      impact: null,
+    });
+  });
+
+  activityLogs.forEach((log) => {
+    records.push({
+      ts: iso(log.created_at) || '',
+      type: 'shipment',
+      actor: log.internal_shipment_id || log.shipment_title || 'Shipment activity',
+      subject: log.summary || log.action || 'Shipment activity recorded',
+      impact: null,
+    });
+  });
+
+  ledgerRows.forEach((event) => {
+    const type = String(event.entity_type || event.event_type || '').includes('shipment') || String(event.payload || '').includes('asn')
+      ? 'shipment'
+      : String(event.source_system || '').includes('cortex')
+        ? 'ai'
+        : 'ledger';
+    records.push({
+      ts: iso(event.created_at) || '',
+      type,
+      actor: event.source_system || 'OMS ledger',
+      subject: event.summary || event.event_type || 'Ledger event',
+      impact: null,
+    });
+  });
+
+  return records
+    .filter((record) => record.ts)
+    .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
+    .slice(0, 100);
 }
 
 export async function getCommandCenter(userId: string, range: RangeKey) {
@@ -1065,6 +1148,37 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
      ORDER BY created_at DESC LIMIT 10`,
     [userId, `%${item.sku}%`],
   );
+  const asnRows = await rows(
+    `SELECT a.*, sp.internal_shipment_id, sp.shipment_title
+     FROM asns a
+     LEFT JOIN shipment_plans sp ON sp.id = a.shipment_plan_id AND sp.user_id = a.user_id
+     WHERE a.user_id = $1
+       AND (a.payload::text ILIKE $2 OR sp.items::text ILIKE $2)
+     ORDER BY a.created_at DESC LIMIT 25`,
+    [userId, `%${item.sku}%`],
+  );
+  const activityLogs = await rows(
+    `SELECT sal.*, sp.internal_shipment_id, sp.shipment_title
+     FROM shipment_activity_log sal
+     LEFT JOIN shipment_plans sp ON sp.id = sal.shipment_plan_id AND sp.user_id = sal.user_id
+     WHERE sal.user_id = $1
+       AND (sal.payload::text ILIKE $2 OR sal.summary ILIKE $2 OR sp.items::text ILIKE $2)
+     ORDER BY sal.created_at DESC LIMIT 25`,
+    [userId, `%${item.sku}%`],
+  );
+  const ledgerRows = await rows(
+    `SELECT id, entity_type, entity_id, event_type, source_system, summary, payload, confidence, created_at
+     FROM oms_execution_ledger
+     WHERE user_id = $1
+       AND (
+         entity_id = $2
+         OR entity_id = $3
+         OR payload::text ILIKE $4
+         OR summary ILIKE $4
+       )
+     ORDER BY created_at DESC LIMIT 50`,
+    [userId, item.id, item.sku, `%${item.sku}%`],
+  );
   const facilities = await getFacilities(userId);
   const amazonProfile = (await tableExists('amazon_item_profiles'))
     ? await one(
@@ -1115,12 +1229,13 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
       if (keepaEnrichmentState !== 'manual_override') keepaEnrichmentState = 'keepa_unavailable';
     }
   }
+  const keepaMarker = keepaMarkerForState(keepaEnrichmentState);
   if (
     metadata.keepaEnrichmentState !== keepaEnrichmentState ||
-    metadata.keepaEnrichmentMarker !== (keepaEnrichmentState === 'keepa_unavailable' ? '*' : '')
+    metadata.keepaEnrichmentMarker !== keepaMarker
   ) {
     metadata.keepaEnrichmentState = keepaEnrichmentState;
-    metadata.keepaEnrichmentMarker = keepaEnrichmentState === 'keepa_unavailable' ? '*' : '';
+    metadata.keepaEnrichmentMarker = keepaMarker;
     metadata.keepaEnrichmentUpdatedAt = new Date().toISOString();
     await pgQuery(
       `UPDATE catalog_items
@@ -1166,11 +1281,11 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     images: images.filter(Boolean),
     supplierId: item.supplier_id || null,
     enrichmentState: keepaEnrichmentState,
-    keepaUnavailable: keepaEnrichmentState === 'keepa_unavailable',
-    enrichmentMarker: keepaEnrichmentState === 'keepa_unavailable' ? '*' : '',
+    keepaUnavailable: Boolean(keepaMarker),
+    enrichmentMarker: keepaMarker,
     dimensions: dims,
     weight,
-    price: item.price ?? metadata.price ?? metadata.shopifyPrice ?? keepa?.buyboxPrice ?? null,
+    price: itemPrice(item) || keepa?.buyboxPrice || null,
     margin: metadata.margin ?? attributes.margin ?? null,
     attributes,
     metadata,
@@ -1195,7 +1310,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
       daysOfCover: 0,
       storageCost: 0,
     })),
-    history: [],
+    history: skuHistoryTimeline(item, activityPlans, asnRows, activityLogs, ledgerRows),
     billing: {
       currentMonthly: 120,
       optimizedMonthly: 98.4,
