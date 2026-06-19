@@ -779,6 +779,57 @@ function itemDimensions(item: Row) {
   return json(item.dimensions, {});
 }
 
+function mapSkuEconomics(row: Row) {
+  const payload = json(row.pricing_payload, {});
+  const payloadCosts = json(payload.costs, {});
+  const costs = {
+    ...payloadCosts,
+    currentPerUnit: money(row.current_per_unit),
+    optimizedPerUnit: money(row.optimized_per_unit),
+    receivingPerUnit: money(row.receiving_per_unit),
+    prepLabPerUnit: money(row.prep_lab_per_unit),
+    pickPerUnit: money(row.pick_per_unit),
+    packPerUnit: money(row.pack_per_unit),
+    orderHandlingPerUnit: money(row.order_handling_per_unit),
+    storagePerUnitMonth: money(row.storage_per_unit_month),
+    domesticLabelPerUnit: money(row.domestic_label_per_unit),
+    transferLtlPerUnit: money(row.transfer_ltl_per_unit),
+    totalPerUnit: money(row.total_per_unit ?? row.current_per_unit),
+  };
+  return {
+    id: row.id,
+    itemId: row.item_id,
+    sku: row.sku,
+    workflowType: row.workflow_type,
+    anchorWarehouseCode: row.anchor_warehouse_code,
+    rateShopScope: row.rate_shop_scope,
+    sourceQuality: row.source_quality,
+    confidence: number(row.confidence),
+    currency: row.currency || 'USD',
+    costs,
+    blockers: json(row.blockers, []),
+    sourceLabels: json(row.source_labels, []),
+    quantityRecommendation: json(row.quantity_recommendation, {}),
+    runId: row.run_id,
+    pricingPayload: payload,
+    generatedAt: iso(row.generated_at),
+    expiresAt: iso(row.expires_at),
+  };
+}
+
+async function latestSkuFulfillmentEconomics(userId: string, itemId: string) {
+  const exists = await tableExists('oms_sku_fulfillment_economics');
+  if (!exists) return [];
+  const data = await rows(
+    `SELECT DISTINCT ON (workflow_type, COALESCE(anchor_warehouse_code, '')) *
+     FROM oms_sku_fulfillment_economics
+     WHERE user_id = $1 AND item_id = $2
+     ORDER BY workflow_type, COALESCE(anchor_warehouse_code, ''), generated_at DESC`,
+    [userId, itemId],
+  ).catch(() => []);
+  return data.map(mapSkuEconomics);
+}
+
 function mapAmazonProfile(row: Row | null) {
   if (!row) return null;
   const blockers = Array.isArray(row.blockers) ? row.blockers : [];
@@ -1349,6 +1400,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
   const weight = (item.weight && Number(item.weight) > 0) ? Number(item.weight) : (keepa?.weightLb || null);
   const attributes = json(item.attributes, {});
   const images = Array.isArray(item.images) ? item.images : Array.isArray(metadata.images) ? metadata.images : [];
+  const fulfillmentEconomics = await latestSkuFulfillmentEconomics(userId, item.id);
   const description = item.description || metadata.description || attributes.description || keepa?.description || '';
   const brand = metadata.brand || metadata.manufacturer || attributes.brand || keepa?.brand || '';
   const subtitle = metadata.subtitle || metadata.subTitle || attributes.subtitle || item.sub_category || item.category || '';
@@ -1378,6 +1430,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     attributes,
     metadata,
     intelligence,
+    fulfillmentEconomics,
     amazon: mapAmazonProfile(amazonProfile),
     keepa,
     nextShipments: activityPlans.slice(0, 6).map((plan, i) => ({

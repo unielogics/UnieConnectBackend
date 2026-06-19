@@ -8,13 +8,13 @@ import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
 import { publicEntityId } from '../lib/public-id';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
+import { postCortex } from '../services/cortex-orchestration';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
 import { registerWebhooks as registerShopifyWebhooks, shopifyWebhookHealth } from '../services/shopify';
 import { exchangeCodeForTokens as exchangeAmazonCodeForTokens } from '../services/amazon-auth';
 import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
 import { applyShopifyWebhook, markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
 import { amazonAppIdKind, getAmazonAccountHealth, getAmazonInboundLabels, pullAmazonSql } from '../services/amazon-spapi';
-import { postCortex } from '../services/cortex-orchestration';
 
 type AnyRow = Record<string, any>;
 
@@ -27,6 +27,11 @@ const money = (value: unknown) => Math.round(number(value) * 100) / 100;
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 const trim = (value: unknown) => (value == null ? '' : String(value).trim());
+const cortexSupplierPickupEstimate = (value: unknown) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  const amount = number(value, 0);
+  return amount > 0 ? { amount } : undefined;
+};
 const normalizedEmail = (value: unknown) => trim(value).toLowerCase();
 const CORE_FEATURE_IDS = [
   'core-command-center',
@@ -820,186 +825,389 @@ async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
   return data as T;
 }
 
-async function ensurePricingSnapshotTable() {
-  await pgQuery(`
-    CREATE TABLE IF NOT EXISTS oms_pricing_intelligence_snapshots (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL,
-      shipment_plan_id UUID NULL,
-      rate_shop_scope TEXT,
-      network_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      source_quality JSONB NOT NULL DEFAULT '{}'::jsonb,
-      cortex_run_id TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `).catch(() => null);
-}
-
-function normalizeItemForPricing(line: AnyRow, catalog?: AnyRow | null) {
-  const dimensions = json(line.dimensions, json(catalog?.dimensions, {}));
-  const quantity = number(line.quantity ?? line.qty ?? line.units ?? line.unitsExpected ?? 1, 1);
-  return {
-    itemId: line.itemId || line.id || catalog?.id || null,
-    sku: line.sku || catalog?.sku || '',
-    title: line.itemName || line.title || catalog?.title || line.sku || '',
-    quantity,
-    weightLb: number(line.weightLb ?? line.weight ?? catalog?.weight, 0),
-    dimensions,
-    asin: line.asin || catalog?.asin || null,
-    enrichmentState: json(catalog?.metadata, {})?.keepaEnrichmentState || null,
-  };
-}
-
-async function connectedWarehousesForPricing(userId: string, requestedFacilityId?: string | null) {
-  const values: unknown[] = [userId];
-  const where = [`l.user_id = $1`, `l.status = 'connected'`];
-  if (requestedFacilityId) {
-    values.push(requestedFacilityId);
-    where.push(`l.facility_id::text = $${values.length}`);
-  }
-  const data = await rows(
-    `SELECT l.*, f.code AS facility_code, f.name AS facility_name, f.address AS facility_address, f.metadata AS facility_metadata
+async function connectedWarehousePricingContext(userId: string) {
+  const link = await one(
+    `SELECT l.warehouse_code, l.metadata, f.id AS facility_id, f.code AS facility_code
      FROM oms_warehouse_links l
      LEFT JOIN facilities f ON f.id = l.facility_id
-     WHERE ${where.join(' AND ')}
-     ORDER BY l.connected_at DESC NULLS LAST`,
-    values,
-  );
-  const policies = data
-    .map((row) => json(row.metadata, {})?.networkPolicy)
-    .filter((policy) => policy && typeof policy === 'object');
-  const anchored = policies.find((policy) => policy.multiWarehouseOptimizationEnabled === false);
-  const activePolicy = anchored || policies[0] || {};
-  const warehouses = await Promise.all(data.map(async (row) => {
-    const metadata = json(row.metadata, {});
-    const address = json(row.facility_address, {});
-    const warehouseCode = row.warehouse_code || row.facility_code;
-    let pricingProfile: AnyRow = {};
-    if (warehouseCode) {
-      pricingProfile = await getWmsInternal(`/internal/oms/pricing-profile?warehouseCode=${encodeURIComponent(warehouseCode)}`).catch(() => ({}));
-    }
-    return {
-      warehouseCode,
-      warehouseId: row.facility_id || warehouseCode,
-      name: row.facility_name || metadata?.wmsWarehouse?.name || warehouseCode,
-      postal: address.zipCode || address.postalCode || metadata?.wmsWarehouse?.zipCode || metadata?.wmsWarehouse?.postal || '',
-      state: address.state || metadata?.wmsWarehouse?.state || '',
-      pricingProfileId: pricingProfile?.pricingProfileId || metadata?.pricingProfileId || null,
-      rateCard: pricingProfile || {},
-      isAnchor: activePolicy?.anchorWarehouseCode ? activePolicy.anchorWarehouseCode === warehouseCode : data[0]?.warehouse_code === warehouseCode,
-    };
-  }));
+     WHERE l.user_id = $1 AND l.status = 'connected'
+     ORDER BY l.connected_at DESC NULLS LAST
+     LIMIT 1`,
+    [userId],
+  ).catch(() => null);
+  const metadata = json(link?.metadata, {});
+  const networkPolicy = metadata?.networkPolicy || metadata?.network_policy || null;
   return {
-    warehouses: warehouses.filter((warehouse) => warehouse.warehouseCode),
-    networkPolicy: activePolicy,
+    warehouseCode: trim(link?.warehouse_code || link?.facility_code),
+    facilityId: link?.facility_id || null,
+    networkPolicy,
   };
 }
 
-async function destinationStateWeights(userId: string) {
-  const data = await rows(
-    `SELECT UPPER(COALESCE(
-        NULLIF(shipping_address->>'stateOrProvinceCode', ''),
-        NULLIF(shipping_address->>'state', ''),
-        NULLIF(shipping_address->>'province', '')
-      )) AS state,
-      COUNT(*)::int AS orders
-     FROM orders
-     WHERE user_id = $1
-       AND shipping_address IS NOT NULL
-     GROUP BY state`,
+function cortexFeeLineItems(cortexData: AnyRow, units: number) {
+  const breakdown = cortexData?.feeBreakdown || {};
+  const rows: Array<{ code: string; label: string; amount: number; quantity: number; unit: string; unitPrice: number }> = [];
+  const push = (code: string, label: string, node: any, quantity = 1, unit = 'each') => {
+    const amount = money(node?.amount);
+    if (amount <= 0) return;
+    rows.push({ code, label, amount, quantity, unit, unitPrice: money(quantity ? amount / Math.max(quantity, 1) : amount) });
+  };
+  push('pick', 'Estimated pick fees', breakdown.pick, units, 'unit');
+  push('pack', 'Estimated pack fees', breakdown.pack, 1, 'order');
+  push('order_handling', 'Estimated order handling', breakdown.orderHandling, 1, 'order');
+  push('receiving', 'Estimated receiving', breakdown.receiving, units, 'unit');
+  push('storage', 'Estimated storage', breakdown.storage, units, 'unit');
+  push('lab', 'Estimated prep/LAB', breakdown.lab, units, 'unit');
+  push('materials', 'Estimated packaging materials', breakdown.materials, units, 'unit');
+  push('shipment_label', 'Estimated shipment labels', breakdown.shipmentLabel, 1, 'label');
+  push('supplier_pickup_due_today', 'Supplier pickup due today', breakdown.supplierPickupDueToday, 1, 'pickup');
+  return rows;
+}
+
+async function catalogItemsForPricingRefresh(userId: string, explicitItems?: any[]) {
+  if (Array.isArray(explicitItems) && explicitItems.length > 0) return explicitItems;
+  const items = await rows(
+    `SELECT id, sku, title, weight, dimensions, metadata
+     FROM catalog_items
+     WHERE user_id = $1 AND archived = false
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC
+     LIMIT 250`,
     [userId],
-  ).catch(() => []);
-  const out: Record<string, number> = {};
-  for (const row of data) {
-    const state = trim(row.state).toUpperCase();
-    if (/^[A-Z]{2}$/.test(state)) out[state] = number(row.orders, 0);
+  );
+  return items.map((item) => {
+    const dims = json(item.dimensions, {});
+    const metadata = json(item.metadata, {});
+    return {
+      itemId: item.id,
+      sku: item.sku,
+      title: item.title,
+      quantity: 1,
+      weight: number(item.weight, 0),
+      dimensions: {
+        length: number(dims.length, 0),
+        width: number(dims.width, 0),
+        height: number(dims.height, 0),
+      },
+      cost: money(metadata.cost ?? metadata.unitCost ?? 0),
+      sellingPrice: money(metadata.price ?? metadata.sellingPrice ?? 0),
+    };
+  });
+}
+
+async function storePricingIntelligenceSnapshot(userId: string, cortexData: AnyRow) {
+  const warehouseCodes = Array.isArray(cortexData?.executableWarehouseCodes)
+    ? cortexData.executableWarehouseCodes.filter(Boolean).map(String)
+    : [];
+  const result = await one(
+    `INSERT INTO oms_pricing_intelligence_snapshots
+      (user_id, status, rate_shop_scope, network_policy, warehouse_codes, recommended_warehouse_code,
+       source_quality, pricing_payload, fee_breakdown, blockers, confidence, due_today, run_id, expires_at)
+     VALUES
+      ($1, $2, $3, $4::jsonb, $5::text[], $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13, now() + interval '35 days')
+     RETURNING *`,
+    [
+      userId,
+      'completed',
+      trim(cortexData?.rateShopScope),
+      JSON.stringify(cortexData?.networkPolicy || {}),
+      warehouseCodes,
+      trim(cortexData?.recommendedWarehouseCode) || null,
+      trim(cortexData?.warehousePricingSource) || 'unknown',
+      JSON.stringify(cortexData || {}),
+      JSON.stringify(cortexData?.feeBreakdown || {}),
+      JSON.stringify(Array.isArray(cortexData?.blockers) ? cortexData.blockers : []),
+      number(cortexData?.confidence, 0),
+      money(cortexData?.dueToday || 0),
+      trim(cortexData?.runId) || null,
+    ],
+  );
+  return result;
+}
+
+function normalizeWorkflowType(input: AnyRow = {}) {
+  const raw = trim(input.workflowType || input.marketplaceType).toUpperCase();
+  if (['FBA', 'FBW', 'FBM', 'DTC'].includes(raw)) return raw;
+  const service = trim(input.serviceWorkflow).toLowerCase();
+  if (['prep', 'prep_services', 'prep-services'].includes(service)) return 'FBA';
+  if (['dtc_fbm', 'dtc/fbm', 'dtc-fbm', 'fulfillment'].includes(service)) return 'DTC';
+  return 'DTC';
+}
+
+function isPrepWorkflow(workflowType: string) {
+  return workflowType === 'FBA' || workflowType === 'FBW';
+}
+
+function itemQuantity(item: AnyRow) {
+  return number(item.quantity ?? item.units ?? item.totalUnits, 1);
+}
+
+function economicsCosts(node: AnyRow = {}) {
+  return node.costs || node.feeBreakdown || {};
+}
+
+function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
+  const payload = json(row.pricing_payload, {});
+  const qty = number(quantity ?? payload.quantity, 1);
+  const payloadCosts = json(payload.costs, {});
+  const costs = {
+    ...payloadCosts,
+    receivingPerUnit: money(row.receiving_per_unit),
+    prepLabPerUnit: money(row.prep_lab_per_unit),
+    pickPerUnit: money(row.pick_per_unit),
+    packPerUnit: money(row.pack_per_unit),
+    orderHandlingPerUnit: money(row.order_handling_per_unit),
+    storagePerUnitMonth: money(row.storage_per_unit_month),
+    domesticLabelPerUnit: money(row.domestic_label_per_unit),
+    transferLtlPerUnit: money(row.transfer_ltl_per_unit),
+    currentPerUnit: money(row.current_per_unit ?? row.total_per_unit),
+    optimizedPerUnit: money(row.optimized_per_unit),
+    totalPerUnit: money(row.total_per_unit ?? row.current_per_unit),
+  };
+  const exactOrDerivedTotal = (payloadKey: string, perUnitKey: string) => {
+    const exact = payloadCosts[payloadKey];
+    if (exact !== undefined && exact !== null && exact !== '') return money(exact);
+    return money(costs[perUnitKey] * qty);
+  };
+  return {
+    id: row.id,
+    itemId: row.item_id,
+    sku: row.sku,
+    workflowType: row.workflow_type,
+    anchorWarehouseCode: row.anchor_warehouse_code,
+    rateShopScope: row.rate_shop_scope,
+    sourceQuality: row.source_quality,
+    confidence: number(row.confidence),
+    currency: row.currency || 'USD',
+    quantity: qty,
+    costs: {
+      ...costs,
+      receivingTotal: exactOrDerivedTotal('receivingTotal', 'receivingPerUnit'),
+      prepLabTotal: exactOrDerivedTotal('prepLabTotal', 'prepLabPerUnit'),
+      pickTotal: exactOrDerivedTotal('pickTotal', 'pickPerUnit'),
+      packTotal: exactOrDerivedTotal('packTotal', 'packPerUnit'),
+      orderHandlingTotal: exactOrDerivedTotal('orderHandlingTotal', 'orderHandlingPerUnit'),
+      storageTotalMonth: exactOrDerivedTotal('storageTotalMonth', 'storagePerUnitMonth'),
+      labelTotal: exactOrDerivedTotal('labelTotal', 'domesticLabelPerUnit'),
+      total: payloadCosts.total !== undefined && payloadCosts.total !== null && payloadCosts.total !== ''
+        ? money(payloadCosts.total)
+        : money(costs.totalPerUnit * qty),
+      unitLabelTotal: payloadCosts.unitLabelTotal ?? costs.unitLabelTotal,
+      cartonLabelTotal: payloadCosts.cartonLabelTotal ?? costs.cartonLabelTotal,
+      reboxTotal: payloadCosts.reboxTotal ?? costs.reboxTotal,
+      materialsTotal: payloadCosts.materialsTotal ?? costs.materialsTotal,
+    },
+    blockers: json(row.blockers, []),
+    sourceLabels: json(row.source_labels, []),
+    quantityRecommendation: json(row.quantity_recommendation, {}),
+    pricingPayload: payload,
+    runId: row.run_id,
+    generatedAt: iso(row.generated_at),
+    expiresAt: iso(row.expires_at),
+    cacheState: row.expires_at && new Date(row.expires_at).getTime() < Date.now() ? 'stale' : 'cached',
+  };
+}
+
+async function pricingItemsWithCatalog(userId: string, explicitItems?: any[]) {
+  const incoming = Array.isArray(explicitItems) ? explicitItems : [];
+  if (!incoming.length) return catalogItemsForPricingRefresh(userId);
+  const ids = incoming.map((item) => trim(item.itemId || item.id)).filter(Boolean);
+  const skus = incoming.map((item) => trim(item.sku)).filter(Boolean);
+  const values: unknown[] = [userId];
+  const clauses = ['user_id = $1'];
+  const lookupClauses: string[] = [];
+  if (ids.length) {
+    values.push(ids);
+    lookupClauses.push(`id::text = ANY($${values.length}::text[])`);
   }
-  return Object.keys(out).length ? out : undefined;
+  if (skus.length) {
+    values.push(skus);
+    lookupClauses.push(`sku = ANY($${values.length}::text[])`);
+  }
+  if (!lookupClauses.length) return incoming;
+  clauses.push(`(${lookupClauses.join(' OR ')})`);
+  const found = await rows(
+    `SELECT id, sku, title, asin, upc, ean, weight, dimensions, metadata
+     FROM catalog_items
+     WHERE ${clauses.join(' AND ')}`,
+    values,
+  ).catch(() => []);
+  const byId = new Map(found.map((item) => [String(item.id), item]));
+  const bySku = new Map(found.map((item) => [String(item.sku), item]));
+  return incoming.map((raw) => {
+    const item = byId.get(trim(raw.itemId || raw.id)) || bySku.get(trim(raw.sku)) || {};
+    const dims = json(item.dimensions, {});
+    const metadata = json(item.metadata, {});
+    return {
+      ...raw,
+      itemId: raw.itemId || raw.id || item.id,
+      sku: raw.sku || item.sku,
+      title: raw.title || item.title,
+      asin: raw.asin || item.asin,
+      upc: raw.upc || item.upc,
+      ean: raw.ean || item.ean,
+      unitWeightLb: raw.unitWeightLb ?? raw.weight ?? item.weight,
+      weight: raw.weight ?? item.weight,
+      dimensions: raw.dimensions || {
+        length: number(dims.length, 0),
+        width: number(dims.width, 0),
+        height: number(dims.height, 0),
+      },
+      cost: raw.cost ?? metadata.cost ?? metadata.unitCost ?? metadata.cogs ?? 0,
+      sellingPrice: raw.sellingPrice ?? raw.price ?? metadata.price ?? metadata.sellingPrice ?? metadata.shopifyPrice ?? 0,
+      salesVelocity30d: raw.salesVelocity30d ?? metadata.velocity30d ?? metadata.salesVelocity30d ?? 0,
+      keepaState: raw.keepaState ?? metadata.keepaState ?? metadata.keepa_enrichment_state ?? null,
+    };
+  });
+}
+
+async function latestSkuEconomics(userId: string, items: AnyRow[], workflowType: string, anchorWarehouseCode?: string | null) {
+  const itemIds = items.map((item) => trim(item.itemId || item.id)).filter(Boolean);
+  if (!itemIds.length) return new Map<string, AnyRow>();
+  const data = await rows(
+    `SELECT DISTINCT ON (item_id) *
+     FROM oms_sku_fulfillment_economics
+     WHERE user_id = $1
+       AND item_id = ANY($2::text[])
+       AND workflow_type = $3
+       AND COALESCE(anchor_warehouse_code, '') = COALESCE($4, '')
+       AND (expires_at IS NULL OR expires_at > now())
+     ORDER BY item_id, generated_at DESC`,
+    [userId, itemIds, workflowType, anchorWarehouseCode || null],
+  ).catch(() => []);
+  return new Map(data.map((row) => [String(row.item_id), row]));
+}
+
+async function storeSkuEconomics(userId: string, context: AnyRow, cortexData: AnyRow) {
+  const workflowType = normalizeWorkflowType(cortexData);
+  const perSku = Array.isArray(cortexData?.perSkuEconomics) ? cortexData.perSkuEconomics : [];
+  const stored: AnyRow[] = [];
+  for (const row of perSku) {
+    const itemId = trim(row.itemId || row.item_id);
+    const sku = trim(row.sku);
+    if (!itemId || !sku) continue;
+    const costs = economicsCosts(row);
+    const totalPerUnit = number(costs.totalPerUnit ?? costs.currentPerUnit, 0);
+    await pgQuery(
+      `DELETE FROM oms_sku_fulfillment_economics
+       WHERE user_id = $1 AND item_id = $2 AND workflow_type = $3 AND COALESCE(anchor_warehouse_code, '') = COALESCE($4, '')`,
+      [userId, itemId, row.workflowType || workflowType, context.anchorWarehouseCode || null],
+    ).catch(() => null);
+    const inserted = await one(
+      `INSERT INTO oms_sku_fulfillment_economics
+        (user_id, item_id, sku, workflow_type, anchor_warehouse_code, rate_shop_scope, network_policy,
+         source_quality, confidence, currency, current_per_unit, optimized_per_unit, receiving_per_unit,
+         prep_lab_per_unit, pick_per_unit, pack_per_unit, order_handling_per_unit, storage_per_unit_month,
+         domestic_label_per_unit, transfer_ltl_per_unit, total_per_unit, blockers, source_labels,
+         quantity_recommendation, pricing_payload, run_id, expires_at)
+       VALUES
+        ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+         $18, $19, $20, $21, $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, now() + interval '35 days')
+       RETURNING *`,
+      [
+        userId,
+        itemId,
+        sku,
+        row.workflowType || workflowType,
+        context.anchorWarehouseCode || null,
+        cortexData?.rateShopScope || context.rateShopScope || null,
+        JSON.stringify(cortexData?.networkPolicy || context.networkPolicy || {}),
+        row.sourceQuality || cortexData?.warehousePricingSource || 'cortex',
+        number(row.confidence ?? cortexData?.confidence, 0),
+        cortexData?.currency || 'USD',
+        money(costs.currentPerUnit ?? totalPerUnit),
+        money(costs.optimizedPerUnit),
+        money(costs.receivingPerUnit),
+        money(costs.prepLabPerUnit),
+        money(costs.pickPerUnit),
+        money(costs.packPerUnit),
+        money(costs.orderHandlingPerUnit),
+        money(costs.storagePerUnitMonth),
+        money(costs.domesticLabelPerUnit ?? costs.labelPerUnit),
+        money(costs.transferLtlPerUnit),
+        money(totalPerUnit),
+        JSON.stringify(Array.isArray(row.blockers) ? row.blockers : []),
+        JSON.stringify(cortexData?.sourceLabels || ['Cortex']),
+        JSON.stringify(row.quantityRecommendation || {}),
+        JSON.stringify(row),
+        cortexData?.runId || null,
+      ],
+    ).catch(() => null);
+    if (inserted) stored.push(mapSkuEconomicsRow(inserted, row.quantity));
+  }
+  return stored;
+}
+
+function aggregateSkuEconomics(economics: AnyRow[], workflowType: string) {
+  const totals = economics.reduce((acc, row) => {
+    const costs = row.costs || {};
+    acc.receiving += number(costs.receivingTotal);
+    acc.prepLab += number(costs.prepLabTotal);
+    acc.pick += number(costs.pickTotal);
+    acc.pack += number(costs.packTotal);
+    acc.orderHandling += number(costs.orderHandlingTotal);
+    acc.storage += number(costs.storageTotalMonth);
+    acc.label += number(costs.labelTotal);
+    acc.materials += number(costs.materialsTotal);
+    acc.total += number(costs.total);
+    acc.units += number(row.quantity);
+    return acc;
+  }, { receiving: 0, prepLab: 0, pick: 0, pack: 0, orderHandling: 0, storage: 0, label: 0, materials: 0, total: 0, units: 0 });
+  const isPrep = isPrepWorkflow(workflowType);
+  const feeBreakdown = isPrep
+    ? {
+        receiving: { amount: money(totals.receiving) },
+        lab: { amount: money(totals.prepLab) },
+        storage: { amount: money(totals.storage) },
+      }
+    : {
+        receiving: { amount: money(totals.receiving) },
+        pick: { amount: money(totals.pick) },
+        pack: { amount: money(totals.pack) },
+        orderHandling: { amount: money(totals.orderHandling) },
+        materials: { amount: money(totals.materials) },
+        storage: { amount: money(totals.storage) },
+        shipmentLabel: { amount: money(totals.label) },
+      };
+  return {
+    workflowType,
+    summary: {
+      units: totals.units,
+      estimatedTotal: money(totals.total),
+      estimatedPerUnit: totals.units > 0 ? money(totals.total / totals.units) : 0,
+      receiving: money(totals.receiving),
+      prepLab: money(totals.prepLab),
+      fulfillment: money(totals.pick + totals.pack + totals.orderHandling),
+      materials: money(totals.materials),
+      storage: money(totals.storage),
+      label: money(totals.label),
+    },
+    feeBreakdown,
+  };
 }
 
 async function shipmentPricingPreview(userId: string, input: AnyRow) {
-  const requestItems = Array.isArray(input.items) ? input.items : [];
+  const workflowType = normalizeWorkflowType(input || {});
   const plan = input.shipmentPlanId
     ? await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2', [input.shipmentPlanId, userId])
     : null;
-  const rawItems = requestItems.length ? requestItems : json(plan?.items, []);
-  const skus = Array.from(new Set(rawItems.map((line: AnyRow) => trim(line?.sku)).filter(Boolean)));
-  const catalogRows = skus.length
-    ? await rows(
-      `SELECT id, sku, title, weight, dimensions, asin, metadata
-       FROM catalog_items
-       WHERE user_id = $1 AND sku = ANY($2::text[])`,
-      [userId, skus],
-    )
-    : [];
-  const catalogBySku = new Map(catalogRows.map((row) => [String(row.sku), row]));
-  const items = rawItems.map((line: AnyRow) => normalizeItemForPricing(line, catalogBySku.get(trim(line?.sku))));
-  const requestedFacilityId = input.facilityId || plan?.facility_id || null;
-  const connected = await connectedWarehousesForPricing(userId, requestedFacilityId);
-  const networkPolicy = Object.keys(connected.networkPolicy || {}).length
-    ? connected.networkPolicy
-    : {
-        multiWarehouseOptimizationEnabled: true,
-        rateShopScope: 'full_network',
-        source: 'self_service_default',
-        executablePlan: 'network_modeled_until_wms_connected',
-      };
-  const warehouses = connected.warehouses.length
-    ? connected.warehouses
-    : [{
-        warehouseCode: 'CORTEX-NETWORK',
-        warehouseId: 'cortex-network',
-        name: 'Cortex national network',
-        postal: '',
-        state: '',
-        pricingProfileId: null,
-        rateCard: {},
-        isAnchor: false,
-        modeledOnly: true,
-      }];
-  const supplierPickupRequired = Boolean(input.supplierPickupRequired || input.requiresSupplierPickup || input.ltlPickupRequired);
-  const supplierPickupEstimate = input.supplierPickupEstimate || (supplierPickupRequired ? { amount: number(input.supplierPickupAmount, 0) } : null);
-  const payload = {
+  const planItems = Array.isArray(plan?.items) ? plan.items : [];
+  const items = await pricingItemsWithCatalog(userId, input.items || planItems);
+  const context = await connectedWarehousePricingContext(userId);
+  return postCortex('/v1/oms/shipment-pricing/estimate', {
     userId,
     shipmentPlanId: input.shipmentPlanId || plan?.id || null,
-    selectedWarehouseCode: input.warehouseCode || warehouses[0]?.warehouseCode || null,
     items,
-    warehouses,
-    networkPolicy,
-    orderCount: number(input.orderCount, items.reduce((sum: number, item: AnyRow) => sum + number(item.quantity, 1), 0)),
-    supplierPickupRequired,
-    supplierPickupEstimate,
-    destinationStateWeights: await destinationStateWeights(userId),
-    serviceCode: input.serviceCode || 'GROUND',
-    sourceQuality: {
-      destinationMix: 'oms_orders_or_cortex_48_state_prior',
-      warehousePricing: connected.warehouses.length ? 'wms_pricing_profile' : 'cortex_network_modeled',
-    },
-  };
-  const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', payload, {
-    userId,
-    idempotencyKey: `oms-pricing-${userId}-${payload.shipmentPlanId || randomUUID()}`,
-    allowGlobalApiKey: true,
-  });
-  if (cortex.ok) {
-    await ensurePricingSnapshotTable();
-    await pgQuery(
-      `INSERT INTO oms_pricing_intelligence_snapshots
-        (user_id, shipment_plan_id, rate_shop_scope, network_policy, payload, source_quality, cortex_run_id)
-       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7)`,
-      [
-        userId,
-        payload.shipmentPlanId || null,
-        cortex.data?.rateShopScope || null,
-        JSON.stringify(networkPolicy || {}),
-        JSON.stringify(cortex.data || {}),
-        JSON.stringify(payload.sourceQuality || {}),
-        cortex.data?.cortexRunId || cortex.idempotency_key || null,
-      ],
-    ).catch(() => null);
-  }
-  return cortex;
+    serviceWorkflow: input.serviceWorkflow || (isPrepWorkflow(workflowType) ? 'prep' : 'dtc_fbm'),
+    workflowType,
+    marketplaceType: input.marketplaceType || workflowType,
+    orderCount: number(input.orderCount, Math.max(items.length, 1)),
+    destinationCountry: trim(input.destinationCountry || input.shipToAddress?.country || 'US') || 'US',
+    supplierPickupSelected: Boolean(input.supplierPickupSelected || input.supplierPickupRequired),
+    supplierPickupEstimate: cortexSupplierPickupEstimate(input.supplierPickupEstimate),
+    anchorWarehouseCode: context.warehouseCode || undefined,
+    warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+    networkPolicy: context.networkPolicy || undefined,
+  }, { userId, idempotencyKey: `oms-pricing-plan-${userId}-${input.shipmentPlanId || randomUUID()}`, allowGlobalApiKey: true });
 }
 
 function fallbackPricingPreview(items: AnyRow[]) {
@@ -1012,43 +1220,48 @@ function fallbackPricingPreview(items: AnyRow[]) {
     schemaVersion: 'oms_shipment_pricing_estimate_fallback_v1',
     currency: 'USD',
     dueToday: 0,
-    dueTodayReason: 'warehouse_fees_billed_when_services_are_performed',
     feeTimingNotice: 'Warehouse fees are billed when services are performed. Due today is $0.00 unless supplier pickup or paid transportation is selected.',
     confidence: 0.35,
     blockers: ['cortex_pricing_unavailable'],
-    sourceLabels: ['local_degraded_fallback'],
+    feeBreakdown: {
+      receiving: { amount: money(receiving) },
+      lab: { amount: money(prep + palletization) },
+    },
+    summary: {
+      units,
+      estimatedTotal: money(total),
+      estimatedPerUnit: units > 0 ? money(total / units) : 0,
+      receiving: money(receiving),
+      prepLab: money(prep + palletization),
+      fulfillment: 0,
+      materials: 0,
+      storage: 0,
+      label: 0,
+    },
     warehouses: [{
       warehouseCode: 'fallback',
-      feePreview: {
-        lineItems: [
-          { code: 'receiving', label: 'Receiving', amount: money(receiving), perUnit: money(receiving / Math.max(units, 1)) },
-          { code: 'prep_lab', label: 'Prep services', amount: money(prep), perUnit: money(prep / Math.max(units, 1)) },
-          { code: 'palletization', label: 'Palletization estimate', amount: money(palletization), perUnit: money(palletization / Math.max(units, 1)) },
-        ],
-        total: money(total),
-        perUnit: money(total / Math.max(units, 1)),
-      },
-      weightedLabelCostPerUnit: 0,
-      labelCostByState: [],
+      feePreview: { total: money(total), perUnit: units > 0 ? money(total / units) : 0, lineItems: [] },
       totalEstimatedCost: money(total),
-      totalEstimatedCostPerUnit: money(total / Math.max(units, 1)),
+      totalEstimatedCostPerUnit: units > 0 ? money(total / units) : 0,
     }],
   };
 }
 
-function firstPricingWarehouse(preview: any) {
+function feePreviewFromPricing(preview: any) {
+  const units = number(preview?.summary?.units, 1);
+  const lineItems = cortexFeeLineItems(preview, units);
+  const total = money(preview?.summary?.estimatedTotal ?? lineItems.reduce((sum, item) => sum + number(item.amount), 0));
+  const perUnit = money(preview?.summary?.estimatedPerUnit ?? (units > 0 ? total / units : 0));
   const warehouses = Array.isArray(preview?.warehouses) ? preview.warehouses : [];
-  return warehouses[0] || null;
+  return {
+    warehouse: warehouses[0] || null,
+    fee: { total, perUnit, lineItems },
+    total,
+    perUnit,
+    lineItems,
+  };
 }
 
-function feePreviewFromPricing(preview: any) {
-  const warehouse = firstPricingWarehouse(preview);
-  const fee = warehouse?.feePreview || {};
-  const total = money(fee.total ?? warehouse?.totalEstimatedCost ?? 0);
-  const perUnit = money(fee.perUnit ?? warehouse?.totalEstimatedCostPerUnit ?? warehouse?.estimatedCostPerUnit ?? 0);
-  const lineItems = Array.isArray(fee.lineItems) ? fee.lineItems : [];
-  return { warehouse, fee, total, perUnit, lineItems };
-}
 
 async function syncOmsCatalogToWms(params: {
   userId: string;
@@ -2353,41 +2566,280 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    const previewResult = await shipmentPricingPreview(userId, {
-      ...req.body,
+    const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
+    const context = await connectedWarehousePricingContext(userId);
+    const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', {
+      userId,
+      shipmentPlanId: req.body?.shipmentPlanId || null,
       items,
-      facilityId: req.body?.facilityId || null,
-    }).catch((error) => ({ ok: false, error }));
-    const pricingPreview = (previewResult as any)?.ok
-      ? (previewResult as any).data
-      : fallbackPricingPreview(items);
-    const normalized = feePreviewFromPricing(pricingPreview);
+      orderCount: number(req.body?.orderCount, 1),
+      destinationCountry: trim(req.body?.destinationCountry || req.body?.shipToAddress?.country || 'US') || 'US',
+      supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
+      supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
+      anchorWarehouseCode: context.warehouseCode || undefined,
+      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      networkPolicy: context.networkPolicy || undefined,
+    }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
+      ok: false,
+      status: 503,
+      data: { error: err?.message || 'Cortex pricing failed' },
+    }));
+    if (cortex.ok) {
+      const lineItems = cortexFeeLineItems(cortex.data, units);
+      const total = money(lineItems.reduce((sum, item) => sum + number(item.amount), 0));
+      return {
+        currency: cortex.data?.currency || 'USD',
+        lineItems,
+        total,
+        perUnit: units > 0 ? money(total / units) : 0,
+        dueToday: money(cortex.data?.dueToday || 0),
+        warehouseCode: cortex.data?.recommendedWarehouseCode || context.warehouseCode || null,
+        source: 'cortex_pricing_authority',
+        cortex: cortex.data,
+      };
+    }
     return {
       currency: 'USD',
-      lineItems: normalized.lineItems,
-      total: normalized.total,
-      perUnit: normalized.perUnit,
-      warehouseCode: normalized.warehouse?.warehouseCode || null,
-      dueToday: money(pricingPreview.dueToday || 0),
-      feeTimingNotice: pricingPreview.feeTimingNotice,
-      confidence: pricingPreview.confidence,
-      blockers: pricingPreview.blockers || [],
-      pricingPreview,
-      source: (previewResult as any)?.ok ? 'cortex_shipment_pricing_estimate' : 'local_degraded_fallback',
+      lineItems: [
+        { code: 'receiving', label: 'Receiving', amount: money(Math.max(12, units * 0.18)) },
+        { code: 'prep', label: 'Prep services', amount: money(units * 0.35) },
+        { code: 'palletization', label: 'Palletization estimate', amount: money(Math.ceil(units / 80) * 18) },
+      ],
+      total: money(Math.max(12, units * 0.18) + units * 0.35 + Math.ceil(units / 80) * 18),
+      perUnit: units > 0 ? money((Math.max(12, units * 0.18) + units * 0.35 + Math.ceil(units / 80) * 18) / units) : 0,
+      dueToday: 0,
+      warehouseCode: context.warehouseCode || null,
+      source: 'local_fallback_cortex_unavailable',
+      cortex: { ok: false, status: cortex.status, error: cortex.data?.error || 'Cortex pricing unavailable' },
+
     };
   });
 
   app.post('/shipment-plans/pricing-preview', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const result = await shipmentPricingPreview(userId, req.body || {}).catch((error) => ({ ok: false, error }));
-    if ((result as any).ok) return (result as any).data;
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    const fallback = fallbackPricingPreview(items);
-    return reply.code((result as any).status || 200).send({
-      ...fallback,
-      error: (result as any)?.data?.error || (result as any)?.error?.message || 'Cortex pricing preview is unavailable.',
+    const workflowType = normalizeWorkflowType(req.body || {});
+    const items = await pricingItemsWithCatalog(userId, req.body?.items);
+    const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
+    const context = await connectedWarehousePricingContext(userId);
+    const cached = await latestSkuEconomics(userId, items, workflowType, context.warehouseCode || null);
+    const cachedEconomics = items
+      .map((item: AnyRow) => {
+        const itemId = trim(item.itemId || item.id);
+        const row = itemId ? cached.get(itemId) : null;
+        return row ? mapSkuEconomicsRow(row, itemQuantity(item)) : null;
+      })
+      .filter(Boolean) as AnyRow[];
+    if (cachedEconomics.length === items.length && items.length > 0) {
+      const aggregate = aggregateSkuEconomics(cachedEconomics, workflowType);
+      const lineItems = cortexFeeLineItems({ feeBreakdown: aggregate.feeBreakdown }, units);
+      const total = money(lineItems.reduce((sum, item) => sum + number(item.amount), 0));
+      return {
+        currency: cachedEconomics[0]?.currency || 'USD',
+        workflowType,
+        lineItems,
+        total,
+        perUnit: units > 0 ? money(total / units) : 0,
+        dueToday: 0,
+        warehouseCode: context.warehouseCode || null,
+        source: 'sku_fulfillment_economics_cache',
+        summary: aggregate.summary,
+        perSkuEconomics: cachedEconomics,
+        missingEconomicsCalculated: [],
+        blockers: Array.from(new Set(cachedEconomics.flatMap((row) => Array.isArray(row.blockers) ? row.blockers : []))),
+        confidence: Math.min(...cachedEconomics.map((row) => number(row.confidence, 0.35))),
+        cortex: {
+          workflowType,
+          cacheState: 'cached',
+          feeBreakdown: aggregate.feeBreakdown,
+          perSkuEconomics: cachedEconomics,
+          copy: {
+            dueToday: 'Warehouse fees are billed when services are performed. Due today is $0.00 unless supplier pickup or paid transportation is selected.',
+          },
+        },
+      };
+    }
+    const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', {
+      userId,
+      shipmentPlanId: req.body?.shipmentPlanId || null,
+      items,
+      serviceWorkflow: req.body?.serviceWorkflow || (isPrepWorkflow(workflowType) ? 'prep' : 'dtc_fbm'),
+      workflowType,
+      marketplaceType: req.body?.marketplaceType || workflowType,
+      orderCount: number(req.body?.orderCount, 1),
+      destinationCountry: trim(req.body?.destinationCountry || req.body?.shipToAddress?.country || 'US') || 'US',
+      supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
+      supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
+      anchorWarehouseCode: context.warehouseCode || undefined,
+      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      networkPolicy: context.networkPolicy || undefined,
+    }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
+      ok: false,
+      status: 503,
+      data: { error: err?.message || 'Cortex pricing failed' },
+    }));
+    if (!cortex.ok) {
+      return reply.code(cortex.status || 503).send({
+        error: cortex.data?.error || 'Cortex pricing unavailable',
+        source: 'cortex_pricing_authority',
+        fallbackAvailable: true,
+      });
+    }
+    const storedEconomics = await storeSkuEconomics(userId, {
+      anchorWarehouseCode: context.warehouseCode || null,
+      rateShopScope: cortex.data?.rateShopScope || null,
+      networkPolicy: context.networkPolicy || {},
+    }, cortex.data);
+    const lineItems = cortexFeeLineItems(cortex.data, units);
+    const total = money(lineItems.reduce((sum, item) => sum + number(item.amount), 0));
+    return {
+      currency: cortex.data?.currency || 'USD',
+      workflowType: cortex.data?.workflowType || workflowType,
+      lineItems,
+      total,
+      perUnit: units > 0 ? money(total / units) : 0,
+      dueToday: money(cortex.data?.dueToday || 0),
+      warehouseCode: cortex.data?.recommendedWarehouseCode || context.warehouseCode || null,
+      source: 'cortex_pricing_authority',
+      summary: cortex.data?.summary || aggregateSkuEconomics(storedEconomics, workflowType).summary,
+      perSkuEconomics: storedEconomics.length ? storedEconomics : cortex.data?.perSkuEconomics || [],
+      missingEconomicsCalculated: storedEconomics,
+      blockers: cortex.data?.blockers || [],
+      confidence: number(cortex.data?.confidence, 0),
+      cortex: cortex.data,
+    };
+  });
+
+  app.get('/skus/:skuId/fulfillment-economics', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const workflowType = normalizeWorkflowType(req.query || {});
+    const context = await connectedWarehousePricingContext(userId);
+    const item = await one(
+      `SELECT id, sku, title, weight, dimensions, metadata
+       FROM catalog_items
+       WHERE user_id = $1 AND (id = $2 OR sku = $2)
+       LIMIT 1`,
+      [userId, req.params.skuId],
+    );
+    if (!item) return reply.code(404).send({ error: 'SKU not found' });
+    const cached = await latestSkuEconomics(userId, [{ itemId: item.id }], workflowType, context.warehouseCode || null);
+    const row = cached.get(String(item.id));
+    return {
+      skuId: item.id,
+      sku: item.sku,
+      workflowType,
+      economics: row ? mapSkuEconomicsRow(row) : null,
+      status: row ? 'available' : 'not_calculated',
+    };
+  });
+
+  app.post('/skus/:skuId/fulfillment-economics/refresh', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const workflowType = normalizeWorkflowType(req.body || {});
+    const item = await one(
+      `SELECT id, sku
+       FROM catalog_items
+       WHERE user_id = $1 AND (id = $2 OR sku = $2)
+       LIMIT 1`,
+      [userId, req.params.skuId],
+    );
+    if (!item) return reply.code(404).send({ error: 'SKU not found' });
+    const items = await pricingItemsWithCatalog(userId, [{ ...(req.body?.item || {}), itemId: item.id, sku: item.sku, quantity: number(req.body?.quantity, 1) }]);
+    const context = await connectedWarehousePricingContext(userId);
+    const cortex = await postCortex('/v1/oms/sku-fulfillment-economics', {
+      userId,
+      items,
+      serviceWorkflow: req.body?.serviceWorkflow || (isPrepWorkflow(workflowType) ? 'prep' : 'dtc_fbm'),
+      workflowType,
+      marketplaceType: req.body?.marketplaceType || workflowType,
+      orderCount: number(req.body?.orderCount, 1),
+      destinationCountry: trim(req.body?.destinationCountry || 'US') || 'US',
+      supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
+      supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
+      anchorWarehouseCode: context.warehouseCode || undefined,
+      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      networkPolicy: context.networkPolicy || undefined,
+    }, { userId, idempotencyKey: `oms-sku-econ-refresh-${userId}-${item.id}-${workflowType}-${Date.now()}` }).catch((err) => ({
+      ok: false,
+      status: 503,
+      data: { error: err?.message || 'Cortex SKU economics failed' },
+    }));
+    if (!cortex.ok) {
+      return reply.code(cortex.status || 503).send({ error: cortex.data?.error || 'Cortex SKU economics unavailable' });
+    }
+    const stored = await storeSkuEconomics(userId, {
+      anchorWarehouseCode: context.warehouseCode || null,
+      rateShopScope: cortex.data?.rateShopScope || null,
+      networkPolicy: context.networkPolicy || {},
+    }, cortex.data);
+    await writeLedger(userId, {
+      entityType: 'sku',
+      entityId: item.id,
+      eventType: 'sku_fulfillment_economics_refreshed',
+      sourceSystem: 'cortex',
+      summary: `Cortex refreshed ${workflowType} fulfillment economics for ${item.sku}.`,
+      payload: { workflowType, cortex: cortex.data, stored },
+      confidence: number(cortex.data?.confidence, 0),
     });
+    return {
+      skuId: item.id,
+      sku: item.sku,
+      workflowType,
+      economics: stored[0] || null,
+      cortex: cortex.data,
+      status: stored[0] ? 'refreshed' : 'not_calculated',
+    };
+  });
+
+  app.post('/pricing-intelligence/refresh', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const items = await catalogItemsForPricingRefresh(userId, req.body?.items);
+    const context = await connectedWarehousePricingContext(userId);
+    const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', {
+      userId,
+      items,
+      orderCount: number(req.body?.orderCount, Math.max(items.length, 1)),
+      destinationCountry: trim(req.body?.destinationCountry || 'US') || 'US',
+      supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
+      supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
+      anchorWarehouseCode: context.warehouseCode || undefined,
+      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      networkPolicy: context.networkPolicy || undefined,
+    }, { userId, idempotencyKey: `oms-pricing-refresh-${userId}-${Date.now()}` }).catch((err) => ({
+      ok: false,
+      status: 503,
+      data: { error: err?.message || 'Cortex pricing failed' },
+    }));
+    if (!cortex.ok) {
+      return reply.code(cortex.status || 503).send({
+        error: cortex.data?.error || 'Cortex pricing unavailable',
+        source: 'cortex_pricing_authority',
+      });
+    }
+    const snapshot = await storePricingIntelligenceSnapshot(userId, cortex.data);
+    return {
+      snapshot,
+      source: 'cortex_pricing_authority',
+      cortex: cortex.data,
+    };
+  });
+
+  app.get('/pricing-intelligence/latest', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const snapshot = await one(
+      `SELECT *
+       FROM oms_pricing_intelligence_snapshots
+       WHERE user_id = $1
+       ORDER BY generated_at DESC
+       LIMIT 1`,
+      [userId],
+    );
+    return { snapshot };
+
   });
 
   app.get('/shipment-plans/closest-facility-preview', async (req: any, reply) => {
@@ -3960,3 +4412,4 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   });
   app.post('/amazon/shipping/shipments', amazonPending);
 }
+
