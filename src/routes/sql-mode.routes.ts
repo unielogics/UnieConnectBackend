@@ -972,6 +972,7 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
     id: row.id,
     itemId: row.item_id,
     sku: row.sku,
+    title: payload.title || payload.productTitle || row.title || null,
     workflowType: row.workflow_type,
     anchorWarehouseCode: row.anchor_warehouse_code,
     rateShopScope: row.rate_shop_scope,
@@ -1004,6 +1005,222 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
     generatedAt: iso(row.generated_at),
     expiresAt: iso(row.expires_at),
     cacheState: row.expires_at && new Date(row.expires_at).getTime() < Date.now() ? 'stale' : 'cached',
+  };
+}
+
+function firstFinite(...values: unknown[]) {
+  for (const value of values) {
+    const n = number(value, NaN);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+function itemDimensions(item: AnyRow = {}) {
+  const dims = item.dimensions || {};
+  return {
+    length: firstFinite(dims.length, dims.l, item.length, item.lengthIn),
+    width: firstFinite(dims.width, dims.w, item.width, item.widthIn),
+    height: firstFinite(dims.height, dims.h, item.height, item.heightIn),
+  };
+}
+
+function itemCubeFt(item: AnyRow = {}) {
+  const dims = itemDimensions(item);
+  const cubicInches = dims.length * dims.width * dims.height;
+  if (cubicInches > 0) return cubicInches / 1728;
+  return firstFinite(item.palletCubeFt, item.cubeFt, 0.05);
+}
+
+function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: AnyRow, reason: string) {
+  const quantity = Math.max(1, itemQuantity(item));
+  const cartons = Math.max(1, number(item.cartons ?? item.boxCount, Math.ceil(quantity / Math.max(1, number(item.unitsPerCarton ?? item.unitsPerBox, 24)))));
+  const unitsPerCarton = Math.max(1, number(item.unitsPerCarton ?? item.unitsPerBox, Math.ceil(quantity / cartons)));
+  const cubePerUnit = itemCubeFt(item);
+  const dims = itemDimensions(item);
+  const weight = firstFinite(item.unitWeightLb, item.weight, item.weightPerUnit, 1);
+  const hasDims = dims.length > 0 && dims.width > 0 && dims.height > 0;
+  const hasWeight = weight > 0;
+  const isPrep = isPrepWorkflow(workflowType);
+  const receivingPerUnit = 0.18;
+  const storagePerUnitMonth = money(Math.max(0.01, cubePerUnit * 0.55));
+  const blockers = [
+    reason,
+    !hasDims ? 'missing_dimensions_using_modeled_cube' : null,
+    !hasWeight ? 'missing_weight_using_modeled_weight' : null,
+    !number(item.cost, 0) ? 'missing_cost_using_zero_cogs' : null,
+  ].filter(Boolean) as string[];
+
+  const prepLabPerUnit = isPrep ? 0.5 : 0;
+  const cartonLabelPerCarton = isPrep ? 0.5 : 0;
+  const pickPerUnit = isPrep ? 0 : 0.35;
+  const packPerUnit = isPrep ? 0 : 0.45;
+  const orderHandlingPerUnit = isPrep ? 0 : 0.1;
+  const materialsPerUnit = isPrep ? 0 : 0.25;
+  const domesticLabelPerUnit = isPrep ? 0 : Math.max(4.95, 5.65 + Math.min(4, weight * 0.45));
+  const transferLtlPerUnit = 0;
+  const receivingTotal = money(receivingPerUnit * quantity);
+  const prepLabTotal = money(prepLabPerUnit * quantity);
+  const cartonLabelTotal = money(cartonLabelPerCarton * cartons);
+  const pickTotal = money(pickPerUnit * quantity);
+  const packTotal = money(packPerUnit * quantity);
+  const orderHandlingTotal = money(orderHandlingPerUnit * quantity);
+  const materialsTotal = money(materialsPerUnit * quantity);
+  const labelTotal = money(domesticLabelPerUnit * quantity);
+  const storageTotalMonth = money(storagePerUnitMonth * quantity);
+  const total = money(
+    receivingTotal
+    + prepLabTotal
+    + cartonLabelTotal
+    + pickTotal
+    + packTotal
+    + orderHandlingTotal
+    + materialsTotal
+    + labelTotal
+    + storageTotalMonth,
+  );
+  const totalPerUnit = quantity > 0 ? money(total / quantity) : 0;
+  const configuredUnits = quantity;
+  const velocity = number(item.salesVelocity30d, 0);
+  const suggestedUnits = velocity > 0 ? Math.max(unitsPerCarton, Math.ceil((velocity * 45) / unitsPerCarton) * unitsPerCarton) : configuredUnits;
+  const confidence = money(Math.max(0.25, 0.55 - blockers.length * 0.04));
+
+  return {
+    itemId: trim(item.itemId || item.id),
+    sku: trim(item.sku),
+    title: trim(item.title || item.name || item.sku),
+    workflowType,
+    quantity,
+    cartons,
+    unitsPerCarton,
+    anchorWarehouseCode: context.warehouseCode || null,
+    rateShopScope: context.warehouseCode ? 'anchor_only' : 'full_network',
+    sourceQuality: 'modeled_fallback',
+    confidence,
+    currency: 'USD',
+    blockers,
+    sourceLabels: ['modeled_fallback', context.warehouseCode ? 'connected_warehouse_policy' : 'full_network_policy'],
+    quantityRecommendation: {
+      configuredUnits,
+      suggestedUnits,
+      suggestedCartons: Math.max(1, Math.ceil(suggestedUnits / unitsPerCarton)),
+      unitsPerCarton,
+      direction: suggestedUnits > configuredUnits ? 'increase' : suggestedUnits < configuredUnits ? 'decrease' : 'hold',
+      reason: velocity > 0 ? 'Modeled from available OMS sales velocity.' : 'No sales velocity available; holding configured shipment quantity.',
+      confidence,
+    },
+    costs: {
+      receivingPerUnit,
+      receivingTotal,
+      prepLabPerUnit,
+      prepLabTotal,
+      unitLabelPerUnit: isPrep ? 0.5 : 0,
+      unitLabelTotal: isPrep ? money(0.5 * quantity) : 0,
+      cartonLabelPerCarton,
+      cartonLabelTotal,
+      pickPerUnit,
+      pickTotal,
+      packPerUnit,
+      packTotal,
+      orderHandlingPerUnit,
+      orderHandlingTotal,
+      storagePerUnitMonth,
+      storageTotalMonth,
+      domesticLabelPerUnit,
+      labelTotal,
+      materialsPerUnit,
+      materialsTotal,
+      transferLtlPerUnit,
+      currentPerUnit: totalPerUnit,
+      optimizedPerUnit: totalPerUnit,
+      totalPerUnit,
+      total,
+    },
+    pricingPayload: {
+      mode: 'local_modeled_fallback',
+      reason,
+      dimensions: dims,
+      weight,
+    },
+    generatedAt: new Date().toISOString(),
+    cacheState: 'modeled_live',
+  };
+}
+
+async function modeledSkuPricingPreview(userId: string, items: AnyRow[], workflowType: string, context: AnyRow, reason: string) {
+  const perSku = items.map((item) => fallbackEconomicsForItem(item, workflowType, context, reason));
+  const aggregate = aggregateSkuEconomics(perSku, workflowType);
+  const storedEconomics = await storeSkuEconomics(userId, {
+    anchorWarehouseCode: context.warehouseCode || null,
+    rateShopScope: context.warehouseCode ? 'anchor_only' : 'full_network',
+    networkPolicy: context.networkPolicy || {},
+  }, {
+    workflowType,
+    currency: 'USD',
+    rateShopScope: context.warehouseCode ? 'anchor_only' : 'full_network',
+    networkPolicy: context.networkPolicy || {},
+    warehousePricingSource: 'modeled_fallback',
+    confidence: perSku.length ? Math.min(...perSku.map((row) => number(row.confidence, 0.35))) : 0.35,
+    sourceLabels: ['modeled_fallback', 'cortex_unavailable'],
+    runId: `local-fallback-${Date.now()}`,
+    perSkuEconomics: perSku,
+  });
+  const effectivePerSku: AnyRow[] = perSku.map((row: AnyRow) => {
+    const stored = storedEconomics.find((storedRow) => storedRow.itemId === row.itemId);
+    return stored ? { ...stored, title: stored.title || row.title, cacheState: 'modeled_live' } : row;
+  });
+  const lineItems = cortexFeeLineItems({ feeBreakdown: aggregate.feeBreakdown }, aggregate.summary.units || 1);
+  const total = money(lineItems.reduce((sum, item) => sum + number(item.amount), 0));
+  return {
+    ok: true,
+    schemaVersion: 'oms_sku_fulfillment_economics_fallback_v1',
+    generatedAt: new Date().toISOString(),
+    currency: 'USD',
+    workflowType,
+    source: 'sku_fulfillment_economics_fallback',
+    sourceLabels: ['modeled_fallback', 'cortex_unavailable'],
+    rateShopScope: context.warehouseCode ? 'anchor_only' : 'full_network',
+    networkPolicy: context.networkPolicy || {},
+    executableWarehouseCodes: context.warehouseCode ? [context.warehouseCode] : [],
+    modeledOnlyWarehouseCodes: [],
+    dueToday: 0,
+    feeTimingNotice: 'Warehouse fees are billed when services are performed. Due today is $0.00 unless supplier pickup or paid transportation is selected.',
+    lineItems,
+    total,
+    perUnit: aggregate.summary.units > 0 ? money(total / aggregate.summary.units) : 0,
+    summary: aggregate.summary,
+    totals: {
+      units: aggregate.summary.units,
+      fulfillmentEstimate: aggregate.summary.fulfillment,
+      receivingPrepLabEstimate: money(number(aggregate.summary.receiving) + number(aggregate.summary.prepLab)),
+      storageMonthlyEstimate: aggregate.summary.storage,
+      labelWeightedAverage: aggregate.summary.units > 0 ? money(number(aggregate.summary.label) / aggregate.summary.units) : 0,
+      transportationEstimate: 0,
+      estimatedTotal: aggregate.summary.estimatedTotal,
+      estimatedPerUnit: aggregate.summary.estimatedPerUnit,
+    },
+    feeBreakdown: aggregate.feeBreakdown,
+    feePreview: {
+      fulfillmentFeePerUnit: aggregate.summary.units > 0 ? money(number(aggregate.summary.fulfillment) / aggregate.summary.units) : 0,
+      receivingPerUnit: aggregate.summary.units > 0 ? money(number(aggregate.summary.receiving) / aggregate.summary.units) : 0,
+      prepLabPerUnit: aggregate.summary.units > 0 ? money(number(aggregate.summary.prepLab) / aggregate.summary.units) : 0,
+      storagePerUnitMonth: aggregate.summary.units > 0 ? money(number(aggregate.summary.storage) / aggregate.summary.units) : 0,
+    },
+    warehouses: [{
+      warehouseCode: context.warehouseCode || 'modeled_network',
+      scopeRole: context.warehouseCode ? 'anchor' : 'modeled',
+      source: 'modeled_fallback',
+      feePreview: { total, perUnit: aggregate.summary.units > 0 ? money(total / aggregate.summary.units) : 0 },
+      totalEstimatedCost: total,
+      totalEstimatedCostPerUnit: aggregate.summary.units > 0 ? money(total / aggregate.summary.units) : 0,
+      blockers: [reason],
+      confidence: perSku.length ? Math.min(...perSku.map((row) => number(row.confidence, 0.35))) : 0.35,
+    }],
+    perSkuEconomics: effectivePerSku,
+    missingEconomicsCalculated: effectivePerSku,
+    blockers: Array.from(new Set(effectivePerSku.flatMap((row) => Array.isArray(row.blockers) ? row.blockers : []))),
+    confidence: perSku.length ? Math.min(...perSku.map((row) => number(row.confidence, 0.35))) : 0.35,
+    cortex: { ok: false, source: 'modeled_fallback', error: reason },
   };
 }
 
@@ -1146,7 +1363,7 @@ function aggregateSkuEconomics(economics: AnyRow[], workflowType: string) {
     acc.pack += number(costs.packTotal);
     acc.orderHandling += number(costs.orderHandlingTotal);
     acc.storage += number(costs.storageTotalMonth);
-    acc.label += number(costs.labelTotal);
+    acc.label += number(costs.labelTotal) + number(costs.unitLabelTotal) + number(costs.cartonLabelTotal);
     acc.materials += number(costs.materialsTotal);
     acc.total += number(costs.total);
     acc.units += number(row.quantity);
@@ -1158,6 +1375,7 @@ function aggregateSkuEconomics(economics: AnyRow[], workflowType: string) {
         receiving: { amount: money(totals.receiving) },
         lab: { amount: money(totals.prepLab) },
         storage: { amount: money(totals.storage) },
+        shipmentLabel: { amount: money(totals.label) },
       }
     : {
         receiving: { amount: money(totals.receiving) },
@@ -2679,11 +2897,19 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       data: { error: err?.message || 'Cortex pricing failed' },
     }));
     if (!cortex.ok) {
-      return reply.code(cortex.status || 503).send({
-        error: cortex.data?.error || 'Cortex pricing unavailable',
-        source: 'cortex_pricing_authority',
+      const reason = cortex.data?.error || 'Cortex pricing unavailable';
+      const fallback = await modeledSkuPricingPreview(userId, items, workflowType, context, reason);
+      return {
+        ...fallback,
+        source: 'sku_fulfillment_economics_fallback',
         fallbackAvailable: true,
-      });
+        cortex: {
+          ok: false,
+          status: cortex.status || 503,
+          error: reason,
+          fallbackApplied: true,
+        },
+      };
     }
     const storedEconomics = await storeSkuEconomics(userId, {
       anchorWarehouseCode: context.warehouseCode || null,
