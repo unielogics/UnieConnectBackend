@@ -948,6 +948,7 @@ function economicsCosts(node: AnyRow = {}) {
 function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
   const payload = json(row.pricing_payload, {});
   const qty = number(quantity ?? payload.quantity, 1);
+  const payloadQty = Math.max(0, number(payload.quantity, qty));
   const payloadCosts = json(payload.costs, {});
   const costs = {
     ...payloadCosts,
@@ -965,8 +966,17 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
   };
   const exactOrDerivedTotal = (payloadKey: string, perUnitKey: string) => {
     const exact = payloadCosts[payloadKey];
-    if (exact !== undefined && exact !== null && exact !== '') return money(exact);
+    if (exact !== undefined && exact !== null && exact !== '') {
+      const exactAmount = number(exact, 0);
+      return payloadQty > 0 && payloadQty !== qty ? money((exactAmount / payloadQty) * qty) : money(exactAmount);
+    }
     return money(costs[perUnitKey] * qty);
+  };
+  const exactOrScaledTotal = (payloadKey: string) => {
+    const exact = payloadCosts[payloadKey];
+    if (exact === undefined || exact === null || exact === '') return undefined;
+    const exactAmount = number(exact, 0);
+    return payloadQty > 0 && payloadQty !== qty ? money((exactAmount / payloadQty) * qty) : money(exactAmount);
   };
   return {
     id: row.id,
@@ -990,12 +1000,12 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
       storageTotalMonth: exactOrDerivedTotal('storageTotalMonth', 'storagePerUnitMonth'),
       labelTotal: exactOrDerivedTotal('labelTotal', 'domesticLabelPerUnit'),
       total: payloadCosts.total !== undefined && payloadCosts.total !== null && payloadCosts.total !== ''
-        ? money(payloadCosts.total)
+        ? exactOrScaledTotal('total')
         : money(costs.totalPerUnit * qty),
-      unitLabelTotal: payloadCosts.unitLabelTotal ?? costs.unitLabelTotal,
-      cartonLabelTotal: payloadCosts.cartonLabelTotal ?? costs.cartonLabelTotal,
-      reboxTotal: payloadCosts.reboxTotal ?? costs.reboxTotal,
-      materialsTotal: payloadCosts.materialsTotal ?? costs.materialsTotal,
+      unitLabelTotal: exactOrScaledTotal('unitLabelTotal') ?? costs.unitLabelTotal,
+      cartonLabelTotal: exactOrScaledTotal('cartonLabelTotal') ?? costs.cartonLabelTotal,
+      reboxTotal: exactOrScaledTotal('reboxTotal') ?? costs.reboxTotal,
+      materialsTotal: exactOrScaledTotal('materialsTotal') ?? costs.materialsTotal,
     },
     blockers: json(row.blockers, []),
     sourceLabels: json(row.source_labels, []),
