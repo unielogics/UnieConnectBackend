@@ -161,6 +161,21 @@ async function callKeepa(asin: string, domain: number): Promise<{ ok: boolean; p
   return { ok, product, raw };
 }
 
+async function callKeepaCode(code: string, domain: number): Promise<{ ok: boolean; product: any | null; raw: any }> {
+  const key = process.env.KEEPA_API_KEY;
+  if (!key) throw new Error('KEEPA_API_KEY is not configured');
+  const url = `${KEEPA_API_BASE}/product?key=${encodeURIComponent(key)}&domain=${domain}&code=${encodeURIComponent(code)}&stats=30`;
+  const res = await fetch(url, { method: 'GET' });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Keepa HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const raw: any = await res.json();
+  const product = Array.isArray(raw?.products) ? raw.products[0] : null;
+  const ok = !!(product && product.asin);
+  return { ok, product, raw };
+}
+
 export type GetOpts = { domain?: number; force?: boolean };
 
 /**
@@ -212,6 +227,55 @@ export async function getKeepaSnapshot(asin: string, opts: GetOpts = {}): Promis
     throw err;
   }
 
+  await writeSnapshot(snapshot);
+  return snapshot;
+}
+
+export async function getKeepaSnapshotForIdentifiers(
+  identifiers: { asin?: string | null; upc?: string | null; ean?: string | null },
+  opts: GetOpts = {},
+): Promise<KeepaSnapshot | null> {
+  const cleanAsin = String(identifiers.asin || '').trim().toUpperCase();
+  if (cleanAsin) {
+    const asinSnapshot = await getKeepaSnapshot(cleanAsin, opts);
+    if (asinSnapshot?.ok) return asinSnapshot;
+    if (asinSnapshot && !identifiers.upc && !identifiers.ean) return asinSnapshot;
+  }
+
+  const code = String(identifiers.upc || identifiers.ean || '').replace(/[^0-9A-Za-z]/g, '').trim();
+  if (!code) return cleanAsin ? getKeepaSnapshot(cleanAsin, opts) : null;
+
+  const domain = opts.domain ?? 1;
+  const now = nowSec();
+  const { ok, product, raw } = await callKeepaCode(code, domain);
+  if (!ok || !product?.asin) {
+    return cleanAsin ? getKeepaSnapshot(cleanAsin, opts) : {
+      asin: `CODE#${code.toUpperCase()}`,
+      domain,
+      ok: false,
+      payload: { not_found: true, lookup_code: code, raw_tokens_left: raw?.tokensLeft ?? null },
+      fetched_by: 'unieconnect',
+      fetched_at: now,
+      expires_at: now + NEG_TTL_SEC,
+      read_count: 1,
+      last_read_at: now,
+    };
+  }
+
+  const asin = String(product.asin || '').trim().toUpperCase();
+  const denorm = denormalize(product);
+  const snapshot: KeepaSnapshot = {
+    asin,
+    domain,
+    ok: true,
+    payload: { ...(product as Record<string, unknown>), lookup_code: code },
+    fetched_by: 'unieconnect',
+    fetched_at: now,
+    expires_at: now + FRESH_TTL_SEC,
+    read_count: 1,
+    last_read_at: now,
+    ...denorm,
+  };
   await writeSnapshot(snapshot);
   return snapshot;
 }

@@ -1,4 +1,4 @@
-import { getKeepaSnapshot } from "./keepa";
+import { getKeepaSnapshotForIdentifiers } from "./keepa";
 import { randomUUID } from 'crypto';
 import { FastifyBaseLogger } from 'fastify';
 import fetch from 'node-fetch';
@@ -1330,16 +1330,24 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
   // Keepa enrichment is best-effort and never fails the SKU response.
   const asin = (item.asin || '').trim().toUpperCase() || null;
   const metadata = json(item.metadata, {});
+  const attributes = json(item.attributes, {});
+  const upc = item.upc || metadata.upc || attributes.upc || null;
+  const ean = item.ean || metadata.ean || attributes.ean || null;
+  const hasKeepaIdentifier = Boolean(asin || upc || ean);
   const existingKeepaState = metadata.keepaEnrichmentState || metadata.keepa_enrichment_state;
   let keepaEnrichmentState = existingKeepaState === 'manual_override'
     ? 'manual_override'
-    : asin
+    : hasKeepaIdentifier
       ? 'needs_retry'
       : 'missing_asin';
   let keepa: any = null;
-  if (asin) {
+  if (hasKeepaIdentifier) {
     try {
-      const snap = await getKeepaSnapshot(asin);
+      const snap = await getKeepaSnapshotForIdentifiers({
+        asin,
+        upc,
+        ean,
+      });
       if (snap && snap.ok) {
         keepa = {
           asin: snap.asin,
@@ -1398,7 +1406,6 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     height: dimsLocal?.height || keepa?.dimensions?.heightIn || null,
   };
   const weight = (item.weight && Number(item.weight) > 0) ? Number(item.weight) : (keepa?.weightLb || null);
-  const attributes = json(item.attributes, {});
   const images = Array.isArray(item.images) ? item.images : Array.isArray(metadata.images) ? metadata.images : [];
   const fulfillmentEconomics = await latestSkuFulfillmentEconomics(userId, item.id);
   const description = item.description || metadata.description || attributes.description || keepa?.description || '';

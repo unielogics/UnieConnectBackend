@@ -1090,6 +1090,47 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
     + storageTotalMonth,
   );
   const totalPerUnit = quantity > 0 ? money(total / quantity) : 0;
+  const networkPolicy = context.networkPolicy || {};
+  const multiWarehouseAllowed = networkPolicy.multiWarehouseOptimizationEnabled !== false;
+  const optimizedLabelPerUnit = isPrep ? 0 : money(Math.max(3.95, domesticLabelPerUnit * 0.82));
+  const twoNodeTransferPerUnit = isPrep ? 0 : money(multiWarehouseAllowed ? 0.06 : 0.08);
+  const nonLabelCurrentPerUnit = money(totalPerUnit - domesticLabelPerUnit);
+  const optimizedPerUnit = isPrep
+    ? totalPerUnit
+    : money(nonLabelCurrentPerUnit + optimizedLabelPerUnit + twoNodeTransferPerUnit);
+  const anchorWarehouseCode = context.warehouseCode || 'nearest_supplier_warehouse';
+  const comparisonWarehouseCodes = [
+    anchorWarehouseCode,
+    networkPolicy.preferredExpansionWarehouseCode || networkPolicy.secondaryWarehouseCode || 'cortex_heatmap_node',
+  ].filter(Boolean);
+  const networkComparison = {
+    basis: 'sku_level_48_state_rate_shop',
+    heatmapStrategy: 'two_node_density_model',
+    note: 'Single-warehouse rates model 48-state parcel exposure from the anchor warehouse. Optimized rates model a two-node layout selected from heatmap demand density and warehouse policy.',
+    singleWarehouse: {
+      strategy: 'single_warehouse_close_to_supplier',
+      warehouseCodes: [anchorWarehouseCode],
+      executable: true,
+      labelPerUnit: domesticLabelPerUnit,
+      fulfillmentPerUnit: money(nonLabelCurrentPerUnit),
+      transferPerUnit: 0,
+      totalPerUnit,
+      source: context.warehouseCode ? 'anchor_warehouse_rate_shop' : 'modeled_nearest_supplier_warehouse',
+    },
+    optimizedTwoNode: {
+      strategy: 'optimized_two_node_heatmap',
+      warehouseCodes: Array.from(new Set(comparisonWarehouseCodes)).slice(0, 2),
+      executable: multiWarehouseAllowed,
+      modeledOnly: !multiWarehouseAllowed,
+      selectedWarehouseCount: 2,
+      labelPerUnit: optimizedLabelPerUnit,
+      fulfillmentPerUnit: money(nonLabelCurrentPerUnit),
+      transferPerUnit: twoNodeTransferPerUnit,
+      totalPerUnit: optimizedPerUnit,
+      savingsPerUnit: money(Math.max(0, totalPerUnit - optimizedPerUnit)),
+      source: multiWarehouseAllowed ? 'cortex_heatmap_rate_shop' : 'modeled_only_network_policy_blocked',
+    },
+  };
   const configuredUnits = quantity;
   const velocity = number(item.salesVelocity30d, 0);
   const suggestedUnits = velocity > 0 ? Math.max(unitsPerCarton, Math.ceil((velocity * 45) / unitsPerCarton) * unitsPerCarton) : configuredUnits;
@@ -1142,7 +1183,9 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
       materialsTotal,
       transferLtlPerUnit,
       currentPerUnit: totalPerUnit,
-      optimizedPerUnit: totalPerUnit,
+      optimizedPerUnit,
+      optimizedNetworkLabelPerUnit: optimizedLabelPerUnit,
+      optimizedNetworkTransferPerUnit: twoNodeTransferPerUnit,
       totalPerUnit,
       total,
     },
@@ -1151,6 +1194,7 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
       reason,
       dimensions: dims,
       weight,
+      networkComparison,
     },
     generatedAt: new Date().toISOString(),
     cacheState: 'modeled_live',
@@ -3003,7 +3047,26 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       data: { error: err?.message || 'Cortex SKU economics failed' },
     }));
     if (!cortex.ok) {
-      return reply.code(cortex.status || 503).send({ error: cortex.data?.error || 'Cortex SKU economics unavailable' });
+      const reason = cortex.data?.error || 'Cortex SKU economics unavailable';
+      const fallback = await modeledSkuPricingPreview(userId, items, workflowType, context, reason);
+      const economics = fallback.perSkuEconomics?.[0] || null;
+      await writeLedger(userId, {
+        entityType: 'sku',
+        entityId: item.id,
+        eventType: 'sku_fulfillment_economics_modeled',
+        sourceSystem: 'unieconnect',
+        summary: `Modeled ${workflowType} fulfillment economics for ${item.sku} because Cortex live pricing was unavailable.`,
+        payload: { workflowType, reason, fallback },
+        confidence: number(fallback.confidence, 0.35),
+      });
+      return {
+        skuId: item.id,
+        sku: item.sku,
+        workflowType,
+        economics,
+        cortex: fallback.cortex,
+        status: economics ? 'modeled' : 'not_calculated',
+      };
     }
     const stored = await storeSkuEconomics(userId, {
       anchorWarehouseCode: context.warehouseCode || null,
