@@ -83,6 +83,11 @@ function isRetryableError(err: any): boolean {
   );
 }
 
+function isForegroundPricingPath(path: string): boolean {
+  return path === '/v1/oms/shipment-pricing/estimate'
+    || path === '/v1/oms/sku-fulfillment-economics';
+}
+
 async function fetchWithTimeout(url: string, init: any): Promise<{ res: any; text: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), READ_TIMEOUT_MS);
@@ -165,7 +170,7 @@ export async function postCortex(path: string, payload: any, options: CortexPost
     } catch (err: any) {
       lastErr = err;
       const code = err?.code || err?.cause?.code;
-      const retryable = isRetryableError(err) || err?.name === 'AbortError';
+      const retryable = (isRetryableError(err) || err?.name === 'AbortError') && !isForegroundPricingPath(path);
       if (!retryable || attempt >= MAX_ATTEMPTS - 1) {
         breakerRecordFailure();
         return {
