@@ -849,7 +849,7 @@ async function connectedWarehousePricingContext(userId: string) {
     [userId],
   ).catch(() => null);
   const metadata = json(link?.metadata, {});
-  const networkPolicy = metadata?.networkPolicy || metadata?.network_policy || null;
+  const rawNetworkPolicy = metadata?.networkPolicy || metadata?.network_policy || null;
   const address = json(link?.facility_address, {});
   const warehouseCode = trim(link?.warehouse_code || link?.facility_code);
   const postal = trim(
@@ -879,12 +879,65 @@ async function connectedWarehousePricingContext(userId: string) {
         isAnchor: true,
       }
     : null;
+  const networkPolicy = normalizeNetworkPolicyForCortex(rawNetworkPolicy, warehouseCode);
   return {
     warehouseCode,
     facilityId: link?.facility_id || null,
     networkPolicy,
     warehouses: warehouse ? [warehouse] : [],
   };
+}
+
+function uniqueWarehouseCodes(values: unknown[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values.flatMap((entry: any) => Array.isArray(entry) ? entry : typeof entry === 'string' ? entry.split(/[,\n]/) : [])) {
+    const code = trim(value).toUpperCase();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    out.push(code);
+  }
+  return out;
+}
+
+function normalizeNetworkPolicyForCortex(policy: AnyRow | null | undefined, anchorWarehouseCode?: string) {
+  const hasWmsPolicy = Boolean(policy && Object.keys(policy).length);
+  if (!hasWmsPolicy) {
+    return {
+      policySource: 'self_service',
+      nodeSelectionMode: 'auto',
+      multiWarehouseOptimizationEnabled: true,
+      anchorWarehouseCode: anchorWarehouseCode || null,
+      anchorWarehouseMustReceiveInventory: false,
+      allowedExpansionWarehouseCodes: [],
+      blockedExpansionWarehouseCodes: [],
+    };
+  }
+  const sourcePolicy = policy || {};
+  const enabled = sourcePolicy.multiWarehouseOptimizationEnabled !== false;
+  const mode = enabled && sourcePolicy.nodeSelectionMode === 'manual' ? 'manual' : 'auto';
+  return {
+    ...sourcePolicy,
+    policySource: sourcePolicy.policySource || 'wms_client',
+    multiWarehouseOptimizationEnabled: enabled,
+    nodeSelectionMode: mode,
+    anchorWarehouseCode: trim(sourcePolicy.anchorWarehouseCode) || anchorWarehouseCode || null,
+    anchorWarehouseMustReceiveInventory: sourcePolicy.anchorWarehouseMustReceiveInventory !== false,
+    anchorWarehousePriorityPct: number(sourcePolicy.anchorWarehousePriorityPct, enabled ? 50 : 100),
+    allowedExpansionWarehouseCodes: mode === 'manual' ? uniqueWarehouseCodes([sourcePolicy.allowedExpansionWarehouseCodes]) : [],
+    blockedExpansionWarehouseCodes: uniqueWarehouseCodes([sourcePolicy.blockedExpansionWarehouseCodes]),
+  };
+}
+
+function warehouseCodesForCortexPricing(context: AnyRow) {
+  const policy = context.networkPolicy || {};
+  const anchor = trim(policy.anchorWarehouseCode || context.warehouseCode);
+  if (policy.policySource === 'self_service') return undefined;
+  if (policy.multiWarehouseOptimizationEnabled === false) return anchor ? [anchor] : undefined;
+  if (policy.nodeSelectionMode === 'manual') {
+    return uniqueWarehouseCodes([anchor, policy.allowedExpansionWarehouseCodes]);
+  }
+  return undefined;
 }
 
 function cortexFeeLineItems(cortexData: AnyRow, units: number) {
@@ -990,10 +1043,48 @@ function economicsCosts(node: AnyRow = {}) {
   return node.costs || node.feeBreakdown || {};
 }
 
+function normalizedEconomicsWarehouseCodes(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[,\n]/) : [];
+  return raw.map((entry) => trim(entry)).filter(Boolean);
+}
+
+function normalizeStoredNetworkComparison(payload: AnyRow, costs: AnyRow) {
+  const comparison = json(payload.networkComparison || payload.pricingPayload?.networkComparison, {});
+  const optimized = json(comparison.optimizedTwoNode, {});
+  if (!comparison.optimizedTwoNode) return payload;
+  const warehouseCodes = normalizedEconomicsWarehouseCodes(optimized.warehouseCodes);
+  const distinctCount = new Set(warehouseCodes.map((code) => code.toLowerCase())).size;
+  const duplicateNode = warehouseCodes.length > 1 && distinctCount < 2;
+  const alreadyBlocked = optimized.status === 'blocked' || optimized.blockedReason || optimized.distinctSecondNode === false;
+  if (!duplicateNode && !alreadyBlocked) return payload;
+  const blockedReason = optimized.blockedReason || 'no_distinct_second_node_selected';
+  costs.optimizedPerUnit = undefined;
+  costs.optimizedNetworkLabelPerUnit = undefined;
+  costs.optimizedNetworkTransferPerUnit = undefined;
+  return {
+    ...payload,
+    networkComparison: {
+      ...comparison,
+      optimizedTwoNode: {
+        ...optimized,
+        status: 'blocked',
+        blockedReason,
+        distinctSecondNode: false,
+        selectedWarehouseCount: Math.min(distinctCount || 1, 1),
+        warehouseCodes: warehouseCodes.slice(0, 1),
+        labelPerUnit: null,
+        transferPerUnit: null,
+        totalPerUnit: null,
+        savingsPerUnit: null,
+      },
+    },
+  };
+}
+
 function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
   const storedPayload = json(row.pricing_payload, {});
   const nestedPricingPayload = json(storedPayload.pricingPayload, {});
-  const payload = {
+  let payload = {
     ...storedPayload,
     ...nestedPricingPayload,
     pricingPayload: nestedPricingPayload,
@@ -1018,6 +1109,7 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
     optimizedNetworkLabelPerUnit: roundedPayloadCost('optimizedNetworkLabelPerUnit'),
     optimizedNetworkTransferPerUnit: roundedPayloadCost('optimizedNetworkTransferPerUnit'),
   };
+  payload = normalizeStoredNetworkComparison(payload, costs);
   const exactOrDerivedTotal = (payloadKey: string, perUnitKey: string) => {
     const exact = payloadCosts[payloadKey];
     if (exact !== undefined && exact !== null && exact !== '') {
@@ -1040,6 +1132,7 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
     workflowType: row.workflow_type,
     anchorWarehouseCode: row.anchor_warehouse_code,
     rateShopScope: row.rate_shop_scope,
+    networkPolicy: json(row.network_policy, {}),
     sourceQuality: row.source_quality,
     confidence: number(row.confidence),
     currency: row.currency || 'USD',
@@ -1290,9 +1383,10 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
   const totalPerUnit = quantity > 0 ? money(total / quantity) : 0;
   const networkPolicy = context.networkPolicy || {};
   const multiWarehouseAllowed = networkPolicy.multiWarehouseOptimizationEnabled !== false;
+  const manualNodeCodes = uniqueWarehouseCodes([networkPolicy.allowedExpansionWarehouseCodes]);
   const demandHeatmap = item.demandHeatmap || {};
   const enoughDemandForNetwork = Boolean(demandHeatmap.enoughForNetworkOptimization);
-  const optimizedHubCount = !isPrep && multiWarehouseAllowed && enoughDemandForNetwork ? 2 : 1;
+  const optimizedHubCount = !isPrep && multiWarehouseAllowed && (enoughDemandForNetwork || networkPolicy.policySource === 'self_service') ? 2 : 1;
   const optimizedLabelPerUnit = isPrep
     ? 0
     : optimizedHubCount > 1
@@ -1306,8 +1400,16 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
   const anchorWarehouseCode = context.warehouseCode || 'nearest_supplier_warehouse';
   const comparisonWarehouseCodes = [
     anchorWarehouseCode,
-    optimizedHubCount > 1 ? (networkPolicy.preferredExpansionWarehouseCode || networkPolicy.secondaryWarehouseCode || 'cortex_heatmap_node') : null,
+    optimizedHubCount > 1 ? (manualNodeCodes[0] || networkPolicy.preferredExpansionWarehouseCode || networkPolicy.secondaryWarehouseCode || 'cortex_heatmap_node') : null,
   ].filter(Boolean);
+  const hasDistinctFallbackNode = new Set(comparisonWarehouseCodes).size >= 2;
+  const fallbackOptimizedBlockedReason = !multiWarehouseAllowed
+    ? 'network_expansion_not_allowed_by_warehouse'
+    : optimizedHubCount < 2
+      ? 'no_eligible_network_node_available'
+      : !hasDistinctFallbackNode
+        ? 'no_distinct_second_node_selected'
+        : null;
   const networkComparison = {
     basis: 'sku_level_48_state_rate_shop',
     heatmapStrategy: optimizedHubCount > 1 ? 'two_node_sku_order_heatmap' : 'single_node_until_sku_heatmap_threshold',
@@ -1328,16 +1430,21 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
     },
     optimizedTwoNode: {
       strategy: 'optimized_two_node_heatmap',
+      status: fallbackOptimizedBlockedReason ? 'blocked' : 'available',
+      blockedReason: fallbackOptimizedBlockedReason,
       warehouseCodes: Array.from(new Set(comparisonWarehouseCodes)).slice(0, 2),
-      executable: multiWarehouseAllowed && optimizedHubCount > 1,
-      modeledOnly: !multiWarehouseAllowed || optimizedHubCount < 2,
-      selectedWarehouseCount: optimizedHubCount,
+      executable: multiWarehouseAllowed && optimizedHubCount > 1 && hasDistinctFallbackNode,
+      modeledOnly: !multiWarehouseAllowed || optimizedHubCount < 2 || !hasDistinctFallbackNode,
+      distinctSecondNode: hasDistinctFallbackNode,
+      selectedWarehouseCount: hasDistinctFallbackNode ? 2 : 1,
+      demandSource: demandHeatmap.orderCount ? 'sku_order_heatmap' : 'national_demand_prior',
+      candidateWarehouseCodes: manualNodeCodes,
       enoughDemandForNetwork,
-      labelPerUnit: optimizedLabelPerUnit,
-      fulfillmentPerUnit: money(nonLabelCurrentPerUnit),
-      transferPerUnit: twoNodeTransferPerUnit,
-      totalPerUnit: optimizedPerUnit,
-      savingsPerUnit: money(Math.max(0, totalPerUnit - optimizedPerUnit)),
+      labelPerUnit: fallbackOptimizedBlockedReason ? null : optimizedLabelPerUnit,
+      fulfillmentPerUnit: fallbackOptimizedBlockedReason ? null : money(nonLabelCurrentPerUnit),
+      transferPerUnit: fallbackOptimizedBlockedReason ? null : twoNodeTransferPerUnit,
+      totalPerUnit: fallbackOptimizedBlockedReason ? null : optimizedPerUnit,
+      savingsPerUnit: fallbackOptimizedBlockedReason ? null : money(Math.max(0, totalPerUnit - optimizedPerUnit)),
       source: !multiWarehouseAllowed
         ? 'modeled_only_network_policy_blocked'
         : optimizedHubCount > 1
@@ -1757,7 +1864,7 @@ async function shipmentPricingPreview(userId: string, input: AnyRow) {
     supplierPickupSelected: Boolean(input.supplierPickupSelected || input.supplierPickupRequired),
     supplierPickupEstimate: cortexSupplierPickupEstimate(input.supplierPickupEstimate),
     anchorWarehouseCode: context.warehouseCode || undefined,
-    warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+    warehouseCodes: warehouseCodesForCortexPricing(context),
     warehouses: context.warehouses,
     networkPolicy: context.networkPolicy || undefined,
   }, { userId, idempotencyKey: `oms-pricing-plan-${userId}-${input.shipmentPlanId || randomUUID()}`, allowGlobalApiKey: true });
@@ -3130,7 +3237,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
-      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouseCodes: warehouseCodesForCortexPricing(context),
       warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
@@ -3231,7 +3338,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
-      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouseCodes: warehouseCodesForCortexPricing(context),
       warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
@@ -3341,7 +3448,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
-      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouseCodes: warehouseCodesForCortexPricing(context),
       warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
@@ -3410,7 +3517,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupSelected: Boolean(req.body?.supplierPickupSelected),
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
-      warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouseCodes: warehouseCodesForCortexPricing(context),
       warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
     }, { userId, idempotencyKey: `oms-pricing-refresh-${userId}-${Date.now()}` }).catch((err) => ({
