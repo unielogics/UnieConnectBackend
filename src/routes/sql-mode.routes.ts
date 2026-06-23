@@ -991,10 +991,16 @@ function economicsCosts(node: AnyRow = {}) {
 }
 
 function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
-  const payload = json(row.pricing_payload, {});
+  const storedPayload = json(row.pricing_payload, {});
+  const nestedPricingPayload = json(storedPayload.pricingPayload, {});
+  const payload = {
+    ...storedPayload,
+    ...nestedPricingPayload,
+    pricingPayload: nestedPricingPayload,
+  };
   const qty = number(quantity ?? payload.quantity, 1);
   const payloadQty = Math.max(0, number(payload.quantity, qty));
-  const payloadCosts = json(payload.costs, {});
+  const payloadCosts = json(storedPayload.costs || payload.costs, {});
   const roundedPayloadCost = (key: string) => optionalMoney(payloadCosts[key]);
   const costs = {
     ...payloadCosts,
@@ -1623,6 +1629,12 @@ async function storeSkuEconomics(userId: string, context: AnyRow, cortexData: An
     const sku = trim(row.sku);
     if (!itemId || !sku) continue;
     const costs = economicsCosts(row);
+    const rowPricingPayload = json(row.pricingPayload, {});
+    const persistedPayload = {
+      ...row,
+      ...rowPricingPayload,
+      pricingPayload: rowPricingPayload,
+    };
     const totalPerUnit = optionalMoney(costs.totalPerUnit ?? costs.currentPerUnit);
     const currentPerUnit = optionalMoney(costs.currentPerUnit ?? totalPerUnit);
     const optimizedPerUnit = optionalMoney(costs.optimizedPerUnit);
@@ -1667,7 +1679,7 @@ async function storeSkuEconomics(userId: string, context: AnyRow, cortexData: An
         JSON.stringify(Array.isArray(row.blockers) ? row.blockers : []),
         JSON.stringify(Array.from(new Set([...(cortexData?.sourceLabels || ['Cortex']), ...(row.sourceLabels || [])]))),
         JSON.stringify(row.quantityRecommendation || {}),
-        JSON.stringify(row),
+        JSON.stringify(persistedPayload),
         cortexData?.runId || null,
       ],
     ).catch(() => null);
