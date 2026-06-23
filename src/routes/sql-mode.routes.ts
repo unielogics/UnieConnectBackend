@@ -832,7 +832,15 @@ async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
 
 async function connectedWarehousePricingContext(userId: string) {
   const link = await one(
-    `SELECT l.warehouse_code, l.metadata, f.id AS facility_id, f.code AS facility_code
+    `SELECT
+       l.warehouse_code,
+       l.metadata,
+       f.id AS facility_id,
+       f.code AS facility_code,
+       f.name AS facility_name,
+       f.address AS facility_address,
+       f.latitude,
+       f.longitude
      FROM oms_warehouse_links l
      LEFT JOIN facilities f ON f.id = l.facility_id
      WHERE l.user_id = $1 AND l.status = 'connected'
@@ -842,10 +850,40 @@ async function connectedWarehousePricingContext(userId: string) {
   ).catch(() => null);
   const metadata = json(link?.metadata, {});
   const networkPolicy = metadata?.networkPolicy || metadata?.network_policy || null;
+  const address = json(link?.facility_address, {});
+  const warehouseCode = trim(link?.warehouse_code || link?.facility_code);
+  const postal = trim(
+    address.postal
+      || address.zip
+      || address.zipCode
+      || address.postalCode
+      || address.postal_code,
+  );
+  const state = trim(
+    address.state
+      || address.stateOrProvinceCode
+      || address.region
+      || address.province,
+  ).toUpperCase();
+  const latitude = number(link?.latitude ?? address.latitude ?? address.lat, NaN);
+  const longitude = number(link?.longitude ?? address.longitude ?? address.lon ?? address.lng, NaN);
+  const warehouse = warehouseCode
+    ? {
+        warehouseCode,
+        warehouseId: trim(link?.facility_id) || warehouseCode,
+        name: trim(link?.facility_name) || warehouseCode,
+        postal: postal || undefined,
+        state: state || undefined,
+        latitude: Number.isFinite(latitude) ? latitude : undefined,
+        longitude: Number.isFinite(longitude) ? longitude : undefined,
+        isAnchor: true,
+      }
+    : null;
   return {
-    warehouseCode: trim(link?.warehouse_code || link?.facility_code),
+    warehouseCode,
     facilityId: link?.facility_id || null,
     networkPolicy,
+    warehouses: warehouse ? [warehouse] : [],
   };
 }
 
@@ -1708,6 +1746,7 @@ async function shipmentPricingPreview(userId: string, input: AnyRow) {
     supplierPickupEstimate: cortexSupplierPickupEstimate(input.supplierPickupEstimate),
     anchorWarehouseCode: context.warehouseCode || undefined,
     warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+    warehouses: context.warehouses,
     networkPolicy: context.networkPolicy || undefined,
   }, { userId, idempotencyKey: `oms-pricing-plan-${userId}-${input.shipmentPlanId || randomUUID()}`, allowGlobalApiKey: true });
 }
@@ -3080,6 +3119,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
       destinationZipDemand: destinationZipDemandFromItems(items),
@@ -3180,6 +3220,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
       destinationZipDemand: destinationZipDemandFromItems(items),
@@ -3289,6 +3330,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
       destinationZipDemand: destinationZipDemandFromItems(items),
@@ -3357,6 +3399,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       supplierPickupEstimate: cortexSupplierPickupEstimate(req.body?.supplierPickupEstimate),
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
+      warehouses: context.warehouses,
       networkPolicy: context.networkPolicy || undefined,
     }, { userId, idempotencyKey: `oms-pricing-refresh-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
