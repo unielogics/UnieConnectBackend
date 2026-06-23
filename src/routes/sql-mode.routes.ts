@@ -24,6 +24,11 @@ const number = (value: unknown, fallback = 0) => {
 };
 
 const money = (value: unknown) => Math.round(number(value) * 100) / 100;
+const optionalMoney = (value: unknown) => {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 10000) / 10000 : null;
+};
 const json = (value: unknown, fallback: any) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
 const trim = (value: unknown) => (value == null ? '' : String(value).trim());
@@ -952,19 +957,22 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
   const qty = number(quantity ?? payload.quantity, 1);
   const payloadQty = Math.max(0, number(payload.quantity, qty));
   const payloadCosts = json(payload.costs, {});
+  const roundedPayloadCost = (key: string) => optionalMoney(payloadCosts[key]);
   const costs = {
     ...payloadCosts,
-    receivingPerUnit: money(row.receiving_per_unit),
-    prepLabPerUnit: money(row.prep_lab_per_unit),
-    pickPerUnit: money(row.pick_per_unit),
-    packPerUnit: money(row.pack_per_unit),
-    orderHandlingPerUnit: money(row.order_handling_per_unit),
-    storagePerUnitMonth: money(row.storage_per_unit_month),
-    domesticLabelPerUnit: money(row.domestic_label_per_unit),
-    transferLtlPerUnit: money(row.transfer_ltl_per_unit),
-    currentPerUnit: money(row.current_per_unit ?? row.total_per_unit),
-    optimizedPerUnit: money(row.optimized_per_unit),
-    totalPerUnit: money(row.total_per_unit ?? row.current_per_unit),
+    receivingPerUnit: optionalMoney(row.receiving_per_unit),
+    prepLabPerUnit: optionalMoney(row.prep_lab_per_unit),
+    pickPerUnit: optionalMoney(row.pick_per_unit),
+    packPerUnit: optionalMoney(row.pack_per_unit),
+    orderHandlingPerUnit: optionalMoney(row.order_handling_per_unit),
+    storagePerUnitMonth: optionalMoney(row.storage_per_unit_month),
+    domesticLabelPerUnit: optionalMoney(row.domestic_label_per_unit),
+    transferLtlPerUnit: optionalMoney(row.transfer_ltl_per_unit),
+    currentPerUnit: optionalMoney(row.current_per_unit ?? row.total_per_unit),
+    optimizedPerUnit: optionalMoney(row.optimized_per_unit),
+    totalPerUnit: optionalMoney(row.total_per_unit ?? row.current_per_unit),
+    optimizedNetworkLabelPerUnit: roundedPayloadCost('optimizedNetworkLabelPerUnit'),
+    optimizedNetworkTransferPerUnit: roundedPayloadCost('optimizedNetworkTransferPerUnit'),
   };
   const exactOrDerivedTotal = (payloadKey: string, perUnitKey: string) => {
     const exact = payloadCosts[payloadKey];
@@ -972,7 +980,7 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
       const exactAmount = number(exact, 0);
       return payloadQty > 0 && payloadQty !== qty ? money((exactAmount / payloadQty) * qty) : money(exactAmount);
     }
-    return money(costs[perUnitKey] * qty);
+    return costs[perUnitKey] == null ? undefined : money(costs[perUnitKey] * qty);
   };
   const exactOrScaledTotal = (payloadKey: string) => {
     const exact = payloadCosts[payloadKey];
@@ -1003,7 +1011,7 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
       labelTotal: exactOrDerivedTotal('labelTotal', 'domesticLabelPerUnit'),
       total: payloadCosts.total !== undefined && payloadCosts.total !== null && payloadCosts.total !== ''
         ? exactOrScaledTotal('total')
-        : money(costs.totalPerUnit * qty),
+        : costs.totalPerUnit == null ? undefined : money(costs.totalPerUnit * qty),
       unitLabelTotal: exactOrScaledTotal('unitLabelTotal') ?? costs.unitLabelTotal,
       cartonLabelTotal: exactOrScaledTotal('cartonLabelTotal') ?? costs.cartonLabelTotal,
       reboxTotal: exactOrScaledTotal('reboxTotal') ?? costs.reboxTotal,
@@ -1018,6 +1026,20 @@ function mapSkuEconomicsRow(row: AnyRow, quantity?: number) {
     expiresAt: iso(row.expires_at),
     cacheState: row.expires_at && new Date(row.expires_at).getTime() < Date.now() ? 'stale' : 'cached',
   };
+}
+
+function skuEconomicsHasCurrentPricingContract(economics: AnyRow | null | undefined) {
+  if (!economics) return false;
+  const payload = economics.pricingPayload || {};
+  const costs = economics.costs || {};
+  const blockers = Array.isArray(economics.blockers) ? economics.blockers.map((b: any) => String(b || '')) : [];
+  const network = payload.networkComparison || {};
+  const hasNetworkComparison = Boolean(network.singleWarehouse || network.optimizedTwoNode);
+  const hasLabelValue = costs.domesticLabelPerUnit !== undefined && costs.domesticLabelPerUnit !== null && costs.domesticLabelPerUnit !== '';
+  const hasLabelBlocker = blockers.includes('label_rate_unavailable');
+  const hasTransferValue = costs.transferLtlPerUnit !== undefined && costs.transferLtlPerUnit !== null && costs.transferLtlPerUnit !== '';
+  const hasTransferBlocker = blockers.some((b: string) => b.startsWith('ltl_transfer_'));
+  return hasNetworkComparison && (hasLabelValue || hasLabelBlocker) && (hasTransferValue || hasTransferBlocker || Boolean(network.singleWarehouse));
 }
 
 function firstFinite(...values: unknown[]) {
@@ -1469,6 +1491,23 @@ async function pricingItemsWithCatalog(userId: string, explicitItems?: any[]) {
   });
 }
 
+function destinationStateWeightsFromItems(items: AnyRow[]) {
+  const stateWeights = new Map<string, number>();
+  for (const item of items || []) {
+    const heatmap = item?.demandHeatmap;
+    const states = Array.isArray(heatmap?.states) ? heatmap.states : [];
+    for (const state of states) {
+      const code = trim(state?.state || state?.stateCode).toUpperCase();
+      if (!code) continue;
+      const weight = number(state?.orders ?? state?.units, 0);
+      if (weight > 0) stateWeights.set(code, (stateWeights.get(code) || 0) + weight);
+    }
+  }
+  const total = Array.from(stateWeights.values()).reduce((sum, value) => sum + value, 0);
+  if (total <= 0) return undefined;
+  return Object.fromEntries(Array.from(stateWeights.entries()).map(([state, value]) => [state, value / total]));
+}
+
 async function latestSkuEconomics(userId: string, items: AnyRow[], workflowType: string, anchorWarehouseCode?: string | null) {
   const itemIds = items.map((item) => trim(item.itemId || item.id)).filter(Boolean);
   if (!itemIds.length) return new Map<string, AnyRow>();
@@ -1495,7 +1534,9 @@ async function storeSkuEconomics(userId: string, context: AnyRow, cortexData: An
     const sku = trim(row.sku);
     if (!itemId || !sku) continue;
     const costs = economicsCosts(row);
-    const totalPerUnit = number(costs.totalPerUnit ?? costs.currentPerUnit, 0);
+    const totalPerUnit = optionalMoney(costs.totalPerUnit ?? costs.currentPerUnit);
+    const currentPerUnit = optionalMoney(costs.currentPerUnit ?? totalPerUnit);
+    const optimizedPerUnit = optionalMoney(costs.optimizedPerUnit);
     await pgQuery(
       `DELETE FROM oms_sku_fulfillment_economics
        WHERE user_id = $1 AND item_id = $2 AND workflow_type = $3 AND COALESCE(anchor_warehouse_code, '') = COALESCE($4, '')`,
@@ -1523,19 +1564,19 @@ async function storeSkuEconomics(userId: string, context: AnyRow, cortexData: An
         row.sourceQuality || cortexData?.warehousePricingSource || 'cortex',
         number(row.confidence ?? cortexData?.confidence, 0),
         cortexData?.currency || 'USD',
-        money(costs.currentPerUnit ?? totalPerUnit),
-        money(costs.optimizedPerUnit),
-        money(costs.receivingPerUnit),
-        money(costs.prepLabPerUnit),
-        money(costs.pickPerUnit),
-        money(costs.packPerUnit),
-        money(costs.orderHandlingPerUnit),
-        money(costs.storagePerUnitMonth),
-        money(costs.domesticLabelPerUnit ?? costs.labelPerUnit),
-        money(costs.transferLtlPerUnit),
-        money(totalPerUnit),
+        currentPerUnit,
+        optimizedPerUnit,
+        optionalMoney(costs.receivingPerUnit),
+        optionalMoney(costs.prepLabPerUnit),
+        optionalMoney(costs.pickPerUnit),
+        optionalMoney(costs.packPerUnit),
+        optionalMoney(costs.orderHandlingPerUnit),
+        optionalMoney(costs.storagePerUnitMonth),
+        optionalMoney(costs.domesticLabelPerUnit ?? costs.labelPerUnit),
+        optionalMoney(costs.transferLtlPerUnit ?? costs.optimizedNetworkTransferPerUnit),
+        totalPerUnit,
         JSON.stringify(Array.isArray(row.blockers) ? row.blockers : []),
-        JSON.stringify(cortexData?.sourceLabels || ['Cortex']),
+        JSON.stringify(Array.from(new Set([...(cortexData?.sourceLabels || ['Cortex']), ...(row.sourceLabels || [])]))),
         JSON.stringify(row.quantityRecommendation || {}),
         JSON.stringify(row),
         cortexData?.runId || null,
@@ -2989,6 +3030,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
       networkPolicy: context.networkPolicy || undefined,
+      destinationStateWeights: destinationStateWeightsFromItems(items),
     }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
@@ -3040,7 +3082,11 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         return row ? mapSkuEconomicsRow(row, itemQuantity(item)) : null;
       })
       .filter(Boolean) as AnyRow[];
-    if (cachedEconomics.length === items.length && items.length > 0) {
+    if (
+      cachedEconomics.length === items.length &&
+      items.length > 0 &&
+      cachedEconomics.every(skuEconomicsHasCurrentPricingContract)
+    ) {
       const aggregate = aggregateSkuEconomics(cachedEconomics, workflowType);
       const lineItems = cortexFeeLineItems({ feeBreakdown: aggregate.feeBreakdown }, units);
       const total = money(lineItems.reduce((sum, item) => sum + number(item.amount), 0));
@@ -3083,6 +3129,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
       networkPolicy: context.networkPolicy || undefined,
+      destinationStateWeights: destinationStateWeightsFromItems(items),
     }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
@@ -3143,11 +3190,22 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!item) return reply.code(404).send({ error: 'SKU not found' });
     const cached = await latestSkuEconomics(userId, [{ itemId: item.id }], workflowType, context.warehouseCode || null);
     const row = cached.get(String(item.id));
+    const economics = row ? mapSkuEconomicsRow(row) : null;
+    if (economics && !skuEconomicsHasCurrentPricingContract(economics)) {
+      return {
+        skuId: item.id,
+        sku: item.sku,
+        workflowType,
+        economics: null,
+        staleEconomics: economics,
+        status: 'stale_contract',
+      };
+    }
     return {
       skuId: item.id,
       sku: item.sku,
       workflowType,
-      economics: row ? mapSkuEconomicsRow(row) : null,
+      economics,
       status: row ? 'available' : 'not_calculated',
     };
   });
@@ -3179,6 +3237,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       anchorWarehouseCode: context.warehouseCode || undefined,
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
       networkPolicy: context.networkPolicy || undefined,
+      destinationStateWeights: destinationStateWeightsFromItems(items),
     }, { userId, idempotencyKey: `oms-sku-econ-refresh-${userId}-${item.id}-${workflowType}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
