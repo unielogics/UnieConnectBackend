@@ -9,7 +9,7 @@ import { getCortexCredentialHeaders } from './cortex-credentials.service';
 // so the caller falls back to local heuristics fast instead of queueing.
 
 const CONNECT_TIMEOUT_MS = 5_000;
-const READ_TIMEOUT_MS = 30_000;
+const READ_TIMEOUT_MS = 60_000;
 const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = [250, 1_000, 4_000] as const;
 
@@ -92,7 +92,7 @@ async function fetchWithTimeout(url: string, init: any): Promise<{ res: any; tex
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), READ_TIMEOUT_MS);
   try {
-    const res: any = await fetch(url, { ...init, signal: controller.signal, timeout: CONNECT_TIMEOUT_MS });
+    const res: any = await fetch(url, { ...init, signal: controller.signal, timeout: READ_TIMEOUT_MS });
     const text = await res.text();
     return { res, text };
   } finally {
