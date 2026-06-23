@@ -1039,7 +1039,18 @@ function skuEconomicsHasCurrentPricingContract(economics: AnyRow | null | undefi
   const hasLabelBlocker = blockers.includes('label_rate_unavailable');
   const hasTransferValue = costs.transferLtlPerUnit !== undefined && costs.transferLtlPerUnit !== null && costs.transferLtlPerUnit !== '';
   const hasTransferBlocker = blockers.some((b: string) => b.startsWith('ltl_transfer_'));
-  return hasNetworkComparison && (hasLabelValue || hasLabelBlocker) && (hasTransferValue || hasTransferBlocker || Boolean(network.singleWarehouse));
+  const workflow = String(economics.workflowType || '').toUpperCase();
+  const isPrep = workflow === 'FBA' || workflow === 'FBW';
+  const hasRateCacheEvidence = Boolean(
+    payload.rateCacheDiagnostics
+      || network.singleWarehouse?.rateCacheDiagnostics
+      || network.optimizedTwoNode?.rateCacheDiagnostics
+      || hasLabelBlocker,
+  );
+  return hasNetworkComparison
+    && (hasLabelValue || hasLabelBlocker)
+    && (hasTransferValue || hasTransferBlocker || Boolean(network.singleWarehouse))
+    && (isPrep || hasRateCacheEvidence);
 }
 
 function firstFinite(...values: unknown[]) {
@@ -1094,6 +1105,11 @@ async function skuDemandHeatmaps(userId: string, items: AnyRow[]) {
          NULLIF(o.shipping_address->>'zip', ''),
          NULLIF(o.shipping_address->>'postal_code', '')
        ), '[^0-9]', '', 'g'), 3) AS zip3,
+       LEFT(REGEXP_REPLACE(COALESCE(
+         NULLIF(o.shipping_address->>'postalCode', ''),
+         NULLIF(o.shipping_address->>'zip', ''),
+         NULLIF(o.shipping_address->>'postal_code', '')
+       ), '[^0-9]', '', 'g'), 5) AS zip5,
        COUNT(DISTINCT o.id)::int AS orders,
        COALESCE(SUM(COALESCE(ol.quantity, 0)), 0)::numeric AS units
      FROM order_lines ol
@@ -1102,7 +1118,7 @@ async function skuDemandHeatmaps(userId: string, items: AnyRow[]) {
      WHERE ol.user_id = $1
        AND (${lookup.join(' OR ')})
        AND COALESCE(o.placed_at, o.created_at, now()) >= now() - interval '365 days'
-     GROUP BY item_id, sku, state, zip3
+     GROUP BY item_id, sku, state, zip3, zip5
      HAVING UPPER(COALESCE(
        NULLIF(o.shipping_address->>'stateOrProvinceCode', ''),
        NULLIF(o.shipping_address->>'state', ''),
@@ -1127,9 +1143,11 @@ async function skuDemandHeatmaps(userId: string, items: AnyRow[]) {
     const list = byKey.get(itemId) || byKey.get(sku) || [];
     const states = new Map<string, { state: string; orders: number; units: number }>();
     const zipPrefixes = new Map<string, { zip3: string; orders: number; units: number }>();
+    const zip5s = new Map<string, { zip5: string; state: string; orders: number; units: number }>();
     for (const row of list) {
       const state = trim(row.state);
       const zip3 = trim(row.zip3);
+      const zip5 = trim(row.zip5);
       const orders = number(row.orders);
       const units = number(row.units);
       if (state) {
@@ -1144,9 +1162,16 @@ async function skuDemandHeatmaps(userId: string, items: AnyRow[]) {
         existing.units += units;
         zipPrefixes.set(zip3, existing);
       }
+      if (zip5 && state) {
+        const existing = zip5s.get(`${state}:${zip5}`) || { zip5, state, orders: 0, units: 0 };
+        existing.orders += orders;
+        existing.units += units;
+        zip5s.set(`${state}:${zip5}`, existing);
+      }
     }
     const stateList = Array.from(states.values()).sort((a, b) => b.orders - a.orders || b.units - a.units);
     const zipList = Array.from(zipPrefixes.values()).sort((a, b) => b.orders - a.orders || b.units - a.units);
+    const zip5List = Array.from(zip5s.values()).sort((a, b) => b.orders - a.orders || b.units - a.units);
     const totalOrders = stateList.reduce((sum, row) => sum + row.orders, 0);
     const totalUnits = stateList.reduce((sum, row) => sum + row.units, 0);
     const enoughForNetworkOptimization = stateList.length >= 2 && (totalOrders >= 25 || totalUnits >= 100);
@@ -1160,6 +1185,7 @@ async function skuDemandHeatmaps(userId: string, items: AnyRow[]) {
         zipPrefixCount: zipList.length,
         states: stateList.slice(0, 12),
         zipPrefixes: zipList.slice(0, 20),
+        zip5s: zip5List.slice(0, 50),
         enoughForNetworkOptimization,
         recommendedHubCount: enoughForNetworkOptimization ? 2 : 1,
         basis: 'sku_order_heatmap',
@@ -1506,6 +1532,31 @@ function destinationStateWeightsFromItems(items: AnyRow[]) {
   const total = Array.from(stateWeights.values()).reduce((sum, value) => sum + value, 0);
   if (total <= 0) return undefined;
   return Object.fromEntries(Array.from(stateWeights.entries()).map(([state, value]) => [state, value / total]));
+}
+
+function destinationZipDemandFromItems(items: AnyRow[]) {
+  const stateZipWeights = new Map<string, Map<string, number>>();
+  for (const item of items || []) {
+    const heatmap = item?.demandHeatmap;
+    const zips = Array.isArray(heatmap?.zip5s) ? heatmap.zip5s : [];
+    for (const row of zips) {
+      const state = trim(row?.state || row?.stateCode).toUpperCase();
+      const zip5 = trim(row?.zip5 || row?.postalCode || row?.zip).replace(/[^0-9]/g, '').slice(0, 5);
+      if (!state || zip5.length !== 5) continue;
+      const weight = number(row?.orders ?? row?.units, 0);
+      if (weight <= 0) continue;
+      const byZip = stateZipWeights.get(state) || new Map<string, number>();
+      byZip.set(zip5, (byZip.get(zip5) || 0) + weight);
+      stateZipWeights.set(state, byZip);
+    }
+  }
+  if (!stateZipWeights.size) return undefined;
+  return Object.fromEntries(
+    Array.from(stateZipWeights.entries()).map(([state, byZip]) => [
+      state,
+      Object.fromEntries(Array.from(byZip.entries())),
+    ]),
+  );
 }
 
 async function latestSkuEconomics(userId: string, items: AnyRow[], workflowType: string, anchorWarehouseCode?: string | null) {
@@ -3016,7 +3067,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.post('/shipment-plans/estimate-service-fees', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const items = await pricingItemsWithCatalog(userId, req.body?.items);
     const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
     const context = await connectedWarehousePricingContext(userId);
     const cortex = await postCortex('/v1/oms/shipment-pricing/estimate', {
@@ -3031,6 +3082,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
+      destinationZipDemand: destinationZipDemandFromItems(items),
     }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
@@ -3130,6 +3182,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
+      destinationZipDemand: destinationZipDemandFromItems(items),
     }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
@@ -3238,6 +3291,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       warehouseCodes: context.warehouseCode ? [context.warehouseCode] : undefined,
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
+      destinationZipDemand: destinationZipDemandFromItems(items),
     }, { userId, idempotencyKey: `oms-sku-econ-refresh-${userId}-${item.id}-${workflowType}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
