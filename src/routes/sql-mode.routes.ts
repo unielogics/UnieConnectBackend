@@ -874,6 +874,7 @@ async function catalogItemsForPricingRefresh(userId: string, explicitItems?: any
      LIMIT 250`,
     [userId],
   );
+  const demandHeatmaps = await skuDemandHeatmaps(userId, items).catch(() => new Map<string, AnyRow>());
   return items.map((item) => {
     const dims = json(item.dimensions, {});
     const metadata = json(item.metadata, {});
@@ -890,6 +891,7 @@ async function catalogItemsForPricingRefresh(userId: string, explicitItems?: any
       },
       cost: money(metadata.cost ?? metadata.unitCost ?? 0),
       sellingPrice: money(metadata.price ?? metadata.sellingPrice ?? 0),
+      demandHeatmap: demandHeatmaps.get(trim(item.id)) || demandHeatmaps.get(trim(item.sku)) || null,
     };
   });
 }
@@ -1042,6 +1044,109 @@ function itemCubeFt(item: AnyRow = {}) {
   return firstFinite(item.palletCubeFt, item.cubeFt, 0.05);
 }
 
+async function skuDemandHeatmaps(userId: string, items: AnyRow[]) {
+  const ids = items.map((item) => trim(item.itemId || item.id)).filter(Boolean);
+  const skus = items.map((item) => trim(item.sku)).filter(Boolean);
+  if (!ids.length && !skus.length) return new Map<string, AnyRow>();
+  const values: unknown[] = [userId];
+  const lookup: string[] = [];
+  if (ids.length) {
+    values.push(ids);
+    lookup.push(`ol.item_id::text = ANY($${values.length}::text[])`);
+  }
+  if (skus.length) {
+    values.push(skus);
+    lookup.push(`ol.sku = ANY($${values.length}::text[])`);
+  }
+  const data = await rows(
+    `SELECT
+       COALESCE(ol.item_id::text, '') AS item_id,
+       COALESCE(ci.sku, ol.sku, '') AS sku,
+       UPPER(COALESCE(
+         NULLIF(o.shipping_address->>'stateOrProvinceCode', ''),
+         NULLIF(o.shipping_address->>'state', ''),
+         NULLIF(o.shipping_address->>'province', '')
+       )) AS state,
+       LEFT(REGEXP_REPLACE(COALESCE(
+         NULLIF(o.shipping_address->>'postalCode', ''),
+         NULLIF(o.shipping_address->>'zip', ''),
+         NULLIF(o.shipping_address->>'postal_code', '')
+       ), '[^0-9]', '', 'g'), 3) AS zip3,
+       COUNT(DISTINCT o.id)::int AS orders,
+       COALESCE(SUM(COALESCE(ol.quantity, 0)), 0)::numeric AS units
+     FROM order_lines ol
+     INNER JOIN orders o ON o.id = ol.order_id AND o.user_id = ol.user_id
+     LEFT JOIN catalog_items ci ON ci.id = ol.item_id AND ci.user_id = ol.user_id
+     WHERE ol.user_id = $1
+       AND (${lookup.join(' OR ')})
+       AND COALESCE(o.placed_at, o.created_at, now()) >= now() - interval '365 days'
+     GROUP BY item_id, sku, state, zip3
+     HAVING UPPER(COALESCE(
+       NULLIF(o.shipping_address->>'stateOrProvinceCode', ''),
+       NULLIF(o.shipping_address->>'state', ''),
+       NULLIF(o.shipping_address->>'province', '')
+     )) IS NOT NULL
+     ORDER BY COUNT(DISTINCT o.id) DESC`,
+    values,
+  ).catch(() => []);
+  const byKey = new Map<string, AnyRow[]>();
+  for (const row of data) {
+    for (const key of [trim(row.item_id), trim(row.sku)].filter(Boolean)) {
+      const list = byKey.get(key) || [];
+      list.push(row);
+      byKey.set(key, list);
+    }
+  }
+  const result = new Map<string, AnyRow>();
+  for (const item of items) {
+    const itemId = trim(item.itemId || item.id);
+    const sku = trim(item.sku);
+    const key = itemId || sku;
+    const list = byKey.get(itemId) || byKey.get(sku) || [];
+    const states = new Map<string, { state: string; orders: number; units: number }>();
+    const zipPrefixes = new Map<string, { zip3: string; orders: number; units: number }>();
+    for (const row of list) {
+      const state = trim(row.state);
+      const zip3 = trim(row.zip3);
+      const orders = number(row.orders);
+      const units = number(row.units);
+      if (state) {
+        const existing = states.get(state) || { state, orders: 0, units: 0 };
+        existing.orders += orders;
+        existing.units += units;
+        states.set(state, existing);
+      }
+      if (zip3) {
+        const existing = zipPrefixes.get(zip3) || { zip3, orders: 0, units: 0 };
+        existing.orders += orders;
+        existing.units += units;
+        zipPrefixes.set(zip3, existing);
+      }
+    }
+    const stateList = Array.from(states.values()).sort((a, b) => b.orders - a.orders || b.units - a.units);
+    const zipList = Array.from(zipPrefixes.values()).sort((a, b) => b.orders - a.orders || b.units - a.units);
+    const totalOrders = stateList.reduce((sum, row) => sum + row.orders, 0);
+    const totalUnits = stateList.reduce((sum, row) => sum + row.units, 0);
+    const enoughForNetworkOptimization = stateList.length >= 2 && (totalOrders >= 25 || totalUnits >= 100);
+    if (key) {
+      result.set(key, {
+        source: totalOrders > 0 ? 'oms_order_destinations' : 'no_order_heatmap',
+        lookbackDays: 365,
+        orderCount: totalOrders,
+        unitCount: totalUnits,
+        stateCount: stateList.length,
+        zipPrefixCount: zipList.length,
+        states: stateList.slice(0, 12),
+        zipPrefixes: zipList.slice(0, 20),
+        enoughForNetworkOptimization,
+        recommendedHubCount: enoughForNetworkOptimization ? 2 : 1,
+        basis: 'sku_order_heatmap',
+      });
+    }
+  }
+  return result;
+}
+
 function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: AnyRow, reason: string) {
   const quantity = Math.max(1, itemQuantity(item));
   const cartons = Math.max(1, number(item.cartons ?? item.boxCount, Math.ceil(quantity / Math.max(1, number(item.unitsPerCarton ?? item.unitsPerBox, 24)))));
@@ -1051,6 +1156,7 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
   const weight = firstFinite(item.unitWeightLb, item.weight, item.weightPerUnit, 1);
   const hasDims = dims.length > 0 && dims.width > 0 && dims.height > 0;
   const hasWeight = weight > 0;
+  const rateShoppingTriggered = hasDims && hasWeight;
   const isPrep = isPrepWorkflow(workflowType);
   const receivingPerUnit = 0.18;
   const storagePerUnitMonth = money(Math.max(0.01, cubePerUnit * 0.55));
@@ -1092,8 +1198,15 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
   const totalPerUnit = quantity > 0 ? money(total / quantity) : 0;
   const networkPolicy = context.networkPolicy || {};
   const multiWarehouseAllowed = networkPolicy.multiWarehouseOptimizationEnabled !== false;
-  const optimizedLabelPerUnit = isPrep ? 0 : money(Math.max(3.95, domesticLabelPerUnit * 0.82));
-  const twoNodeTransferPerUnit = isPrep ? 0 : money(multiWarehouseAllowed ? 0.06 : 0.08);
+  const demandHeatmap = item.demandHeatmap || {};
+  const enoughDemandForNetwork = Boolean(demandHeatmap.enoughForNetworkOptimization);
+  const optimizedHubCount = !isPrep && multiWarehouseAllowed && enoughDemandForNetwork ? 2 : 1;
+  const optimizedLabelPerUnit = isPrep
+    ? 0
+    : optimizedHubCount > 1
+      ? money(Math.max(3.95, domesticLabelPerUnit * 0.82))
+      : domesticLabelPerUnit;
+  const twoNodeTransferPerUnit = isPrep || optimizedHubCount < 2 ? 0 : money(0.06);
   const nonLabelCurrentPerUnit = money(totalPerUnit - domesticLabelPerUnit);
   const optimizedPerUnit = isPrep
     ? totalPerUnit
@@ -1101,16 +1214,20 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
   const anchorWarehouseCode = context.warehouseCode || 'nearest_supplier_warehouse';
   const comparisonWarehouseCodes = [
     anchorWarehouseCode,
-    networkPolicy.preferredExpansionWarehouseCode || networkPolicy.secondaryWarehouseCode || 'cortex_heatmap_node',
+    optimizedHubCount > 1 ? (networkPolicy.preferredExpansionWarehouseCode || networkPolicy.secondaryWarehouseCode || 'cortex_heatmap_node') : null,
   ].filter(Boolean);
   const networkComparison = {
     basis: 'sku_level_48_state_rate_shop',
-    heatmapStrategy: 'two_node_density_model',
-    note: 'Single-warehouse rates model 48-state parcel exposure from the anchor warehouse. Optimized rates model a two-node layout selected from heatmap demand density and warehouse policy.',
+    heatmapStrategy: optimizedHubCount > 1 ? 'two_node_sku_order_heatmap' : 'single_node_until_sku_heatmap_threshold',
+    note: optimizedHubCount > 1
+      ? 'Single-warehouse rates model 48-state parcel exposure from the anchor warehouse. Optimized rates model a two-node layout selected from SKU order heatmap density and warehouse policy.'
+      : 'This SKU is rate-shopped from the anchor warehouse. Cortex will model additional hubs after SKU order heatmap density is strong enough and the account policy allows network optimization.',
+    demandHeatmap,
     singleWarehouse: {
       strategy: 'single_warehouse_close_to_supplier',
       warehouseCodes: [anchorWarehouseCode],
       executable: true,
+      rateShoppingTriggered,
       labelPerUnit: domesticLabelPerUnit,
       fulfillmentPerUnit: money(nonLabelCurrentPerUnit),
       transferPerUnit: 0,
@@ -1120,15 +1237,20 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
     optimizedTwoNode: {
       strategy: 'optimized_two_node_heatmap',
       warehouseCodes: Array.from(new Set(comparisonWarehouseCodes)).slice(0, 2),
-      executable: multiWarehouseAllowed,
-      modeledOnly: !multiWarehouseAllowed,
-      selectedWarehouseCount: 2,
+      executable: multiWarehouseAllowed && optimizedHubCount > 1,
+      modeledOnly: !multiWarehouseAllowed || optimizedHubCount < 2,
+      selectedWarehouseCount: optimizedHubCount,
+      enoughDemandForNetwork,
       labelPerUnit: optimizedLabelPerUnit,
       fulfillmentPerUnit: money(nonLabelCurrentPerUnit),
       transferPerUnit: twoNodeTransferPerUnit,
       totalPerUnit: optimizedPerUnit,
       savingsPerUnit: money(Math.max(0, totalPerUnit - optimizedPerUnit)),
-      source: multiWarehouseAllowed ? 'cortex_heatmap_rate_shop' : 'modeled_only_network_policy_blocked',
+      source: !multiWarehouseAllowed
+        ? 'modeled_only_network_policy_blocked'
+        : optimizedHubCount > 1
+          ? 'cortex_sku_heatmap_rate_shop'
+          : 'single_node_insufficient_sku_heatmap',
     },
   };
   const configuredUnits = quantity;
@@ -1150,7 +1272,12 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
     confidence,
     currency: 'USD',
     blockers,
-    sourceLabels: ['modeled_fallback', context.warehouseCode ? 'connected_warehouse_policy' : 'full_network_policy'],
+    sourceLabels: [
+      'modeled_fallback',
+      context.warehouseCode ? 'connected_warehouse_policy' : 'full_network_policy',
+      rateShoppingTriggered ? 'manual_dimensions_weight_rate_shop' : 'modeled_dimensions_weight',
+      demandHeatmap.source || 'no_order_heatmap',
+    ],
     quantityRecommendation: {
       configuredUnits,
       suggestedUnits,
@@ -1195,6 +1322,12 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
       dimensions: dims,
       weight,
       networkComparison,
+      rateShopInputs: {
+        hasDimensions: hasDims,
+        hasWeight,
+        rateShoppingTriggered,
+        triggerSource: rateShoppingTriggered ? 'sku_dimensions_weight' : 'modeled_product_profile',
+      },
     },
     generatedAt: new Date().toISOString(),
     cacheState: 'modeled_live',
@@ -1304,14 +1437,18 @@ async function pricingItemsWithCatalog(userId: string, explicitItems?: any[]) {
   ).catch(() => []);
   const byId = new Map(found.map((item) => [String(item.id), item]));
   const bySku = new Map(found.map((item) => [String(item.sku), item]));
+  const demandHeatmaps = await skuDemandHeatmaps(userId, incoming).catch(() => new Map<string, AnyRow>());
   return incoming.map((raw) => {
     const item = byId.get(trim(raw.itemId || raw.id)) || bySku.get(trim(raw.sku)) || {};
     const dims = json(item.dimensions, {});
     const metadata = json(item.metadata, {});
+    const itemId = raw.itemId || raw.id || item.id;
+    const sku = raw.sku || item.sku;
+    const demandHeatmap = demandHeatmaps.get(trim(itemId)) || demandHeatmaps.get(trim(sku)) || raw.demandHeatmap || null;
     return {
       ...raw,
-      itemId: raw.itemId || raw.id || item.id,
-      sku: raw.sku || item.sku,
+      itemId,
+      sku,
       title: raw.title || item.title,
       asin: raw.asin || item.asin,
       upc: raw.upc || item.upc,
@@ -1327,6 +1464,7 @@ async function pricingItemsWithCatalog(userId: string, explicitItems?: any[]) {
       sellingPrice: raw.sellingPrice ?? raw.price ?? metadata.price ?? metadata.sellingPrice ?? metadata.shopifyPrice ?? 0,
       salesVelocity30d: raw.salesVelocity30d ?? metadata.velocity30d ?? metadata.salesVelocity30d ?? 0,
       keepaState: raw.keepaState ?? metadata.keepaState ?? metadata.keepa_enrichment_state ?? null,
+      demandHeatmap,
     };
   });
 }
