@@ -330,16 +330,29 @@ async function upsertWmsOrder(userId: string, warehouseCode: string, body: any) 
   if (orderId) {
     await pgQuery(
       `UPDATE orders
-       SET external_order_id=$3, order_number=$4, status=$5, totals=$6::jsonb, shipping_address=$7::jsonb, tracking_number=$8, metadata=metadata || $9::jsonb, updated_at=now()
+       SET external_order_id=$3, order_number=$4, status=$5, totals=$6::jsonb, shipping_address=$7::jsonb, tracking_number=$8::text, metadata=metadata || $9::jsonb, updated_at=now()
        WHERE user_id=$1 AND id=$2`,
       params,
     );
   } else {
+    // Own param list for the INSERT: the shared `params` includes $2 (existing id) which the
+    // INSERT never references, and Postgres can't infer the type of that unused bare-null
+    // parameter → error 42P18. Also cast the nullable tracking_number so a null binds cleanly.
+    const insertParams = [
+      params[0], // user_id
+      params[2], // external_order_id
+      params[3], // order_number
+      params[4], // status
+      params[5], // totals jsonb
+      params[6], // shipping_address jsonb
+      params[7], // tracking_number (nullable)
+      params[8], // metadata jsonb
+    ];
     const inserted = await pgQuery(
       `INSERT INTO orders (user_id, channel, external_order_id, order_number, status, totals, shipping_address, tracking_number, metadata)
-       VALUES ($1,'wms',$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9::jsonb)
+       VALUES ($1,'wms',$2,$3,$4,$5::jsonb,$6::jsonb,$7::text,$8::jsonb)
        RETURNING id`,
-      params,
+      insertParams,
     );
     orderId = inserted?.rows?.[0]?.id;
   }
@@ -593,7 +606,7 @@ async function acceptWmsEvent(req: any, reply: any, defaultEventType: string) {
   const event = await pgQuery(
     `INSERT INTO oms_wms_events
       (user_id, credential_id, client_id, warehouse_code, wms_intermediary_id, event_type, entity_type, entity_id, idempotency_key, payload)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+     VALUES ($1, $2, $3, $4, $5::text, $6, $7::text, $8::text, $9, $10::jsonb)
      ON CONFLICT (client_id, idempotency_key) DO UPDATE SET
       payload = EXCLUDED.payload,
       received_at = now()
