@@ -176,6 +176,36 @@ function wmsMetadata(body: any, warehouseCode: string) {
   };
 }
 
+// Fixed stage-rank per entity. A WMS event may NOT downgrade a more-advanced status (the
+// 30-min batch drain can deliver events out of order — a stale 'picking' must not overwrite
+// 'shipped'). 'cancelled' is terminal (only an explicit reopen elsewhere can leave it).
+const WMS_STATUS_RANK: Record<string, Record<string, number>> = {
+  order: { pending: 0, confirmed: 1, picking: 2, packing: 3, ready_to_ship: 4, shipped: 5, completed: 6 },
+  // ASN receiving lifecycle; putaway is tracked separately in payload, not this column.
+  asn: { 'in-transit': 0, pending: 0, partial: 1, received: 2, completed: 3 },
+}
+
+/**
+ * Decide whether an incoming WMS status may be applied to the current stored status.
+ * - unknown/absent statuses pass through (never block on something we don't rank),
+ * - 'cancelled' is terminal: once cancelled, a non-cancelled WMS event cannot revive it,
+ * - otherwise apply only when incoming rank >= current rank (no downgrade).
+ */
+function wmsStatusAllowsTransition(entity: 'order' | 'asn', current?: string | null, incoming?: string | null): boolean {
+  const cur = String(current || '').trim().toLowerCase()
+  const inc = String(incoming || '').trim().toLowerCase()
+  if (!inc) return false
+  if (!cur) return true
+  if (cur === inc) return true
+  if (cur === 'cancelled') return inc === 'cancelled'
+  if (inc === 'cancelled') return true // cancellation may always be applied to a non-terminal order
+  const ranks = WMS_STATUS_RANK[entity] || {}
+  const rc = ranks[cur]
+  const ri = ranks[inc]
+  if (rc === undefined || ri === undefined) return true // don't block on unranked statuses
+  return ri >= rc
+}
+
 async function upsertWmsItem(userId: string, warehouseCode: string, body: any) {
   const payload = bodyPayload(body);
   const sku = textValue(payload.sku, body.externalReference);
@@ -304,59 +334,98 @@ async function upsertWmsCustomer(userId: string, warehouseCode: string, body: an
 async function upsertWmsOrder(userId: string, warehouseCode: string, body: any) {
   const payload = bodyPayload(body);
   const externalOrderId = String(body.entityId || payload.id || payload._id || '');
-  const orderNumber = textValue(payload.orderNumber, payload.alternativeOrderNumber, body.externalReference, externalOrderId);
+  const wmsOrderNumber = textValue(payload.orderNumber, body.externalReference);
+  // The client's ORIGINAL OMS order id/number travels back as alternativeOrderNumber. This is
+  // the correct join key — the WMS number/_id are NOT stored on the native order.
+  const altOrderNumber = textValue(payload.alternativeOrderNumber);
+  const orderNumber = textValue(wmsOrderNumber, altOrderNumber, externalOrderId);
   if (!externalOrderId && !orderNumber) return { skipped: true, reason: 'missing_order_identity' };
   const metadata = wmsMetadata(body, warehouseCode);
-  const existing = await pgQuery(
-    `SELECT id FROM orders WHERE user_id=$1 AND (external_order_id=$2 OR order_number=$3) LIMIT 1`,
-    [userId, externalOrderId, orderNumber],
-  );
-  const totals = payload.totals || {
-    quantity: payload.totalQuantity,
-    value: payload.totalValue,
-  };
-  const params = [
-    userId,
-    existing?.rows?.[0]?.id || null,
-    externalOrderId,
-    orderNumber,
-    textValue(payload.status) || 'open',
-    JSON.stringify(totals || {}),
-    JSON.stringify(payload.shipping?.address || payload.shippingAddress || {}),
-    textValue(payload.trackingNumber, payload.shipping?.trackingNumber),
-    JSON.stringify(metadata),
-  ];
-  let orderId = existing?.rows?.[0]?.id;
+
+  // Identity match precedence (all scoped to user_id = this OMS account):
+  //  1. alternativeOrderNumber → the client's native order (id / order_number / external_order_id).
+  //     THIS is what prevents the duplicate 'wms' shadow: it finds the order the client placed.
+  //  2. Fallback: the WMS _id / WMS number (for orders that originated in the WMS, no native row,
+  //     and for rows we already stamped on a prior sync).
+  let existing: any = null;
+  if (altOrderNumber) {
+    existing = await pgQuery(
+      `SELECT id, status FROM orders
+       WHERE user_id=$1 AND (id::text=$2 OR order_number=$2 OR external_order_id=$2)
+       LIMIT 1`,
+      [userId, altOrderNumber],
+    );
+  }
+  if (!existing?.rows?.[0]?.id) {
+    existing = await pgQuery(
+      `SELECT id, status FROM orders
+       WHERE user_id=$1 AND (
+         (external_order_id IS NOT NULL AND external_order_id=$2) OR
+         (metadata->>'wmsEntityId')=$2 OR
+         ($3 <> '' AND (order_number=$3 OR (metadata->>'wmsOrderNumber')=$3))
+       ) LIMIT 1`,
+      [userId, externalOrderId || ' ', wmsOrderNumber || ''],
+    );
+  }
+
+  const matchedId = existing?.rows?.[0]?.id || null;
+  const currentStatus = existing?.rows?.[0]?.status || null;
+  const incomingStatus = textValue(payload.status);
+  const hasTotals = payload.totals != null || payload.totalQuantity != null || payload.totalValue != null;
+  const hasShipping = payload.shipping?.address != null || payload.shippingAddress != null;
+  const totals = payload.totals || { quantity: payload.totalQuantity, value: payload.totalValue };
+
+  let orderId = matchedId;
   if (orderId) {
+    // Stamp WMS ids into metadata for fast future matches, WITHOUT overwriting the client's
+    // native order_number / external_order_id. Only advance status forward, and only overwrite
+    // totals/shipping when the WMS event actually carries them (else keep OMS-owned values).
+    const applyStatus = incomingStatus && wmsStatusAllowsTransition('order', currentStatus, incomingStatus);
+    const metaWithWms = { ...metadata, wmsOrderNumber: wmsOrderNumber || undefined, wmsEntityId: externalOrderId || undefined };
     await pgQuery(
-      `UPDATE orders
-       SET external_order_id=$3, order_number=$4, status=$5, totals=$6::jsonb, shipping_address=$7::jsonb, tracking_number=$8::text, metadata=metadata || $9::jsonb, updated_at=now()
+      `UPDATE orders SET
+         status = CASE WHEN $3::boolean THEN $4 ELSE status END,
+         totals = CASE WHEN $5::boolean THEN $6::jsonb ELSE totals END,
+         shipping_address = CASE WHEN $7::boolean THEN $8::jsonb ELSE shipping_address END,
+         tracking_number = COALESCE($9::text, tracking_number),
+         metadata = metadata || $10::jsonb,
+         updated_at = now()
        WHERE user_id=$1 AND id=$2`,
-      params,
+      [
+        userId,
+        orderId,
+        Boolean(applyStatus),
+        incomingStatus || currentStatus || 'open',
+        hasTotals,
+        JSON.stringify(totals || {}),
+        hasShipping,
+        JSON.stringify(payload.shipping?.address || payload.shippingAddress || {}),
+        textValue(payload.trackingNumber, payload.shipping?.trackingNumber),
+        JSON.stringify(metaWithWms),
+      ],
     );
   } else {
-    // Own param list for the INSERT: the shared `params` includes $2 (existing id) which the
-    // INSERT never references, and Postgres can't infer the type of that unused bare-null
-    // parameter → error 42P18. Also cast the nullable tracking_number so a null binds cleanly.
-    const insertParams = [
-      params[0], // user_id
-      params[2], // external_order_id
-      params[3], // order_number
-      params[4], // status
-      params[5], // totals jsonb
-      params[6], // shipping_address jsonb
-      params[7], // tracking_number (nullable)
-      params[8], // metadata jsonb
-    ];
+    // No native match → this is a genuinely WMS-origin order. Create a wms-channel row.
     const inserted = await pgQuery(
       `INSERT INTO orders (user_id, channel, external_order_id, order_number, status, totals, shipping_address, tracking_number, metadata)
        VALUES ($1,'wms',$2,$3,$4,$5::jsonb,$6::jsonb,$7::text,$8::jsonb)
        RETURNING id`,
-      insertParams,
+      [
+        userId,
+        externalOrderId,
+        orderNumber,
+        incomingStatus || 'open',
+        JSON.stringify(totals || {}),
+        JSON.stringify(payload.shipping?.address || payload.shippingAddress || {}),
+        textValue(payload.trackingNumber, payload.shipping?.trackingNumber),
+        JSON.stringify({ ...metadata, wmsOrderNumber: wmsOrderNumber || undefined, wmsEntityId: externalOrderId || undefined }),
+      ],
     );
     orderId = inserted?.rows?.[0]?.id;
   }
-  if (orderId && Array.isArray(payload.lineItems)) {
+  // Only (re)write line items when the WMS event actually carries them, so a status-only event
+  // doesn't wipe the client's order lines.
+  if (orderId && Array.isArray(payload.lineItems) && payload.lineItems.length > 0) {
     await pgQuery('DELETE FROM order_lines WHERE user_id=$1 AND order_id=$2', [userId, orderId]);
     for (const line of payload.lineItems) {
       await pgQuery(
@@ -382,27 +451,57 @@ async function upsertWmsAsn(userId: string, warehouseCode: string, body: any) {
   const payload = bodyPayload(body);
   const metadata = wmsMetadata(body, warehouseCode);
   const externalId = String(body.entityId || payload.id || payload._id || '');
-  const asnNumber = textValue(payload.asnNumber, body.externalReference, payload.poNumber, externalId);
+  const wmsAsnNumber = textValue(payload.asnNumber, body.externalReference);
+  // The client's ORIGINAL OMS ASN identity travels back as alternativeOrderNumber / poNumber
+  // (OMS sends its own ASN-xxxx as poNumber at create). Use it to find the native ASN.
+  const altRef = textValue(payload.alternativeOrderNumber, payload.poNumber);
+  const asnNumber = textValue(wmsAsnNumber, altRef, externalId);
   if (!externalId && !asnNumber) return { skipped: true, reason: 'missing_asn_identity' };
-  const existing = await pgQuery(
-    `SELECT id FROM asns WHERE user_id=$1 AND (payload->>'wmsEntityId'=$2 OR asn_number=$3) LIMIT 1`,
-    [userId, externalId, asnNumber],
-  );
+
+  // Identity precedence (scoped user_id): 1) the client's native ASN by its own number /
+  // the wmsExecution linkage carrying alternativeOrderNumber; 2) fallback to the WMS id/number
+  // we may have already stamped. This avoids creating a duplicate 'wms' ASN alongside the
+  // client's projected ASN.
+  let existing: any = null;
+  if (altRef) {
+    existing = await pgQuery(
+      `SELECT id, status FROM asns
+       WHERE user_id=$1 AND (asn_number=$2 OR payload->>'poNumber'=$2 OR payload->'wmsExecution'->>'asnNumber'=$2)
+       LIMIT 1`,
+      [userId, altRef],
+    );
+  }
+  if (!existing?.rows?.[0]?.id) {
+    existing = await pgQuery(
+      `SELECT id, status FROM asns
+       WHERE user_id=$1 AND ((payload->>'wmsEntityId')=$2 OR ($3 <> '' AND asn_number=$3))
+       LIMIT 1`,
+      [userId, externalId || ' ', wmsAsnNumber || ''],
+    );
+  }
+
+  const matchedId = existing?.rows?.[0]?.id || null;
+  const currentStatus = existing?.rows?.[0]?.status || null;
+  const incomingStatus = textValue(payload.status, body.operation);
   const asnPayload = { ...payload, ...metadata };
-  if (existing?.rows?.[0]?.id) {
+  if (matchedId) {
+    // Advance status forward only; keep the native asn_number (don't overwrite with the WMS one).
+    const applyStatus = incomingStatus && wmsStatusAllowsTransition('asn', currentStatus, incomingStatus);
     await pgQuery(
       `UPDATE asns
-       SET asn_number=$3, status=$4, payload=$5::jsonb, updated_at=now()
+       SET status = CASE WHEN $3::boolean THEN $4 ELSE status END,
+           payload = payload || $5::jsonb,
+           updated_at = now()
        WHERE user_id=$1 AND id=$2`,
-      [userId, existing.rows[0].id, asnNumber, textValue(payload.status) || body.operation || 'created', JSON.stringify(asnPayload)],
+      [userId, matchedId, Boolean(applyStatus), incomingStatus || currentStatus || 'created', JSON.stringify(asnPayload)],
     );
-    return { upserted: existing.rows[0].id };
+    return { upserted: matchedId };
   }
   const inserted = await pgQuery(
     `INSERT INTO asns (user_id, asn_number, status, payload)
      VALUES ($1,$2,$3,$4::jsonb)
      RETURNING id`,
-    [userId, asnNumber, textValue(payload.status) || body.operation || 'created', JSON.stringify(asnPayload)],
+    [userId, asnNumber, incomingStatus || 'created', JSON.stringify(asnPayload)],
   );
   return { upserted: inserted?.rows?.[0]?.id || null };
 }
@@ -501,11 +600,13 @@ async function upsertWmsSupportTicket(userId: string, warehouseCode: string, bod
       ticketValues,
     );
   } else {
+    // Own param list: the shared ticketValues includes $2 (existing id) which the INSERT never
+    // references → untyped bare-null param → 42P18. Cast the nullable body param too.
     const inserted = await pgQuery(
       `INSERT INTO support_tickets (user_id, subject, body, entity_type, entity_id, channel, priority, status, owner)
-       VALUES ($1,$3,$4,'support_ticket',$5,'wms',$6,$7,$8)
+       VALUES ($1,$2,$3::text,'support_ticket',$4,'wms',$5,$6,$7)
        RETURNING id`,
-      ticketValues,
+      [ticketValues[0], ticketValues[2], ticketValues[3], ticketValues[4], ticketValues[5], ticketValues[6], ticketValues[7]],
     );
     ticketId = inserted?.rows?.[0]?.id;
   }
