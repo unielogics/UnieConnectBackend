@@ -1318,6 +1318,47 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     [userId, item.id, item.sku, `%${item.sku}%`],
   );
   const facilities = await getFacilities(userId);
+
+  // Build the REAL per-warehouse inventory for this SKU. The WMS pushes an inventory_snapshot
+  // per warehouse into catalog_items.wms_inventory keyed by warehouseCode (applyInventorySnapshot
+  // in wms-integration.routes). Non-warehouse keys are marketplace channels (shopify/amazon/
+  // ebay/shopifyStores) — a warehouse entry is distinguished by carrying warehouseCode/onHand.
+  // Only surface warehouses that actually have a WMS snapshot for THIS sku (not every facility),
+  // so the count + numbers are truthful instead of placeholder zeros.
+  const wmsInv = json(item.wms_inventory, {}) as Record<string, any>;
+  const CHANNEL_KEYS = new Set(['shopify', 'shopifyStores', 'amazon', 'ebay', 'walmart', 'available', 'reserved', 'onHand', 'inbound']);
+  const facilityByCode = new Map(
+    facilities.map((f: any) => [String(f.code || '').toUpperCase(), f]),
+  );
+  const skuVelocityPerDay = number((intelligence as any)?.velocity30d ?? (intelligence as any)?.velocityPerDay, 0) || 0;
+  const skuWarehouses = Object.entries(wmsInv)
+    .filter(([key, val]) =>
+      val && typeof val === 'object' && !CHANNEL_KEYS.has(key) &&
+      ((val as any).warehouseCode || (val as any).onHand != null || (val as any).available != null),
+    )
+    .map(([key, val]) => {
+      const code = String((val as any).warehouseCode || key).toUpperCase();
+      const fac = facilityByCode.get(code);
+      const available = number((val as any).available ?? (val as any).onHand, 0);
+      const inbound = number((val as any).inbound, 0);
+      const velocity = skuVelocityPerDay; // per-SKU network velocity (no per-wh split available yet)
+      const daysOfCover = velocity > 0 ? Math.round((available / velocity) * 10) / 10 : (available > 0 ? 999 : 0);
+      return {
+        code,
+        name: fac?.name || (val as any).name || code,
+        region: fac?.region || (fac?.metadata as any)?.region || undefined,
+        available,
+        inbound,
+        velocityPerDay: velocity,
+        daysOfCover,
+        storageCost: 0,
+        status: available > 0 ? 'stocked' : 'empty',
+        updatedAt: (val as any).updatedAt || null,
+        hasWmsData: true,
+      };
+    })
+    .sort((a, b) => b.available - a.available);
+
   const amazonProfile = (await tableExists('amazon_item_profiles'))
     ? await one(
         `SELECT *
@@ -1450,14 +1491,10 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
       cube: intelligence?.palletCubeFt || 0,
       mode: i % 3 === 0 ? 'LTL' : 'Parcel',
     })),
-    warehouses: facilities.map((f, i) => ({
-      code: f.code || `WH-${i + 1}`,
-      name: f.name,
-      available: 0,
-      inbound: 0,
-      daysOfCover: 0,
-      storageCost: 0,
-    })),
+    // Real per-warehouse inventory for this SKU (from WMS snapshots). Empty until the WMS has
+    // pushed an inventory_snapshot for this SKU — the UI shows an honest "no WMS inventory yet"
+    // state rather than a row of placeholder zeros for every facility.
+    warehouses: skuWarehouses,
     history: skuHistoryTimeline(item, activityPlans, asnRows, activityLogs, ledgerRows),
     billing: {
       currentMonthly: 120,
