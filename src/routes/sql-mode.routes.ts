@@ -4515,6 +4515,11 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (body.demandTrailingWindowDays !== undefined) {
       payload.demandTrailingWindowDays = Number(body.demandTrailingWindowDays);
     }
+    if (body.safetyBufferDays !== undefined) payload.safetyBufferDays = Number(body.safetyBufferDays);
+    if (body.maxTasksPerSweep !== undefined) payload.maxTasksPerSweep = Number(body.maxTasksPerSweep);
+    // Time windows (when replenishment may run, warehouse-local). Passed through as-is; the
+    // WMS sanitizes each {start,end,days?} entry and drops malformed rows. [] clears them.
+    if (body.windows !== undefined) payload.windows = Array.isArray(body.windows) ? body.windows : [];
     try {
       const tuning = await callWmsInternal('/internal/oms/replenishment-tuning', payload);
       return { warehouseCode, ...tuning };
@@ -4522,6 +4527,30 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       return reply.code(err?.status || 502).send({
         error: 'wms_replenishment_tuning_update_failed',
         message: err?.message || 'Failed to update WMS replenishment tuning',
+      });
+    }
+  });
+
+  // Quiet-time window suggestions (from WMS pick/pack activity) — read-only helper the UI
+  // uses to suggest good replenishment windows.
+  app.get('/oms/warehouses/:warehouseCode/replenishment-quiet-times', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const warehouseCode = trim(req.params.warehouseCode).toUpperCase();
+    const link = await one(
+      `SELECT 1 FROM oms_warehouse_links WHERE user_id = $1 AND warehouse_code = $2 LIMIT 1`,
+      [userId, warehouseCode],
+    );
+    if (!link) return reply.code(404).send({ error: 'warehouse_connection_not_found' });
+    try {
+      const report = await getWmsInternal(
+        `/internal/oms/replenishment-quiet-times?warehouseCode=${encodeURIComponent(warehouseCode)}`,
+      );
+      return report;
+    } catch (err: any) {
+      return reply.code(err?.status || 502).send({
+        error: 'wms_replenishment_quiet_times_unavailable',
+        message: err?.message || 'WMS quiet-time suggestions unavailable',
       });
     }
   });
