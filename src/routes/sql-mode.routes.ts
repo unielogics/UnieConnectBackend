@@ -3468,8 +3468,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (warehouseCodes.length === 0) return reply.code(404).send({ error: 'no_connected_warehouse' });
     const b = (req.body || {}) as AnyRow;
     const payload: AnyRow = { sku: item.sku, warehouseCodes };
-    // Pass through only the profile fields (undefined ones are omitted by the WMS).
-    for (const f of ['enabled', 'preferredHandlingUnit', 'minPickFaceEaches', 'maxPickFaceEaches', 'velocityThresholdPerDay', 'approvalRequired', 'leadTimeDays', 'demandTrailingWindowDays', 'safetyBufferDays']) {
+    // The CLIENT owns ONLY demand intent: enable, supplier lead time, demand window. Physical/
+    // derived fields are computed by the WMS brain and are not accepted from the client.
+    for (const f of ['enabled', 'supplierLeadTimeDays', 'demandWindowDays']) {
       if (b[f] !== undefined) payload[f] = b[f];
     }
     try {
@@ -3481,6 +3482,55 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         message: err?.message || 'Failed to update WMS replenishment profile',
       });
     }
+  });
+
+  // Push the seller's ecommerce demand (per-SKU units/day from sales history) to the WMS, which
+  // blends it with actual pick throughput. Computes over a trailing window from order_lines +
+  // orders and pushes to every connected warehouse. Body: { windowDays? } (default 30).
+  app.post('/oms/replenishment/push-demand', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const windowDays = Math.max(1, Number((req.body || {}).windowDays) || 30);
+    const links = await rows(
+      `SELECT warehouse_code FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected' AND warehouse_code IS NOT NULL`,
+      [userId],
+    );
+    const warehouseCodes = Array.from(
+      new Set(links.map((l: any) => String(l.warehouse_code || '').trim().toUpperCase()).filter(Boolean)),
+    );
+    if (warehouseCodes.length === 0) return reply.code(404).send({ error: 'no_connected_warehouse' });
+
+    // Per-SKU units/day = total shipped/ordered units in the window / windowDays. Uses the
+    // user's own orders across all channels (the real ecommerce demand), joined to lines.
+    const demandRows = await rows(
+      `SELECT ol.sku AS sku, COALESCE(SUM(ol.quantity), 0) AS units
+         FROM order_lines ol
+         JOIN orders o ON o.id = ol.order_id
+        WHERE ol.user_id = $1
+          AND ol.sku IS NOT NULL AND ol.sku <> ''
+          AND COALESCE(o.placed_at, o.created_at) >= now() - ($2::int || ' days')::interval
+          AND o.status <> 'cancelled'
+        GROUP BY ol.sku`,
+      [userId, windowDays],
+    );
+    const items = demandRows
+      .map((r: any) => ({ sku: String(r.sku), unitsPerDay: Number(r.units) / windowDays, windowDays }))
+      .filter((r: any) => r.sku && Number.isFinite(r.unitsPerDay));
+
+    if (items.length === 0) {
+      return { pushed: 0, warehouses: warehouseCodes, note: 'no sales in window' };
+    }
+
+    const results: AnyRow[] = [];
+    for (const code of warehouseCodes) {
+      try {
+        const res = await callWmsInternal('/internal/oms/sku-demand', { warehouseCode: code, source: 'oms_sales', items });
+        results.push({ warehouseCode: code, ...res });
+      } catch (err: any) {
+        results.push({ warehouseCode: code, error: err?.message || 'push failed' });
+      }
+    }
+    return { skus: items.length, windowDays, results };
   });
 
   app.post('/skus/:skuId/fulfillment-economics/refresh', async (req: any, reply) => {
