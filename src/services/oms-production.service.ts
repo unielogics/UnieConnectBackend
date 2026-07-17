@@ -775,6 +775,32 @@ function itemInventory(item: Row, filter: MarketplaceFilter = {}) {
   return { ...inv, available };
 }
 
+// Non-warehouse keys in wms_inventory (marketplace channels + scalar fields). A per-warehouse
+// entry is keyed by warehouseCode and carries available/onHand — same discrimination used by
+// getOmsSkuDetail's skuWarehouses builder.
+const WMS_INVENTORY_CHANNEL_KEYS = new Set([
+  'shopify', 'shopifyStores', 'amazon', 'ebay', 'walmart', 'available', 'reserved', 'onHand', 'inbound',
+]);
+
+/**
+ * True NETWORK on-hand for a SKU = sum of the real per-warehouse WMS snapshots stored in
+ * catalog_items.wms_inventory (keyed by warehouseCode by applyInventorySnapshot). This is
+ * distinct from itemInventory().available, which returns a marketplace-channel figure. Returns
+ * { total, warehouseCount, hasWms }; hasWms=false when no warehouse snapshot exists yet.
+ */
+function wmsNetworkOnHand(item: Row): { total: number; warehouseCount: number; hasWms: boolean } {
+  const inv = json(item.wms_inventory, item.wmsInventory || {}) as Record<string, any>;
+  let total = 0;
+  let warehouseCount = 0;
+  for (const [key, val] of Object.entries(inv)) {
+    if (!val || typeof val !== 'object' || WMS_INVENTORY_CHANNEL_KEYS.has(key)) continue;
+    if (!((val as any).warehouseCode || (val as any).onHand != null || (val as any).available != null)) continue;
+    total += number((val as any).available ?? (val as any).onHand);
+    warehouseCount += 1;
+  }
+  return { total, warehouseCount, hasWms: warehouseCount > 0 };
+}
+
 function itemDimensions(item: Row) {
   return json(item.dimensions, {});
 }
@@ -901,26 +927,34 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
 
   // ---- Reorder-needed (external supply loop) ------------------------------------------------
   // Only for products where the client enabled auto-replenishment on the SKU page (cached into
-  // metadata.replenishment by the profile POST). "velocity" here is a 30-DAY total, so per-day
-  // = velocity/30. Flag when projected days-of-cover falls within the supplier lead time + a
-  // safety buffer, i.e. the seller should place a supplier reorder now. This is a SUGGESTION,
-  // isolated from the internal warehouse forward-pick loop (different lead time entirely).
+  // metadata.replenishment by the profile POST). This is a SUGGESTION, isolated from the
+  // internal warehouse forward-pick loop (different lead time entirely).
+  //
+  // UNITS/SOURCE (pinned): `velocity` is a 30-DAY total → per-day = velocity/30. The reorder
+  // trigger keys off TRUE NETWORK on-hand summed from the WMS per-warehouse snapshots
+  // (wmsNetworkOnHand), NOT the marketplace-channel `available` used for the display column —
+  // because reordering from the supplier is about physical stock across the warehouse network.
+  // Falls back to the channel `available` only when no WMS snapshot exists yet (un-synced SKU),
+  // so nothing regresses before inventory flows.
   const REORDER_DEFAULT_LEAD_DAYS = 7;
   const REORDER_SAFETY_BUFFER_DAYS = 3;
   const REORDER_COVER_TARGET_DAYS = 30; // reorder up to ~30 days of cover
   const repl = json(metadata.replenishment, {});
   const reorderEnabled = repl?.enabled === true;
   const perDay = velocity / 30;
+  const netOnHand = wmsNetworkOnHand(item);
+  const reorderOnHand = netOnHand.hasWms ? netOnHand.total : available;
+  const reorderDaysOfCover = perDay > 0 ? Math.round((reorderOnHand / perDay)) : 0;
   const supplierLeadTimeDays = Number.isFinite(Number(repl?.supplierLeadTimeDays)) && Number(repl?.supplierLeadTimeDays) > 0
     ? Number(repl.supplierLeadTimeDays)
     : REORDER_DEFAULT_LEAD_DAYS;
   const reorderThresholdDays = supplierLeadTimeDays + REORDER_SAFETY_BUFFER_DAYS;
-  const reorderNeeded = reorderEnabled && perDay > 0 && daysOfCover <= reorderThresholdDays;
+  const reorderNeeded = reorderEnabled && perDay > 0 && reorderDaysOfCover <= reorderThresholdDays;
   const suggestedReorderQty = reorderNeeded
-    ? Math.max(0, Math.ceil(perDay * (supplierLeadTimeDays + REORDER_COVER_TARGET_DAYS)) - available)
+    ? Math.max(0, Math.ceil(perDay * (supplierLeadTimeDays + REORDER_COVER_TARGET_DAYS)) - reorderOnHand)
     : 0;
   const reorderReason = reorderNeeded
-    ? `~${daysOfCover}d of cover vs ${supplierLeadTimeDays}d supplier lead time — reorder ~${suggestedReorderQty} units`
+    ? `~${reorderDaysOfCover}d of network cover (${reorderOnHand} on hand${netOnHand.hasWms ? '' : ', channel est.'}) vs ${supplierLeadTimeDays}d supplier lead time — reorder ~${suggestedReorderQty} units`
     : '';
 
   const asin = String(item.asin || '').trim();
@@ -944,9 +978,13 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     velocity30d: velocity,
     daysOfCover,
     risk,
+    // Network on-hand summed from WMS per-warehouse snapshots (distinct from the channel
+    // `available` column). Drives the reorder trigger; exposed for transparency.
+    networkOnHand: netOnHand.hasWms ? netOnHand.total : null,
     reorderNeeded,
     reorderReason,
     suggestedReorderQty,
+    reorderDaysOfCover: reorderEnabled && perDay > 0 ? reorderDaysOfCover : null,
     supplierLeadTimeDays: reorderEnabled ? supplierLeadTimeDays : null,
     currentWarehouseCount: facilitiesCount,
     proposedWarehouseCount: velocity > 0 ? Math.max(1, facilitiesCount) : facilitiesCount,

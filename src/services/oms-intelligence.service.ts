@@ -924,7 +924,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
       entityId: sku.id || sku.sku,
       title: `${sku.sku}: reorder from supplier`,
       summary: sku.reorderReason || 'Projected to stock out within supplier lead time — place a reorder.',
-      currentValue: { daysOfCover: sku.daysOfCover, available: sku.available, velocity30d: sku.velocity30d },
+      currentValue: { networkOnHand: sku.networkOnHand ?? sku.available, daysOfCover: sku.reorderDaysOfCover ?? sku.daysOfCover, velocity30d: sku.velocity30d },
       optimizedValue: { suggestedReorderQty: sku.suggestedReorderQty, supplierLeadTimeDays: sku.supplierLeadTimeDays },
       requiredAction: 'place_reorder',
       approvalState: 'draft',
