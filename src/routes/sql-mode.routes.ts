@@ -4474,6 +4474,58 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     };
   });
 
+  // Replenishment tuning (P3): read/write the WMS warehouse-wide leadTimeDays +
+  // demandTrailingWindowDays that the forward-pick replenishment engine consumes. The
+  // values live canonically in the WMS; we proxy to its internal API (keyed by warehouseCode
+  // the OMS already stores in oms_warehouse_links). Requires the warehouse be connected.
+  app.get('/oms/warehouses/:warehouseCode/replenishment-tuning', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const warehouseCode = trim(req.params.warehouseCode).toUpperCase();
+    const link = await one(
+      `SELECT 1 FROM oms_warehouse_links WHERE user_id = $1 AND warehouse_code = $2 LIMIT 1`,
+      [userId, warehouseCode],
+    );
+    if (!link) return reply.code(404).send({ error: 'warehouse_connection_not_found' });
+    try {
+      const tuning = await getWmsInternal(
+        `/internal/oms/replenishment-tuning?warehouseCode=${encodeURIComponent(warehouseCode)}`,
+      );
+      return { warehouseCode, ...tuning };
+    } catch (err: any) {
+      return reply.code(err?.status || 502).send({
+        error: 'wms_replenishment_tuning_unavailable',
+        message: err?.message || 'WMS replenishment tuning unavailable',
+      });
+    }
+  });
+
+  app.post('/oms/warehouses/:warehouseCode/replenishment-tuning', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const warehouseCode = trim(req.params.warehouseCode).toUpperCase();
+    const link = await one(
+      `SELECT 1 FROM oms_warehouse_links WHERE user_id = $1 AND warehouse_code = $2 LIMIT 1`,
+      [userId, warehouseCode],
+    );
+    if (!link) return reply.code(404).send({ error: 'warehouse_connection_not_found' });
+    const body = (req.body || {}) as AnyRow;
+    const payload: AnyRow = { warehouseCode };
+    if (body.leadTimeDays !== undefined) payload.leadTimeDays = Number(body.leadTimeDays);
+    if (body.demandTrailingWindowDays !== undefined) {
+      payload.demandTrailingWindowDays = Number(body.demandTrailingWindowDays);
+    }
+    try {
+      const tuning = await callWmsInternal('/internal/oms/replenishment-tuning', payload);
+      return { warehouseCode, ...tuning };
+    } catch (err: any) {
+      return reply.code(err?.status || 502).send({
+        error: 'wms_replenishment_tuning_update_failed',
+        message: err?.message || 'Failed to update WMS replenishment tuning',
+      });
+    }
+  });
+
   app.post('/oms/warehouses/:warehouseCode/repair', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
