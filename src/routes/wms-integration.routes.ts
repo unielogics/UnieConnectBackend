@@ -71,7 +71,11 @@ async function verifyWmsCallback(req: any, reply: any) {
 }
 
 function normalizeInventoryRows(body: any): Array<{ sku: string; snapshot: Record<string, unknown> }> {
-  const source = body?.inventory || body?.items || body?.skus || [];
+  // The WMS wraps the snapshot rows inside `payload` (postEntitySync sends
+  // { ...envelope, payload: { inventory: rows } }), so the rows live at body.payload.inventory.
+  // Fall back to the top level for any flat/legacy callers.
+  const p = body?.payload && typeof body.payload === 'object' ? body.payload : body;
+  const source = p?.inventory || p?.items || p?.skus || body?.inventory || body?.items || body?.skus || [];
   if (Array.isArray(source)) {
     return source
       .map((row) => ({
