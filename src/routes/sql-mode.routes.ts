@@ -3423,6 +3423,66 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     };
   });
 
+  // ---- Per-product replenishment profile (P3, client-facing on the SKU page) --------------
+  // The settings live canonically in the WMS on each warehouse's Item.replenishmentProfile.
+  // GET reads from the user's primary connected warehouse; POST writes the SAME value to the
+  // SKU in EVERY connected warehouse (one value per product). Proxied to the WMS internal API.
+  app.get('/skus/:skuId/replenishment-profile', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const item = await one(
+      `SELECT id, sku FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1`,
+      [userId, req.params.skuId],
+    );
+    if (!item) return reply.code(404).send({ error: 'SKU not found' });
+    const ctx = await connectedWarehousePricingContext(userId);
+    if (!ctx?.warehouseCode) return reply.code(404).send({ error: 'no_connected_warehouse' });
+    try {
+      const profile = await getWmsInternal(
+        `/internal/oms/item-replenishment-profile?warehouseCode=${encodeURIComponent(ctx.warehouseCode)}&sku=${encodeURIComponent(item.sku)}`,
+      );
+      return { skuId: item.id, sku: item.sku, ...profile };
+    } catch (err: any) {
+      return reply.code(err?.status || 502).send({
+        error: 'wms_item_replenishment_profile_unavailable',
+        message: err?.message || 'WMS replenishment profile unavailable',
+      });
+    }
+  });
+
+  app.post('/skus/:skuId/replenishment-profile', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const item = await one(
+      `SELECT id, sku FROM catalog_items WHERE user_id = $1 AND (id = $2 OR sku = $2) LIMIT 1`,
+      [userId, req.params.skuId],
+    );
+    if (!item) return reply.code(404).send({ error: 'SKU not found' });
+    const links = await rows(
+      `SELECT warehouse_code FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected' AND warehouse_code IS NOT NULL`,
+      [userId],
+    );
+    const warehouseCodes = Array.from(
+      new Set(links.map((l: any) => String(l.warehouse_code || '').trim().toUpperCase()).filter(Boolean)),
+    );
+    if (warehouseCodes.length === 0) return reply.code(404).send({ error: 'no_connected_warehouse' });
+    const b = (req.body || {}) as AnyRow;
+    const payload: AnyRow = { sku: item.sku, warehouseCodes };
+    // Pass through only the profile fields (undefined ones are omitted by the WMS).
+    for (const f of ['enabled', 'preferredHandlingUnit', 'minPickFaceEaches', 'maxPickFaceEaches', 'velocityThresholdPerDay', 'approvalRequired', 'leadTimeDays', 'demandTrailingWindowDays', 'safetyBufferDays']) {
+      if (b[f] !== undefined) payload[f] = b[f];
+    }
+    try {
+      const result = await callWmsInternal('/internal/oms/item-replenishment-profile', payload);
+      return { skuId: item.id, sku: item.sku, ...result };
+    } catch (err: any) {
+      return reply.code(err?.status || 502).send({
+        error: 'wms_item_replenishment_profile_update_failed',
+        message: err?.message || 'Failed to update WMS replenishment profile',
+      });
+    }
+  });
+
   app.post('/skus/:skuId/fulfillment-economics/refresh', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
