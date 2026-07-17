@@ -898,6 +898,31 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
   const cube = (number(dim.length) * number(dim.width) * number(dim.height)) / 1728;
   const weight = number(item.weight);
   const risk = velocity === 0 ? 'needs_sales_data' : daysOfCover < 14 ? 'high' : daysOfCover < 30 ? 'medium' : 'low';
+
+  // ---- Reorder-needed (external supply loop) ------------------------------------------------
+  // Only for products where the client enabled auto-replenishment on the SKU page (cached into
+  // metadata.replenishment by the profile POST). "velocity" here is a 30-DAY total, so per-day
+  // = velocity/30. Flag when projected days-of-cover falls within the supplier lead time + a
+  // safety buffer, i.e. the seller should place a supplier reorder now. This is a SUGGESTION,
+  // isolated from the internal warehouse forward-pick loop (different lead time entirely).
+  const REORDER_DEFAULT_LEAD_DAYS = 7;
+  const REORDER_SAFETY_BUFFER_DAYS = 3;
+  const REORDER_COVER_TARGET_DAYS = 30; // reorder up to ~30 days of cover
+  const repl = json(metadata.replenishment, {});
+  const reorderEnabled = repl?.enabled === true;
+  const perDay = velocity / 30;
+  const supplierLeadTimeDays = Number.isFinite(Number(repl?.supplierLeadTimeDays)) && Number(repl?.supplierLeadTimeDays) > 0
+    ? Number(repl.supplierLeadTimeDays)
+    : REORDER_DEFAULT_LEAD_DAYS;
+  const reorderThresholdDays = supplierLeadTimeDays + REORDER_SAFETY_BUFFER_DAYS;
+  const reorderNeeded = reorderEnabled && perDay > 0 && daysOfCover <= reorderThresholdDays;
+  const suggestedReorderQty = reorderNeeded
+    ? Math.max(0, Math.ceil(perDay * (supplierLeadTimeDays + REORDER_COVER_TARGET_DAYS)) - available)
+    : 0;
+  const reorderReason = reorderNeeded
+    ? `~${daysOfCover}d of cover vs ${supplierLeadTimeDays}d supplier lead time — reorder ~${suggestedReorderQty} units`
+    : '';
+
   const asin = String(item.asin || '').trim();
   const keepaEnrichmentState =
     metadata.keepaEnrichmentState ||
@@ -919,6 +944,10 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     velocity30d: velocity,
     daysOfCover,
     risk,
+    reorderNeeded,
+    reorderReason,
+    suggestedReorderQty,
+    supplierLeadTimeDays: reorderEnabled ? supplierLeadTimeDays : null,
     currentWarehouseCount: facilitiesCount,
     proposedWarehouseCount: velocity > 0 ? Math.max(1, facilitiesCount) : facilitiesCount,
     proposedUnits,
@@ -1016,18 +1045,22 @@ function skuHistoryTimeline(item: Row, shipmentPlans: Row[], asns: Row[], activi
 export async function getCommandCenter(userId: string, range: RangeKey) {
   const start = rangeStart(range);
   const prevStart = previousRangeStart(range, start);
-  const [current, previous, units, previousUnits, counts, items] = await Promise.all([
+  const [current, previous, units, previousUnits, counts, items, plan] = await Promise.all([
     orderSummary(userId, start),
     orderSummary(userId, prevStart, start),
     getUnitsSold(userId, start),
     getUnitsSold(userId, prevStart, start),
     baseCounts(userId),
     getItems(userId),
+    getInventoryPlan(userId).catch(() => ({ skus: [] as any[] })),
   ]);
   const aov = current.orders > 0 ? money(current.revenue / current.orders) : 0;
   const grossProfit = money(current.revenue * 0.36);
   const lowStock = items.filter((i) => number(itemInventory(i).available) <= 10).length;
   const unmapped = items.filter((i) => !i.supplier_id).length;
+  // Reorder-needed rollup (external supply loop): count SKUs the client enabled auto-replenish
+  // on that are projected to stock out within their supplier lead time (computed in mapSkuPlan).
+  const reorderCount = ((plan as any)?.skus || []).filter((s: any) => s?.reorderNeeded === true).length;
 
   return {
     range,
@@ -1049,6 +1082,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
       unitsDeltaPct: pctDelta(units, previousUnits),
     },
     warnings: [
+      ...(reorderCount ? [{ severity: 'high', title: 'Reorder needed', detail: `${reorderCount} product${reorderCount === 1 ? '' : 's'} will stock out within supplier lead time — review reorder suggestions.` }] : []),
       ...(lowStock ? [{ severity: 'high', title: 'Inventory risk', detail: `${lowStock} SKUs are at or below 10 available units.` }] : []),
       ...(unmapped ? [{ severity: 'medium', title: 'Supplier mapping gap', detail: `${unmapped} SKUs are missing supplier assignment for shipment planning.` }] : []),
       ...(counts.channels === 0 ? [{ severity: 'high', title: 'No marketplace connection', detail: 'Connect Amazon, Shopify, or eBay to keep OMS forecasts live.' }] : []),
@@ -2545,7 +2579,7 @@ export async function getWarehouseDetail(userId: string, warehouseCode: string) 
   if (!link) return null;
   const [inventoryRows, orders, asns, shipmentPlans, events, ledger] = await Promise.all([
     rows(
-      `SELECT id, sku, title, weight, dimensions, wms_inventory, updated_at
+      `SELECT id, sku, title, image, weight, dimensions, wms_inventory, metadata, updated_at
        FROM catalog_items
        WHERE user_id = $1 AND wms_inventory ? $2
        ORDER BY updated_at DESC LIMIT 500`,
@@ -2593,17 +2627,28 @@ export async function getWarehouseDetail(userId: string, warehouseCode: string) 
   ]);
   const inventory = inventoryRows.map((item) => {
     const snap = snapshotForWarehouse(item, String(link.warehouse_code)) || {};
+    const available = number(snap.available ?? snap.onHand ?? snap.quantity);
+    // Reorder flag (external supply loop): only for SKUs the client enabled auto-replenishment
+    // on. This per-warehouse view lacks the network sales velocity, so we use a conservative
+    // low-stock signal against the item's cached reorder intent; the SKUs table + dashboard
+    // carry the full velocity-aware truth.
+    const repl = json(json(item.metadata, {}).replenishment, {});
+    const reorderEnabled = repl?.enabled === true;
+    const REORDER_WH_LOW_UNITS = 10;
+    const reorderNeeded = reorderEnabled && available <= REORDER_WH_LOW_UNITS;
     return {
       id: item.id,
       sku: item.sku,
       title: item.title,
-      available: number(snap.available ?? snap.onHand ?? snap.quantity),
+      image: item.image || null,
+      available,
       inbound: number(snap.inbound),
       received: number(snap.received),
       orders: number(snap.orders ?? snap.allocated),
       shippedToday: number(snap.shippedToday ?? snap.shipped_today),
       openAsnsCount: number(snap.openAsnsCount ?? snap.open_asns_count),
       receiving: number(snap.receiving),
+      reorderNeeded,
       updatedAt: snap.updatedAt || iso(item.updated_at),
     };
   });

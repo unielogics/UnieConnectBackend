@@ -911,6 +911,29 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
       sourceSummary: readiness,
     }));
   }
+
+  // Reorder-needed (external supply loop): actionable per-SKU alert for products the client
+  // has auto-replenishment enabled on, projected to stock out within their supplier lead time.
+  // Surfaces in the Cortex task inbox via refreshCortexTasks. Suggestion only (no auto-PO).
+  const reorderSkus = (inventory.skus || []).filter((sku: any) => sku.reorderNeeded === true).slice(0, 10);
+  for (const sku of reorderSkus) {
+    recommendations.push(await createRecommendation(userId, {
+      runId: run?.id || null,
+      recommendationType: 'reorder_needed',
+      entityType: 'sku',
+      entityId: sku.id || sku.sku,
+      title: `${sku.sku}: reorder from supplier`,
+      summary: sku.reorderReason || 'Projected to stock out within supplier lead time — place a reorder.',
+      currentValue: { daysOfCover: sku.daysOfCover, available: sku.available, velocity30d: sku.velocity30d },
+      optimizedValue: { suggestedReorderQty: sku.suggestedReorderQty, supplierLeadTimeDays: sku.supplierLeadTimeDays },
+      requiredAction: 'place_reorder',
+      approvalState: 'draft',
+      wmsTruthState: readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only',
+      confidence: stored?.confidence,
+      sourceSummary: readiness,
+    }));
+  }
+
   if (readiness.blockers.length) {
     recommendations.push(await createRecommendation(userId, {
       runId: run?.id || null,

@@ -3475,6 +3475,26 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     }
     try {
       const result = await callWmsInternal('/internal/oms/item-replenishment-profile', payload);
+      // Cache the client's reorder intent onto the catalog item so the SKU list path
+      // (mapSkuPlan) can flag reorderNeeded without a per-SKU WMS round-trip. Only the
+      // client-owned fields; the WMS remains the source of truth for the profile itself.
+      try {
+        const cache: AnyRow = { updatedAt: new Date().toISOString() };
+        if (b.enabled !== undefined) cache.enabled = Boolean(b.enabled);
+        if (b.supplierLeadTimeDays !== undefined && b.supplierLeadTimeDays !== null && b.supplierLeadTimeDays !== '') {
+          cache.supplierLeadTimeDays = Number(b.supplierLeadTimeDays);
+        }
+        await pgQuery(
+          `UPDATE catalog_items
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{replenishment}', $3::jsonb, true),
+                 updated_at = now()
+           WHERE user_id = $1 AND id = $2`,
+          [userId, item.id, JSON.stringify(cache)],
+        );
+      } catch (cacheErr: any) {
+        // Best-effort cache; the WMS write already succeeded. Log and continue.
+        req.log?.warn?.({ err: cacheErr?.message }, 'replenishment intent cache write failed');
+      }
       return { skuId: item.id, sku: item.sku, ...result };
     } catch (err: any) {
       return reply.code(err?.status || 502).send({
