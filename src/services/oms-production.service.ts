@@ -1277,7 +1277,9 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
 
 export async function getInventoryPlan(userId: string, horizon = '6m', filter: MarketplaceFilter = {}) {
   const velocityValues: unknown[] = [userId, rangeStart('30d')];
-  const velocityClauses = ['ol.user_id = $1', 'COALESCE(o.placed_at, o.created_at) >= $2'];
+  // P0a: exclude cancelled orders so display velocity matches the push-demand definition
+  // (SUM(quantity excl cancelled) / windowDays). Both paths now agree on the 30-day base.
+  const velocityClauses = ['ol.user_id = $1', "COALESCE(o.placed_at, o.created_at) >= $2", "o.status <> 'cancelled'"];
   if (filter.channelAccountId) {
     velocityValues.push(filter.channelAccountId);
     velocityClauses.push(`o.channel_connection_id = $${velocityValues.length}`);

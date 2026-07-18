@@ -7,6 +7,7 @@ const DBG = path.join(process.cwd(), '..', '..', '.cursor', 'debug.log');
 const dbg = (o: object) => { try { fs.appendFileSync(DBG, JSON.stringify({ ...o, ts: Date.now() }) + '\n'); } catch {} };
 import jwt from 'jsonwebtoken';
 import { registerRoutes } from './routes';
+import { startDemandPushScheduler } from './services/demand-push.scheduler';
 import { authRoutes } from './routes/auth.routes';
 import { config } from './config/env';
 
@@ -90,6 +91,7 @@ async function start() {
   }, { prefix: '/api/v1' });
   await app.listen({ port: config.port, host: '0.0.0.0' });
   app.log.info(`UnieConnect listening on ${config.port}`);
+  try { startDemandPushScheduler(); } catch (e) { app.log.error(e, 'demand-push scheduler failed to start'); }
 }
 
 start().catch((err) => {
