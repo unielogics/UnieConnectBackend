@@ -2,9 +2,57 @@ import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
 import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent, getBillingCategoryTotals, getStorageBillingSignal } from './oms-production.service';
+import { lookupProductByIdentifier, type KeepaLookupResult } from './keepa-lookup.service';
 
 import { createHmac, timingSafeEqual } from "crypto";
 type Row = Record<string, any>;
+
+/**
+ * Resolve a product-research input to a Keepa+Cortex intelligence bundle. Picks the best
+ * identifier (asin > upc > ean, else the catalog item's), looks it up (cached), returns null
+ * when no identifier is available or nothing is found. Best-effort — never throws.
+ */
+async function researchKeepaForInput(userId: string, input: any, item: Row | null): Promise<KeepaLookupResult | null> {
+  const identifier = String(
+    input?.asin || input?.upc || input?.ean || input?.identifier ||
+    item?.asin || item?.upc || item?.ean || '',
+  ).trim();
+  if (!identifier) return null;
+  const type: 'asin' | 'upc' | 'ean' | undefined =
+    input?.asin || item?.asin ? 'asin' : input?.upc || item?.upc ? 'upc' : input?.ean || item?.ean ? 'ean' : undefined;
+  try {
+    const opts: { type?: 'asin' | 'upc' | 'ean'; tenantId?: string } = { tenantId: userId };
+    if (type) opts.type = type;
+    const r = await lookupProductByIdentifier(identifier, opts);
+    return r?.found ? r : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Merge Cortex/Keepa intelligence into a product-research result so the UI can render it. */
+function attachKeepaIntelligence(result: any, keepa: KeepaLookupResult | null): void {
+  if (!result || !keepa || !keepa.found) return;
+  result.keepa = {
+    source: keepa.source,
+    asin: keepa.asin,
+    title: keepa.title,
+    brand: keepa.brand,
+    image: keepa.image,
+    category: keepa.category,
+    salesRank: keepa.salesRank,
+    buyBoxPrice: keepa.buyBoxPrice,
+    rating: keepa.rating,
+    reviewCount: keepa.reviewCount,
+    verdict: keepa.verdict || null,
+    opportunity: keepa.opportunity || null,
+    charts: keepa.charts || null,
+  };
+  // Surface the Cortex sellability verdict as a headline signal on the result.
+  const v = keepa.verdict || {};
+  if (v.final_verdict) result.keepaVerdict = v.final_verdict; // favorable | neutral | cautious
+  if (v.recommended_to_sell_label) result.keepaRecommendedToSell = v.recommended_to_sell_label;
+}
 
 const money = (value: unknown) => {
   const n = typeof value === 'string' ? Number.parseFloat(value) : Number(value || 0);
@@ -400,15 +448,14 @@ export async function createProductResearchRun(userId: string, input: any) {
       )
     : null;
   const run = await createRun(userId, 'product_research', normalizedInput, readiness);
-  const cortex = await postCortex('/v1/assessment/product-research/runs', {
-    userId,
-    tenant_id: userId,
-    source_priority: readiness.sourcePriority,
-    readiness,
-    item: item || normalizedInput,
-  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+  // Real research: resolve the identifier against Keepa (cached) + Cortex intelligence, and
+  // merge the verdict/opportunity/charts into the stored result. The dead
+  // /v1/assessment/product-research/* endpoints never existed → this replaces the 404 path.
+  const keepa = await researchKeepaForInput(userId, normalizedInput, item);
+  const cortex = { ok: !!keepa?.found, status: keepa?.found ? 200 : 503, data: keepa || {} };
 
   const { result, confidence } = productResearchResult(normalizedInput, item, readiness, cortex);
+  attachKeepaIntelligence(result, keepa);
   const status = result.missingData.length ? 'needs_data' : 'completed';
   const saved = await one(
     `INSERT INTO oms_product_research_results
@@ -496,20 +543,19 @@ export async function createBulkProductResearchRun(userId: string, body: any) {
   const readiness = await getDataReadiness(userId);
   const inputRows = Array.isArray(body?.rows) ? body.rows.slice(0, 500).map(normalizeProductInput) : [];
   const run = await createRun(userId, 'product_research_bulk', { rows: inputRows, filename: body?.filename }, readiness);
-  const cortex = await postCortex('/v1/assessment/product-research/bulk', {
-    userId,
-    tenant_id: userId,
-    source_priority: readiness.sourcePriority,
-    readiness,
-    rows: inputRows,
-  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
 
   const results = [];
+  let keepaHits = 0;
   for (const input of inputRows) {
     const item = input?.sku
       ? await one('SELECT * FROM catalog_items WHERE user_id = $1 AND sku = $2 LIMIT 1', [userId, String(input.sku)])
       : null;
+    // Per-row Keepa+Cortex research (cached → repeated identifiers are cheap).
+    const keepa = await researchKeepaForInput(userId, input, item);
+    if (keepa?.found) keepaHits += 1;
+    const cortex = { ok: !!keepa?.found, status: keepa?.found ? 200 : 503, data: keepa || {} };
     const { result, confidence } = productResearchResult({ ...input, source: 'csv_bulk_product_research' }, item, readiness, cortex);
+    attachKeepaIntelligence(result, keepa);
     const saved = await one(
       `INSERT INTO oms_product_research_results
         (user_id, run_id, item_id, sku, status, input, result, confidence, source_summary)
@@ -552,11 +598,11 @@ export async function createBulkProductResearchRun(userId: string, body: any) {
     status,
     output: { rowCount: inputRows.length, resultCount: results.length },
     confidence: readiness.score / 100,
-    cortexStatus: cortex.ok ? 'ok' : 'degraded',
-    cortexResponse: cortex.data,
+    cortexStatus: keepaHits > 0 ? 'ok' : 'degraded',
+    cortexResponse: { keepaHits, rows: inputRows.length },
     error: inputRows.length ? null : 'No rows supplied',
   });
-  return { runId: run?.id, status, results, rowCount: inputRows.length, cortex: { ok: cortex.ok, status: cortex.status } };
+  return { runId: run?.id, status, results, rowCount: inputRows.length, cortex: { ok: keepaHits > 0, keepaHits } };
 }
 
 async function createRecommendation(userId: string, params: {

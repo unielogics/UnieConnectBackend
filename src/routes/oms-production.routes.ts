@@ -34,6 +34,7 @@ import {
 } from '../services/oms-production.service';
 import { ensureBillingPlanRecommendations } from '../services/oms-intelligence.service';
 import { getKeepaSnapshot, peekKeepaSnapshot } from '../services/keepa';
+import { lookupProductByIdentifier } from '../services/keepa-lookup.service';
 
 function requireUser(req: any, reply: any): string | null {
   const userId = req.user?.userId;
@@ -316,6 +317,25 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
       return { asin, snapshot: snap };
     } catch (err: any) {
       return reply.code(502).send({ error: err?.message || 'Keepa refresh failed' });
+    }
+  });
+
+  // Single-identifier lookup (ASIN / UPC / EAN) for the new-product prefill flow + research.
+  // Resolves via the cached Keepa client and enriches with Cortex intelligence when an ASIN
+  // resolves. Returns { found, ...prefill fields, verdict, opportunity, charts }.
+  fastify.post('/oms/keepa/lookup', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const identifier = String(req.body?.identifier || '').trim();
+    const type = req.body?.type as 'asin' | 'upc' | 'ean' | undefined;
+    if (!identifier) return reply.code(400).send({ error: 'identifier required' });
+    try {
+      const lookupOpts: { type?: 'asin' | 'upc' | 'ean'; tenantId?: string } = { tenantId: userId };
+      if (type) lookupOpts.type = type;
+      const result = await lookupProductByIdentifier(identifier, lookupOpts);
+      return result;
+    } catch (err: any) {
+      return reply.code(502).send({ error: err?.message || 'Keepa lookup failed' });
     }
   });
 
