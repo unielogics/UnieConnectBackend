@@ -320,9 +320,12 @@ export async function authRoutes(fastify: FastifyInstance) {
     const resolvedPhone = phone ? String(phone).trim() : trim(inviteProfile.phone);
     const resolvedLlcName = trim(inviteProfile.llcName || inviteProfile.companyName);
     const resolvedBillingAddress = inviteProfile.billingAddress || null;
+    const _isWhInvite = invite.metadata?.source === 'wms_intermediary_invite';
+    const _origin = _isWhInvite ? 'warehouse_invited' : 'direct';
+    const _owningWh = _isWhInvite ? (trim(invite.metadata?.warehouseCode) || null) : null;
     await pgQuery(
-      `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone, llc_name, billing_address)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+      `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone, llc_name, billing_address, origin, owning_warehouse_code)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)`,
       [
         userId,
         normalizedEmail,
@@ -333,6 +336,8 @@ export async function authRoutes(fastify: FastifyInstance) {
         resolvedPhone || null,
         resolvedLlcName || null,
         resolvedBillingAddress ? JSON.stringify(resolvedBillingAddress) : null,
+        _origin,
+        _owningWh,
       ],
     );
     await pgQuery(
