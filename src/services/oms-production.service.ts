@@ -3232,25 +3232,59 @@ export async function getLabelAuditRun(userId: string, runId: string) {
 }
 
 export async function getBillingProfit(userId: string) {
-  const counts = await baseCounts(userId);
   const revenue = (await orderSummary(userId, rangeStart('30d'))).revenue;
-  const invoiceRows = await rows<{ amount: string }>('SELECT COALESCE(SUM(amount), 0)::text AS amount FROM invoice_lines WHERE user_id = $1', [userId]);
-  const invoices = number(invoiceRows[0]?.amount);
-  const current = {
-    freight: money(counts.orders * 1.1 + invoices * 0.18),
-    storage: money(counts.items * 2.2),
-    handling: money(counts.shipmentPlans * 24),
-    accessorials: money(counts.shipmentPlans * 9),
-    refundsCaptured: money(0),
-  };
+  const counts = await baseCounts(userId);
+
+  // REAL warehouse charges from the WMS invoices already synced into invoice_lines (each row
+  // carries payload.category + payload.warehouseCode from upsertWmsInvoice). Aggregate by
+  // category and by warehouse. This replaces the previous fabricated row-count×constant model.
+  const catRows = await rows<{ category: string; total: string }>(
+    `SELECT COALESCE(payload->>'category','accessorials') AS category, COALESCE(SUM(amount),0)::text AS total
+     FROM invoice_lines WHERE user_id = $1 GROUP BY 1`,
+    [userId],
+  );
+  const whRows = await rows<{ code: string; total: string }>(
+    `SELECT COALESCE(payload->>'warehouseCode','') AS code, COALESCE(SUM(amount),0)::text AS total
+     FROM invoice_lines WHERE user_id = $1 GROUP BY 1`,
+    [userId],
+  );
+  const hasRealInvoices = catRows.some((r) => number(r.total) > 0);
+
+  const current: { freight: number; storage: number; handling: number; accessorials: number; refundsCaptured: number; materials: number } =
+    { freight: 0, storage: 0, handling: 0, accessorials: 0, refundsCaptured: 0, materials: 0 };
+  if (hasRealInvoices) {
+    for (const r of catRows) {
+      const key = (['freight', 'storage', 'handling', 'accessorials', 'materials'].includes(r.category) ? r.category : 'accessorials') as keyof typeof current;
+      current[key] = money(current[key] + number(r.total));
+    }
+  } else {
+    // Fallback (no WMS invoices synced yet): keep a lightweight estimate so the screen isn't
+    // empty, clearly derived from counts — not fabricated warehouse truth.
+    current.freight = money(counts.orders * 1.1);
+    current.storage = money(counts.items * 2.2);
+    current.handling = money(counts.shipmentPlans * 24);
+    current.accessorials = money(counts.shipmentPlans * 9);
+  }
+
+  // Optimized stays a Cortex-style advisory projection, now based off the REAL current cost.
   const optimized = {
     freight: money(current.freight * 0.84),
     storage: money(current.storage * 0.9),
     handling: money(current.handling * 0.88),
     accessorials: money(current.accessorials * 0.76),
     refundsCaptured: money(current.refundsCaptured * 2.8),
+    materials: money(current.materials * 0.95),
   };
-  return { revenue, current, optimized };
+
+  const perWarehouse = whRows
+    .filter((r) => r.code && number(r.total) > 0)
+    .map((r) => {
+      const cur = money(number(r.total));
+      return { code: r.code, current: cur, optimized: money(cur * 0.87) };
+    })
+    .sort((a, b) => b.current - a.current);
+
+  return { revenue, current, optimized, perWarehouse, source: hasRealInvoices ? 'wms_invoices' : 'estimate' };
 }
 
 export async function getLedger(userId: string) {

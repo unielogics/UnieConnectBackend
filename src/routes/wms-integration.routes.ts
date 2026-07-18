@@ -510,51 +510,102 @@ async function upsertWmsAsn(userId: string, warehouseCode: string, body: any) {
   return { upserted: inserted?.rows?.[0]?.id || null };
 }
 
+// Map a WMS invoice line CODE to the OMS Billing screen's cost bucket. OMS apply-side so the
+// WMS stays source-of-truth-neutral. Buckets match Billing.tsx CAT_META keys.
+function wmsInvoiceCategory(code: string): string {
+  switch (String(code || '').toUpperCase()) {
+    case 'STORAGE':
+      return 'storage';
+    case 'LABEL_FEE':
+      return 'freight';
+    case 'PICK_FEE':
+    case 'PACK_FEE':
+    case 'FULFILLMENT_FEE':
+    case 'ORDER_HANDLING_FEE':
+    case 'BOX_CLOSE_FEE':
+    case 'RECEIVING_FEE':
+    case 'RECEIVING_UNIT_FEE':
+    case 'UNLOAD_FEE':
+    case 'SORT_COUNT_FEE':
+    case 'RETURN_HANDLING':
+    case 'RESTOCK_FEE':
+    case 'LAB_LABELING':
+    case 'LAB_REBOXING':
+      return 'handling';
+    case 'MATERIAL':
+      return 'materials';
+    default:
+      return 'accessorials';
+  }
+}
+
 async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any) {
   const payload = bodyPayload(body);
   const metadata = wmsMetadata(body, warehouseCode);
   const externalId = String(body.entityId || payload.id || payload._id || '');
   const invoiceNumber = textValue(payload.invoiceNumber, body.externalReference, externalId);
   if (!externalId && !invoiceNumber) return { skipped: true, reason: 'missing_invoice_identity' };
-  const existing = await pgQuery(
-    `SELECT id FROM invoice_lines
-     WHERE user_id=$1
-       AND (payload->>'wmsEntityId'=$2 OR invoice_id=$3)
-     LIMIT 1`,
-    [userId, externalId, invoiceNumber],
-  );
-  const total = Number(payload?.totals?.total || payload?.total || payload?.amount || 0);
-  const invoicePayload = { ...payload, ...metadata };
-  if (existing?.rows?.[0]?.id) {
-    await pgQuery(
-      `UPDATE invoice_lines
-       SET description=$3, amount=$4, status=$5, payload=$6::jsonb, updated_at=now()
-       WHERE user_id=$1 AND id=$2`,
-      [
-        userId,
-        existing.rows[0].id,
-        `WMS invoice ${invoiceNumber || externalId}`,
-        total,
-        textValue(payload.status, body.operation) || 'open',
-        JSON.stringify(invoicePayload),
-      ],
+  const invoiceKey = invoiceNumber || externalId;
+  const status = textValue(payload.status, body.operation) || 'open';
+  const currency = textValue(payload.currency) || 'USD';
+  const lineItems = Array.isArray(payload.lineItems) ? payload.lineItems : [];
+  const periodStart = payload.periodStart || null;
+  const periodEnd = payload.periodEnd || null;
+
+  // Status-only events (approved/submitted/paid/void carry no lineItems) must NOT wipe the
+  // stored breakdown — just advance status across all rows of this invoice. Mirrors the
+  // order-upsert guard (only rewrite detail when the event actually carries it).
+  if (lineItems.length === 0) {
+    const upd = await pgQuery(
+      `UPDATE invoice_lines SET status=$4, updated_at=now()
+       WHERE user_id=$1 AND (invoice_id=$2 OR payload->>'wmsEntityId'=$3)`,
+      [userId, invoiceKey, externalId, status],
     );
-    return { upserted: existing.rows[0].id };
+    const affected = upd?.rowCount || 0;
+    if (affected > 0) return { statusUpdated: affected };
+    // No prior rows (status event arrived first) → store a single summary row as a fallback.
+    const total = Number(payload?.totals?.total || payload?.total || payload?.amount || 0);
+    const inserted = await pgQuery(
+      `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, currency, status, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING id`,
+      [userId, invoiceKey, `WMS invoice ${invoiceKey}`, total, currency, status,
+        JSON.stringify({ ...metadata, invoiceNumber, periodStart, periodEnd, warehouseCode, category: 'accessorials' })],
+    );
+    return { upserted: inserted?.rows?.[0]?.id || null };
   }
-  const inserted = await pgQuery(
-    `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, status, payload)
-     VALUES ($1,$2,$3,$4,$5,$6::jsonb)
-     RETURNING id`,
-    [
-      userId,
-      invoiceNumber || externalId,
-      `WMS invoice ${invoiceNumber || externalId}`,
-      total,
-      textValue(payload.status, body.operation) || 'open',
-      JSON.stringify(invoicePayload),
-    ],
+
+  // Full invoice (with lineItems): DELETE-then-INSERT one invoice_lines row per WMS line item,
+  // so the seller-visible data keeps the storage/handling/freight/materials category breakdown.
+  await pgQuery(
+    `DELETE FROM invoice_lines WHERE user_id=$1 AND (invoice_id=$2 OR payload->>'wmsEntityId'=$3)`,
+    [userId, invoiceKey, externalId],
   );
-  return { upserted: inserted?.rows?.[0]?.id || null };
+  let insertedCount = 0;
+  for (const li of lineItems) {
+    const code = String(li?.code || '').toUpperCase();
+    const amount = Number(li?.amount ?? (Number(li?.quantity) || 0) * (Number(li?.unitPrice) || 0)) || 0;
+    const linePayload = {
+      ...metadata,
+      code,
+      category: wmsInvoiceCategory(code),
+      invoiceNumber,
+      periodStart,
+      periodEnd,
+      warehouseCode,
+      quantity: Number(li?.quantity) || 0,
+      unitPrice: Number(li?.unitPrice) || 0,
+      wmsEntityId: externalId || undefined,
+      invoiceStatus: status,
+      invoiceTotal: Number(payload?.totals?.total ?? payload?.total ?? 0) || 0,
+    };
+    await pgQuery(
+      `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, currency, status, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [userId, invoiceKey, textValue(li?.description, code, `WMS invoice ${invoiceKey}`), amount, currency, status, JSON.stringify(linePayload)],
+    );
+    insertedCount += 1;
+  }
+  return { upserted: insertedCount, invoiceKey };
 }
 
 function normalizeSupportStatus(value: unknown): string {
