@@ -1,0 +1,92 @@
+/**
+ * Cortex/WMS → OMS facility registration.
+ *
+ * A warehouse facility created in the WMS auto-registers here as a GLOBAL
+ * network facility (user_id = NULL) so it is known network-wide (Cortex
+ * candidate + network facility count) WITHOUT attaching any client. Clients
+ * reach a facility only via the separate WH1-owned toggle + approval flow —
+ * this endpoint never creates an oms_warehouse_links / client row.
+ *
+ * Auth: X-Internal-Api-Key (the same shared secret WMS uses for
+ * /internal/wms/events, config.internalApiKey). Falls back to the cortex
+ * x-api-key for parity with cortex-ingest. Idempotent on (code) for the
+ * global (user_id IS NULL) row.
+ */
+import { FastifyInstance } from 'fastify';
+import { config } from '../config/env';
+import { pgQuery } from '../db/postgres';
+
+interface WarehouseRegisterBody {
+  warehouseCode: string;
+  warehouseId?: string;
+  name?: string;
+  networkEligible?: boolean;
+  address?: Record<string, unknown>;
+  source?: string;
+}
+
+function checkInternalAuth(req: any): boolean {
+  const internal = config.internalApiKey;
+  const cortexKey = process.env.WMS_TO_UNIECONNECT_API_KEY || (config as any).cortex?.apiKey;
+  if (!internal && !cortexKey) return true; // dev mode — no key configured
+  const provided = req.headers['x-internal-api-key'] || req.headers['x-api-key'];
+  if (typeof provided !== 'string') return false;
+  return (!!internal && provided === internal) || (!!cortexKey && provided === cortexKey);
+}
+
+export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
+  app.post('/internal/cortex/warehouse-register', async (req: any, reply) => {
+    if (!checkInternalAuth(req)) {
+      return reply.code(401).send({ error: 'invalid internal key' });
+    }
+    const body = req.body as WarehouseRegisterBody;
+    const code = (body?.warehouseCode || '').trim();
+    if (!code) {
+      return reply.code(400).send({ error: 'warehouseCode required' });
+    }
+
+    try {
+      const meta = {
+        source: body.source || 'wms_auto',
+        wmsWarehouseId: body.warehouseId || null,
+        networkEligible: body.networkEligible === true,
+        registeredAt: new Date().toISOString(),
+      };
+      // Global network facility: user_id IS NULL. The unique constraint is
+      // (user_id, code) and treats NULL as distinct, so ON CONFLICT won't
+      // dedupe here — do an explicit check-then-update/insert.
+      const existing = await pgQuery(
+        `SELECT id FROM facilities WHERE code = $1 AND user_id IS NULL LIMIT 1`,
+        [code]
+      );
+      if (existing.rows.length) {
+        const id = existing.rows[0].id;
+        await pgQuery(
+          `UPDATE facilities
+             SET name = COALESCE($2, name),
+                 address = COALESCE($3::jsonb, address),
+                 metadata = metadata || $4::jsonb,
+                 status = 'active',
+                 updated_at = now()
+           WHERE id = $1`,
+          [id, body.name || null, body.address ? JSON.stringify(body.address) : null, JSON.stringify(meta)]
+        );
+        return reply.code(200).send({ ok: true, facilityId: id, status: 'updated' });
+      }
+      const inserted = await pgQuery(
+        `INSERT INTO facilities (user_id, code, name, facility_type, status, address, metadata)
+         VALUES (NULL, $1, $2, 'warehouse', 'active', $3::jsonb, $4::jsonb)
+         RETURNING id`,
+        [code, body.name || code, JSON.stringify(body.address || {}), JSON.stringify(meta)]
+      );
+      return reply.code(200).send({ ok: true, facilityId: inserted.rows[0]?.id, status: 'created' });
+    } catch (err: any) {
+      req.log?.error({ err }, '[cortex-warehouse-register] failed');
+      return reply.code(500).send({ error: err?.message || 'register failed' });
+    }
+  });
+
+  app.get('/internal/cortex/warehouse-register/health', async (_req, reply) => {
+    return reply.code(200).send({ ok: true, route: 'cortex-warehouse-register' });
+  });
+}
