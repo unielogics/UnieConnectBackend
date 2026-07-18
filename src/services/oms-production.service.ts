@@ -11,7 +11,7 @@ import { publicEntityId } from '../lib/public-id';
 import { LabelAuditFinding, LabelAuditRun } from './oms-production.types';
 import { postCortex, cortexConfigStatus } from './cortex-orchestration';
 
-type RangeKey = 'today' | '7d' | '30d';
+type RangeKey = 'today' | '7d' | '30d' | '90d' | 'mtd';
 type Row = Record<string, any>;
 type MarketplaceFilter = {
   channel?: string;
@@ -534,13 +534,29 @@ function rangeStart(range: RangeKey): Date {
     d.setHours(0, 0, 0, 0);
     return d;
   }
-  d.setDate(d.getDate() - (range === '7d' ? 7 : 30));
+  if (range === 'mtd') {
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  const days = range === '7d' ? 7 : range === '90d' ? 90 : 30;
+  d.setDate(d.getDate() - days);
   return d;
 }
 
 function previousRangeStart(range: RangeKey, currentStart: Date): Date {
   const d = new Date(currentStart);
-  d.setDate(d.getDate() - (range === 'today' ? 1 : range === '7d' ? 7 : 30));
+  if (range === 'today') {
+    d.setDate(d.getDate() - 1);
+    return d;
+  }
+  if (range === 'mtd') {
+    // Same-length window immediately preceding the start of this month.
+    d.setMonth(d.getMonth() - 1);
+    return d;
+  }
+  const days = range === '7d' ? 7 : range === '90d' ? 90 : 30;
+  d.setDate(d.getDate() - days);
   return d;
 }
 
@@ -3231,42 +3247,110 @@ export async function getLabelAuditRun(userId: string, runId: string) {
   };
 }
 
-export async function getBillingProfit(userId: string) {
-  const revenue = (await orderSummary(userId, rangeStart('30d'))).revenue;
+type BillingCategoryTotals = {
+  freight: number;
+  storage: number;
+  handling: number;
+  accessorials: number;
+  refundsCaptured: number;
+  materials: number;
+};
+const BILLING_CATEGORY_KEYS = ['freight', 'storage', 'handling', 'accessorials', 'materials'];
+const emptyBillingCategoryTotals = (): BillingCategoryTotals => ({
+  freight: 0,
+  storage: 0,
+  handling: 0,
+  accessorials: 0,
+  refundsCaptured: 0,
+  materials: 0,
+});
+// The true billed-activity day (WMS invoice period), falling back to OMS ingest time for rows
+// that predate periodStart being carried through, or for the estimate/status-only fallback rows.
+const BILLING_ACTIVITY_AT = `COALESCE((payload->>'periodStart')::timestamptz, created_at)`;
+
+export async function getBillingProfit(
+  userId: string,
+  opts: { range?: RangeKey; from?: string; to?: string } = {},
+) {
+  const range: RangeKey = opts.range || '30d';
+  const customFrom = opts.from ? new Date(opts.from) : null;
+  const customTo = opts.to ? new Date(opts.to) : null;
+  const hasCustomFrom = !!(customFrom && !Number.isNaN(customFrom.getTime()));
+  const hasCustomTo = !!(customTo && !Number.isNaN(customTo.getTime()));
+
+  const start = hasCustomFrom ? (customFrom as Date) : rangeStart(range);
+  const end = hasCustomTo ? (customTo as Date) : undefined;
+  const spanMs = (end ? end.getTime() : Date.now()) - start.getTime();
+  const prevStart = hasCustomFrom ? new Date(start.getTime() - Math.max(spanMs, 0)) : previousRangeStart(range, start);
+  const prevEnd = start;
+
+  const revenue = (await orderSummary(userId, start, end)).revenue;
   const counts = await baseCounts(userId);
 
   // REAL warehouse charges from the WMS invoices already synced into invoice_lines (each row
   // carries payload.category + payload.warehouseCode from upsertWmsInvoice). Aggregate by
-  // category and by warehouse. This replaces the previous fabricated row-count×constant model.
-  const catRows = await rows<{ category: string; total: string }>(
-    `SELECT COALESCE(payload->>'category','accessorials') AS category, COALESCE(SUM(amount),0)::text AS total
-     FROM invoice_lines WHERE user_id = $1 GROUP BY 1`,
-    [userId],
-  );
-  const whRows = await rows<{ code: string; total: string }>(
-    `SELECT COALESCE(payload->>'warehouseCode','') AS code, COALESCE(SUM(amount),0)::text AS total
-     FROM invoice_lines WHERE user_id = $1 GROUP BY 1`,
-    [userId],
-  );
+  // category and by warehouse, windowed to the requested date range. This replaces the previous
+  // all-time, fabricated row-count×constant model.
+  const catRowsFor = (windowStart: Date, windowEnd?: Date) =>
+    rows<{ category: string; total: string }>(
+      `SELECT COALESCE(payload->>'category','accessorials') AS category, COALESCE(SUM(amount),0)::text AS total
+       FROM invoice_lines
+       WHERE user_id = $1 AND ${BILLING_ACTIVITY_AT} >= $2 AND ($3::timestamptz IS NULL OR ${BILLING_ACTIVITY_AT} < $3)
+       GROUP BY 1`,
+      [userId, windowStart, windowEnd || null],
+    );
+  const whRowsFor = (windowStart: Date, windowEnd?: Date) =>
+    rows<{ code: string; total: string }>(
+      `SELECT COALESCE(payload->>'warehouseCode','') AS code, COALESCE(SUM(amount),0)::text AS total
+       FROM invoice_lines
+       WHERE user_id = $1 AND ${BILLING_ACTIVITY_AT} >= $2 AND ($3::timestamptz IS NULL OR ${BILLING_ACTIVITY_AT} < $3)
+       GROUP BY 1`,
+      [userId, windowStart, windowEnd || null],
+    );
+  const seriesRowsFor = (windowStart: Date, windowEnd?: Date) =>
+    rows<{ day: string; category: string; total: string; line_count: string }>(
+      `SELECT to_char(date_trunc('day', ${BILLING_ACTIVITY_AT}), 'YYYY-MM-DD') AS day,
+              COALESCE(payload->>'category','accessorials') AS category,
+              COALESCE(SUM(amount),0)::text AS total,
+              COUNT(*)::text AS line_count
+       FROM invoice_lines
+       WHERE user_id = $1 AND ${BILLING_ACTIVITY_AT} >= $2 AND ($3::timestamptz IS NULL OR ${BILLING_ACTIVITY_AT} < $3)
+       GROUP BY 1, 2
+       ORDER BY 1`,
+      [userId, windowStart, windowEnd || null],
+    );
+
+  const [catRows, whRows, seriesRows, prevCatRows] = await Promise.all([
+    catRowsFor(start, end),
+    whRowsFor(start, end),
+    seriesRowsFor(start, end),
+    catRowsFor(prevStart, prevEnd),
+  ]);
   const hasRealInvoices = catRows.some((r) => number(r.total) > 0);
 
-  const current: { freight: number; storage: number; handling: number; accessorials: number; refundsCaptured: number; materials: number } =
-    { freight: 0, storage: 0, handling: 0, accessorials: 0, refundsCaptured: 0, materials: 0 };
+  const current = emptyBillingCategoryTotals();
   if (hasRealInvoices) {
     for (const r of catRows) {
-      const key = (['freight', 'storage', 'handling', 'accessorials', 'materials'].includes(r.category) ? r.category : 'accessorials') as keyof typeof current;
+      const key = (BILLING_CATEGORY_KEYS.includes(r.category) ? r.category : 'accessorials') as keyof BillingCategoryTotals;
       current[key] = money(current[key] + number(r.total));
     }
   } else {
-    // Fallback (no WMS invoices synced yet): keep a lightweight estimate so the screen isn't
-    // empty, clearly derived from counts — not fabricated warehouse truth.
+    // Fallback (no WMS invoices synced yet in this window): keep a lightweight estimate so the
+    // screen isn't empty, clearly derived from all-time counts — not fabricated warehouse truth,
+    // and not date-scoped since it isn't derived from real dated activity.
     current.freight = money(counts.orders * 1.1);
     current.storage = money(counts.items * 2.2);
     current.handling = money(counts.shipmentPlans * 24);
     current.accessorials = money(counts.shipmentPlans * 9);
   }
 
-  // Optimized stays a Cortex-style advisory projection, now based off the REAL current cost.
+  const previous = emptyBillingCategoryTotals();
+  for (const r of prevCatRows) {
+    const key = (BILLING_CATEGORY_KEYS.includes(r.category) ? r.category : 'accessorials') as keyof BillingCategoryTotals;
+    previous[key] = money(previous[key] + number(r.total));
+  }
+
+  // Optimized stays a Cortex-style advisory projection, now based off the REAL windowed current cost.
   const optimized = {
     freight: money(current.freight * 0.84),
     storage: money(current.storage * 0.9),
@@ -3276,6 +3360,30 @@ export async function getBillingProfit(userId: string) {
     materials: money(current.materials * 0.95),
   };
 
+  const sumTotals = (t: BillingCategoryTotals) =>
+    money(Object.entries(t).reduce((sum, [key, val]) => sum + (key === 'refundsCaptured' ? -Math.abs(val) : val), 0));
+  const currentTotal = sumTotals(current);
+  const previousTotal = sumTotals(previous);
+  const optimizedTotal = sumTotals(optimized);
+  const savings = money(currentTotal - optimizedTotal);
+
+  const deltaPct: Record<string, number> = { total: pctDelta(currentTotal, previousTotal) };
+  for (const key of [...BILLING_CATEGORY_KEYS, 'refundsCaptured'] as (keyof BillingCategoryTotals)[]) {
+    deltaPct[key] = pctDelta(current[key], previous[key]);
+  }
+
+  // Daily buckets for the trend chart — merge per-category rows into one entry per day.
+  const seriesMap = new Map<string, { date: string; total: number; lineCount: number; byCategory: Record<string, number> }>();
+  for (const r of seriesRows) {
+    if (!seriesMap.has(r.day)) seriesMap.set(r.day, { date: r.day, total: 0, lineCount: 0, byCategory: {} });
+    const bucket = seriesMap.get(r.day) as { date: string; total: number; lineCount: number; byCategory: Record<string, number> };
+    const amt = money(number(r.total));
+    bucket.total = money(bucket.total + amt);
+    bucket.lineCount += number(r.line_count);
+    bucket.byCategory[r.category] = money((bucket.byCategory[r.category] || 0) + amt);
+  }
+  const series = Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
   const perWarehouse = whRows
     .filter((r) => r.code && number(r.total) > 0)
     .map((r) => {
@@ -3284,7 +3392,347 @@ export async function getBillingProfit(userId: string) {
     })
     .sort((a, b) => b.current - a.current);
 
-  return { revenue, current, optimized, perWarehouse, source: hasRealInvoices ? 'wms_invoices' : 'estimate' };
+  return {
+    range,
+    from: start.toISOString(),
+    to: end ? end.toISOString() : null,
+    revenue,
+    current,
+    optimized,
+    previous,
+    deltaPct,
+    series,
+    perWarehouse,
+    totals: {
+      current: currentTotal,
+      optimized: optimizedTotal,
+      savings,
+      savingsPct: currentTotal ? Math.round((savings / currentTotal) * 1000) / 10 : 0,
+    },
+    source: hasRealInvoices ? 'wms_invoices' : 'estimate',
+  };
+}
+
+type BillingInvoicesOpts = {
+  range?: RangeKey;
+  from?: string;
+  to?: string;
+  category?: string;
+  warehouseCode?: string;
+  status?: string;
+  search?: string;
+  invoiceNumber?: string;
+  limit?: number;
+  offset?: number;
+};
+
+// Batch-resolve WMS source.orderId/asnId -> OMS orders/asns via the wmsEntityId stamped at
+// order/ASN ingest time (upsertWmsOrder / upsertWmsAsn). Resolved at READ time (not ingest time)
+// so an order/ASN that syncs *after* its invoice still links up on the next ledger fetch.
+async function resolveBillingInvoiceLinks(userId: string, invoiceRows: Row[]) {
+  const orderWmsIds = Array.from(
+    new Set(invoiceRows.map((r) => json(r.payload, {})?.sourceOrderId).filter(Boolean)),
+  ) as string[];
+  const asnWmsIds = Array.from(
+    new Set(invoiceRows.map((r) => json(r.payload, {})?.sourceAsnId).filter(Boolean)),
+  ) as string[];
+
+  const [orderRows, asnRows] = await Promise.all([
+    orderWmsIds.length
+      ? rows<{ id: string; order_number: string; external_order_id: string; wid: string }>(
+          `SELECT id, order_number, external_order_id, metadata->>'wmsEntityId' AS wid
+           FROM orders WHERE user_id = $1 AND metadata->>'wmsEntityId' = ANY($2::text[])`,
+          [userId, orderWmsIds],
+        )
+      : Promise.resolve([]),
+    asnWmsIds.length
+      ? rows<{ id: string; asn_number: string; wid: string }>(
+          `SELECT id, asn_number, payload->>'wmsEntityId' AS wid
+           FROM asns WHERE user_id = $1 AND payload->>'wmsEntityId' = ANY($2::text[])`,
+          [userId, asnWmsIds],
+        )
+      : Promise.resolve([]),
+  ]);
+
+  const orderByWid = new Map(
+    orderRows.map((o) => [o.wid, { omsId: o.id, number: o.order_number || o.external_order_id || o.id, publicId: publicEntityId('OR', o.id) }]),
+  );
+  const asnByWid = new Map(
+    asnRows.map((a) => [a.wid, { omsId: a.id, number: a.asn_number || a.id, publicId: publicEntityId('AS', a.id) }]),
+  );
+  return { orderByWid, asnByWid };
+}
+
+function mapBillingInvoiceRow(
+  row: Row,
+  orderByWid: Map<string, { omsId: string; number: string; publicId: string }>,
+  asnByWid: Map<string, { omsId: string; number: string; publicId: string }>,
+) {
+  const payload = json(row.payload, {}) as Row;
+  return {
+    id: row.id,
+    date: iso(payload.periodStart) || iso(row.created_at),
+    invoiceNumber: row.invoice_id,
+    warehouse: payload.warehouseCode || null,
+    category: payload.category || 'accessorials',
+    code: payload.code || null,
+    description: row.description,
+    qty: number(payload.quantity),
+    unitPrice: money(payload.unitPrice),
+    amount: money(row.amount),
+    currency: row.currency || 'USD',
+    status: row.status || 'open',
+    linkedOrder: payload.sourceOrderId ? orderByWid.get(String(payload.sourceOrderId)) || null : null,
+    linkedAsn: payload.sourceAsnId ? asnByWid.get(String(payload.sourceAsnId)) || null : null,
+  };
+}
+
+export async function getBillingInvoices(userId: string, opts: BillingInvoicesOpts = {}) {
+  const range: RangeKey = opts.range || '30d';
+  const customFrom = opts.from ? new Date(opts.from) : null;
+  const customTo = opts.to ? new Date(opts.to) : null;
+  const start = customFrom && !Number.isNaN(customFrom.getTime()) ? customFrom : rangeStart(range);
+  const end = customTo && !Number.isNaN(customTo.getTime()) ? customTo : undefined;
+  const limit = Math.min(200, Math.max(1, opts.limit || 50));
+  const offset = Math.max(0, opts.offset || 0);
+
+  const values: unknown[] = [userId, start, end || null];
+  const where = [`user_id = $1`, `${BILLING_ACTIVITY_AT} >= $2`, `($3::timestamptz IS NULL OR ${BILLING_ACTIVITY_AT} < $3)`];
+  if (opts.category) {
+    values.push(opts.category);
+    where.push(`payload->>'category' = $${values.length}`);
+  }
+  if (opts.warehouseCode) {
+    values.push(opts.warehouseCode);
+    where.push(`payload->>'warehouseCode' = $${values.length}`);
+  }
+  if (opts.status) {
+    values.push(opts.status);
+    where.push(`status = $${values.length}`);
+  }
+  if (opts.invoiceNumber) {
+    values.push(opts.invoiceNumber);
+    where.push(`invoice_id = $${values.length}`);
+  }
+  if (opts.search) {
+    values.push(`%${opts.search}%`);
+    const idx = values.length;
+    where.push(`(description ILIKE $${idx} OR invoice_id ILIKE $${idx} OR payload->>'code' ILIKE $${idx})`);
+  }
+  values.push(limit);
+  const limitIdx = values.length;
+  values.push(offset);
+  const offsetIdx = values.length;
+
+  const data = await rows<Row & { total_count: string }>(
+    `SELECT *, COUNT(*) OVER() AS total_count
+     FROM invoice_lines
+     WHERE ${where.join(' AND ')}
+     ORDER BY ${BILLING_ACTIVITY_AT} DESC, invoice_id
+     LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    values,
+  );
+
+  const { orderByWid, asnByWid } = await resolveBillingInvoiceLinks(userId, data);
+  const invoiceRows = data.map((row) => mapBillingInvoiceRow(row, orderByWid, asnByWid));
+  const total = data.length ? number(data[0]?.total_count) : 0;
+
+  return { rows: invoiceRows, total, limit, offset };
+}
+
+function drawPdfDivider(doc: PDFKit.PDFDocument) {
+  doc.moveDown(0.3);
+  doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#d0d5dd').stroke();
+  doc.moveDown(0.3);
+}
+
+function drawBillingLedgerTable(doc: PDFKit.PDFDocument, invoiceRows: ReturnType<typeof mapBillingInvoiceRow>[]) {
+  doc.fontSize(9).font('Helvetica-Bold');
+  const cols = [70, 70, 55, 70, 130, 40, 60, 55];
+  const headers = ['Date', 'Invoice #', 'Warehouse', 'Category', 'Description', 'Qty', 'Unit', 'Amount'];
+  let x = doc.page.margins.left;
+  const headerY = doc.y;
+  headers.forEach((h, i) => {
+    doc.text(h, x, headerY, { width: cols[i] || 60 });
+    x += cols[i] || 60;
+  });
+  doc.moveDown(0.5);
+  doc.font('Helvetica').fontSize(8);
+  for (const row of invoiceRows) {
+    if (doc.y > doc.page.height - doc.page.margins.bottom - 30) {
+      doc.addPage();
+    }
+    x = doc.page.margins.left;
+    const rowY = doc.y;
+    const cells = [
+      (row.date || '').slice(0, 10),
+      row.invoiceNumber || '—',
+      row.warehouse || '—',
+      row.category,
+      row.description || row.code || '—',
+      String(row.qty || ''),
+      row.unitPrice ? `$${row.unitPrice.toFixed(2)}` : '—',
+      `$${row.amount.toFixed(2)}`,
+    ];
+    cells.forEach((c, i) => {
+      doc.text(c, x, rowY, { width: cols[i] || 60 });
+      x += cols[i] || 60;
+    });
+    doc.moveDown(0.35);
+  }
+}
+
+export async function generateBillingStatementPdf(
+  userId: string,
+  opts: Omit<BillingInvoicesOpts, 'limit' | 'offset'> = {},
+) {
+  const [summary, ledger] = await Promise.all([
+    getBillingProfit(userId, opts),
+    getBillingInvoices(userId, { ...opts, limit: 2000, offset: 0 }),
+  ]);
+
+  const doc = new PDFDocument({ size: 'LETTER', margin: 40, autoFirstPage: true });
+  const chunks: Buffer[] = [];
+  doc.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+  const done = new Promise<Buffer>((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+
+  doc.fontSize(16).font('Helvetica-Bold').text('UnieConnect Billing Statement');
+  doc.fontSize(9).font('Helvetica').fillColor('#555').text(
+    `Period: ${(summary.from || '').slice(0, 10)} to ${summary.to ? summary.to.slice(0, 10) : 'now'} · Range: ${summary.range}`,
+  );
+  doc.fillColor('#000');
+  drawPdfDivider(doc);
+
+  doc.fontSize(11).font('Helvetica-Bold').text('Summary');
+  doc.fontSize(9).font('Helvetica');
+  doc.text(`Current cost: $${summary.totals.current.toFixed(2)}`);
+  doc.text(`With AI plan applied: $${summary.totals.optimized.toFixed(2)}`);
+  doc.text(`Savings: $${summary.totals.savings.toFixed(2)} (${summary.totals.savingsPct}%)`);
+  drawPdfDivider(doc);
+
+  doc.fontSize(11).font('Helvetica-Bold').text(`Invoice activity (${ledger.total} line items)`);
+  doc.moveDown(0.3);
+  drawBillingLedgerTable(doc, ledger.rows);
+
+  doc.end();
+  const buffer = await done;
+  const fromLabel = (summary.from || '').slice(0, 10);
+  const toLabel = summary.to ? summary.to.slice(0, 10) : 'present';
+  return { buffer, filename: `billing-statement-${fromLabel}_${toLabel}.pdf`, pageCount: doc.bufferedPageRange().count };
+}
+
+export async function generateInvoicePdf(userId: string, invoiceNumber: string) {
+  if (!invoiceNumber) return null;
+  const ledger = await getBillingInvoices(userId, { invoiceNumber, limit: 500 });
+  if (!ledger.rows.length) return null;
+
+  const doc = new PDFDocument({ size: 'LETTER', margin: 40, autoFirstPage: true });
+  const chunks: Buffer[] = [];
+  doc.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+  const done = new Promise<Buffer>((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+
+  const first = ledger.rows[0]!;
+  const total = ledger.rows.reduce((sum, r) => sum + r.amount, 0);
+  doc.fontSize(16).font('Helvetica-Bold').text(`Invoice ${invoiceNumber}`);
+  doc.fontSize(9).font('Helvetica').fillColor('#555').text(
+    `Warehouse: ${first.warehouse || '—'} · Status: ${first.status} · Billed for: ${(first.date || '').slice(0, 10)}`,
+  );
+  doc.fillColor('#000');
+  drawPdfDivider(doc);
+  drawBillingLedgerTable(doc, ledger.rows);
+  drawPdfDivider(doc);
+  doc.fontSize(11).font('Helvetica-Bold').text(`Total: $${total.toFixed(2)}`, { align: 'right' });
+
+  doc.end();
+  const buffer = await done;
+  return { buffer, filename: `invoice-${invoiceNumber}.pdf`, pageCount: doc.bufferedPageRange().count };
+}
+
+export async function getOmsOrder(userId: string, orderId: string) {
+  if (!orderId) return null;
+  const order = await one(
+    `SELECT o.*, c.email AS customer_email, c.name AS customer_name, mc.channel AS account_channel, mc.display_name, mc.shop_domain, mc.selling_partner_id
+     FROM orders o
+     LEFT JOIN customers c ON c.id = o.customer_id
+     LEFT JOIN marketplace_connections mc ON mc.id = o.channel_connection_id
+     WHERE o.user_id = $1 AND o.id = $2
+     LIMIT 1`,
+    [userId, orderId],
+  );
+  if (!order) return null;
+  const totals = json(order.totals, {});
+  return {
+    ...order,
+    id: order.id,
+    publicId: publicEntityId('OR', order.id),
+    displayId: publicEntityId('OR', order.id),
+    customerDisplayId: order.customer_id ? publicEntityId('CU', order.customer_id) : null,
+    customer: order.customer_name || order.customer_email || undefined,
+    ch: order.channel || order.account_channel || 'manual',
+    channelAccountId: order.channel_connection_id || null,
+    channelDisplay: order.display_name || order.shop_domain || order.selling_partner_id || order.channel || order.account_channel || 'manual',
+    total: money(totals.total || totals.subtotal || 0),
+    placedAt: iso(order.placed_at),
+    createdAt: iso(order.created_at),
+    updatedAt: iso(order.updated_at),
+  };
+}
+
+export async function getOmsAsn(userId: string, asnId: string) {
+  if (!asnId) return null;
+  const asn = await one(
+    `SELECT a.*,
+            sp.internal_shipment_id,
+            sp.shipment_title,
+            sp.status AS shipment_status,
+            sp.supplier_id,
+            sp.facility_id,
+            sp.estimated_arrival_date,
+            sp.items,
+            s.name AS supplier_name,
+            f.code AS facility_code,
+            f.name AS facility_name
+     FROM asns a
+     LEFT JOIN shipment_plans sp ON sp.id = a.shipment_plan_id AND sp.user_id = a.user_id
+     LEFT JOIN suppliers s ON s.id = sp.supplier_id AND s.user_id = a.user_id
+     LEFT JOIN facilities f ON f.id = sp.facility_id
+     WHERE a.user_id = $1 AND a.id = $2
+     LIMIT 1`,
+    [userId, asnId],
+  );
+  if (!asn) return null;
+  const items = json(asn.items, []);
+  const units = Array.isArray(items) ? items.reduce((sum, item) => sum + number(item.quantity || item.units || 0), 0) : 0;
+  return {
+    id: asn.id,
+    _id: asn.id,
+    publicId: publicEntityId('AS', asn.id),
+    displayId: publicEntityId('AS', asn.id),
+    asnNumber: asn.asn_number,
+    status: asn.status || 'created',
+    shipmentPlanId: asn.shipment_plan_id,
+    shipmentDisplayId: asn.shipment_plan_id ? publicEntityId('SH', asn.shipment_plan_id) : null,
+    shipmentTitle: asn.shipment_title || asn.internal_shipment_id || 'Inbound shipment',
+    shipmentStatus: asn.shipment_status || null,
+    supplierId: asn.supplier_id || null,
+    supplierDisplayId: asn.supplier_id ? publicEntityId('SU', asn.supplier_id) : null,
+    supplierName: asn.supplier_name || null,
+    facilityId: asn.facility_id || null,
+    facilityCode: asn.facility_code || null,
+    facilityName: asn.facility_name || null,
+    estimatedArrivalDate: iso(asn.estimated_arrival_date),
+    units,
+    items,
+    payload: json(asn.payload, {}),
+    createdAt: iso(asn.created_at),
+    updatedAt: iso(asn.updated_at),
+  };
 }
 
 export async function getLedger(userId: string) {

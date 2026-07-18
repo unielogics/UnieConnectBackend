@@ -4,6 +4,9 @@ import {
   confirmShipmentWizardDraft,
   createLabelAuditRun,
   createShipmentWizardDraft,
+  generateBillingStatementPdf,
+  generateInvoicePdf,
+  getBillingInvoices,
   getBillingProfit,
   getBusinessDouble,
   getCommandCenter,
@@ -14,8 +17,10 @@ import {
   getLabelAuditRun,
   getLabelAuditRuns,
   getLedger,
+  getOmsAsn,
   getOmsAsns,
   getOmsCustomers,
+  getOmsOrder,
   getOmsOrders,
   getOmsSkuDetail,
   getOmsSkus,
@@ -98,10 +103,26 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     return getOmsOrders(userId, marketplaceFilter(req.query));
   });
 
+  fastify.get('/oms/orders/:orderId', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const order = await getOmsOrder(userId, String(req.params?.orderId || ''));
+    if (!order) return reply.code(404).send({ error: 'Order not found' });
+    return { order };
+  });
+
   fastify.get('/oms/asns', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getOmsAsns(userId);
+  });
+
+  fastify.get('/oms/asns/:asnId', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const asn = await getOmsAsn(userId, String(req.params?.asnId || ''));
+    if (!asn) return reply.code(404).send({ error: 'ASN not found' });
+    return { asn };
   });
 
   fastify.get('/oms/customers', async (req: any, reply) => {
@@ -203,10 +224,62 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     return detail;
   });
 
+  const BILLING_RANGES = new Set(['today', '7d', '30d', '90d', 'mtd']);
+  const billingRangeParams = (query: any) => {
+    const range = BILLING_RANGES.has(query?.range) ? query.range : '30d';
+    const from = typeof query?.from === 'string' && query.from ? query.from : undefined;
+    const to = typeof query?.to === 'string' && query.to ? query.to : undefined;
+    return { range, from, to };
+  };
+
   fastify.get('/oms/billing-profit', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    return getBillingProfit(userId);
+    return getBillingProfit(userId, billingRangeParams(req.query));
+  });
+
+  fastify.get('/oms/billing/invoices', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const q = req.query || {};
+    return getBillingInvoices(userId, {
+      ...billingRangeParams(q),
+      category: typeof q.category === 'string' ? q.category.trim() : undefined,
+      warehouseCode: typeof q.warehouseCode === 'string' ? q.warehouseCode.trim() : undefined,
+      status: typeof q.status === 'string' ? q.status.trim() : undefined,
+      search: typeof q.search === 'string' ? q.search.trim() : undefined,
+      invoiceNumber: typeof q.invoiceNumber === 'string' ? q.invoiceNumber.trim() : undefined,
+      limit: q.limit ? Math.min(200, Math.max(1, Number(q.limit) || 50)) : 50,
+      offset: q.offset ? Math.max(0, Number(q.offset) || 0) : 0,
+    });
+  });
+
+  fastify.get('/oms/billing/statement.pdf', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const q = req.query || {};
+    const pdf = await generateBillingStatementPdf(userId, {
+      ...billingRangeParams(q),
+      category: typeof q.category === 'string' ? q.category.trim() : undefined,
+      warehouseCode: typeof q.warehouseCode === 'string' ? q.warehouseCode.trim() : undefined,
+      status: typeof q.status === 'string' ? q.status.trim() : undefined,
+      search: typeof q.search === 'string' ? q.search.trim() : undefined,
+    });
+    reply
+      .header('Content-Type', 'application/pdf')
+      .header('Content-Disposition', `attachment; filename="${pdf.filename}"`);
+    return reply.send(pdf.buffer);
+  });
+
+  fastify.get('/oms/billing/invoices/:invoiceNumber/export.pdf', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const pdf = await generateInvoicePdf(userId, String(req.params?.invoiceNumber || ''));
+    if (!pdf) return reply.code(404).send({ error: 'Invoice not found' });
+    reply
+      .header('Content-Type', 'application/pdf')
+      .header('Content-Disposition', `attachment; filename="${pdf.filename}"`);
+    return reply.send(pdf.buffer);
   });
 
   fastify.get('/oms/ledger', async (req: any, reply) => {

@@ -597,6 +597,14 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
       wmsEntityId: externalId || undefined,
       invoiceStatus: status,
       invoiceTotal: Number(payload?.totals?.total ?? payload?.total ?? 0) || 0,
+      // Carry the WMS line's source subdoc so the OMS Billing ledger can hyperlink each billed
+      // activity back to its originating Order / ASN. Flattened to strings because Mongo ObjectIds
+      // serialize inconsistently — string form makes the read-time wmsEntityId join reliable.
+      source: li?.source || null,
+      sourceRootType: li?.source?.rootType || null,
+      sourceRootId: li?.source?.rootId ? String(li.source.rootId) : null,
+      sourceOrderId: li?.source?.orderId ? String(li.source.orderId) : null,
+      sourceAsnId: li?.source?.asnId ? String(li.source.asnId) : null,
     };
     await pgQuery(
       `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, currency, status, payload)
