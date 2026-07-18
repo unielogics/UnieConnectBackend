@@ -456,7 +456,13 @@ export async function authRoutes(fastify: FastifyInstance) {
       'UPDATE app_users SET reset_token = $2, reset_token_expires = now() + interval \'1 hour\', updated_at = now() WHERE id = $1',
       [user.userId, token],
     );
-    return { success: true, resetToken: token };
+    // SECURITY: never return the reset token in the HTTP response — that let any anonymous
+    // caller take over any account (submit victim email → receive token → reset password).
+    // The token is delivered out-of-band (email). Non-prod may surface it behind an explicit flag.
+    if (process.env.EXPOSE_RESET_TOKEN === 'true') {
+      return { success: true, resetToken: token };
+    }
+    return { success: true };
   });
 
   fastify.post('/auth/reset-password', async (req: any, reply) => {

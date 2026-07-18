@@ -66,14 +66,23 @@ export async function omsCortexPlansRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     const { id } = req.params as { id: string };
     try {
-      const found = await pgQuery(
-        `SELECT * FROM oms_cortex_plans WHERE id = $1 AND user_id = $2 LIMIT 1`,
+      // ATOMIC CLAIM: flip pending_client_approval → approving in a single guarded UPDATE.
+      // Only one concurrent request (double-click / retry) wins the row; the rest get 0 rows.
+      // This prevents two approvals both calling WMS execute-plan for the same plan.
+      const claim = await pgQuery(
+        `UPDATE oms_cortex_plans
+            SET status='approving', approved_at=now(), updated_at=now()
+          WHERE id=$1 AND user_id=$2 AND status='pending_client_approval'
+        RETURNING decision_id, warehouse_code, client_id, plan`,
         [id, userId],
       );
-      const plan = found?.rows?.[0];
-      if (!plan) return reply.code(404).send({ error: 'Plan not found' });
-      if (plan.status === 'executed' || plan.status === 'approved') {
-        return reply.code(409).send({ error: `Plan already ${plan.status}` });
+      const plan = claim?.rows?.[0];
+      if (!plan) {
+        // Either it doesn't belong to this user, doesn't exist, or was already claimed/decided.
+        const existing = await pgQuery(`SELECT status FROM oms_cortex_plans WHERE id=$1 AND user_id=$2 LIMIT 1`, [id, userId]);
+        const st = existing?.rows?.[0]?.status;
+        if (!st) return reply.code(404).send({ error: 'Plan not found' });
+        return reply.code(409).send({ error: `Plan already ${st}` });
       }
 
       // Ask WMS to create the APPROVAL-GATED draft transfer for this decision. WMS reuses its
@@ -89,16 +98,17 @@ export async function omsCortexPlansRoutes(fastify: FastifyInstance) {
           approvedByUserId: userId,
         });
       } catch (err: any) {
-        // Record the approval intent but surface the execution failure.
+        // Execution failed — leave the plan 'approved' (claimed) so it isn't silently retried
+        // into a double transfer; the operator can investigate the WMS side.
         await pgQuery(
-          `UPDATE oms_cortex_plans SET status='approved', approved_at=now(), updated_at=now() WHERE id=$1`,
+          `UPDATE oms_cortex_plans SET status='approved', updated_at=now() WHERE id=$1`,
           [id],
         );
         return reply.code(502).send({ error: 'Approved, but WMS execution failed', detail: err?.message || String(err) });
       }
 
       await pgQuery(
-        `UPDATE oms_cortex_plans SET status='executed', approved_at=now(), executed_at=now(), updated_at=now() WHERE id=$1`,
+        `UPDATE oms_cortex_plans SET status='executed', executed_at=now(), updated_at=now() WHERE id=$1`,
         [id],
       );
       return reply.send({ ok: true, status: 'executed', wms: wmsResult });

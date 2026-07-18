@@ -28,7 +28,9 @@ interface WarehouseRegisterBody {
 function checkInternalAuth(req: any): boolean {
   const internal = config.internalApiKey;
   const cortexKey = process.env.WMS_TO_UNIECONNECT_API_KEY || (config as any).cortex?.apiKey;
-  if (!internal && !cortexKey) return true; // dev mode — no key configured
+  // Fail CLOSED when no key is configured — a missing key must never make these
+  // stock-affecting internal endpoints public. Opt into the old dev behavior explicitly.
+  if (!internal && !cortexKey) return process.env.ALLOW_UNAUTHENTICATED_INTERNAL === 'true';
   const provided = req.headers['x-internal-api-key'] || req.headers['x-api-key'];
   if (typeof provided !== 'string') return false;
   return (!!internal && provided === internal) || (!!cortexKey && provided === cortexKey);
