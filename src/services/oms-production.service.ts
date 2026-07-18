@@ -3591,7 +3591,7 @@ export async function generateBillingStatementPdf(
     getBillingInvoices(userId, { ...opts, limit: 2000, offset: 0 }),
   ]);
 
-  const doc = new PDFDocument({ size: 'LETTER', margin: 40, autoFirstPage: true });
+  const doc = new PDFDocument({ size: 'LETTER', margin: 40, autoFirstPage: true, bufferPages: true });
   const chunks: Buffer[] = [];
   doc.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
   const done = new Promise<Buffer>((resolve, reject) => {
@@ -3629,7 +3629,7 @@ export async function generateInvoicePdf(userId: string, invoiceNumber: string) 
   const ledger = await getBillingInvoices(userId, { invoiceNumber, limit: 500 });
   if (!ledger.rows.length) return null;
 
-  const doc = new PDFDocument({ size: 'LETTER', margin: 40, autoFirstPage: true });
+  const doc = new PDFDocument({ size: 'LETTER', margin: 40, autoFirstPage: true, bufferPages: true });
   const chunks: Buffer[] = [];
   doc.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
   const done = new Promise<Buffer>((resolve, reject) => {
