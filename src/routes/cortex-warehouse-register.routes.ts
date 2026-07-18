@@ -187,16 +187,35 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
           UNIQUE (decision_id)
         )
       `);
-      // Resolve the OMS user for this client (link via app_users.origin/owning, else leave null;
-      // the client's own dashboard reads by client_id + user_id when present).
+      // Resolve the OMS user for this client. WMS may send clientId as the OMS user id, an
+      // email, or (for warehouse-invited clients with no OMS-identity link) an intermediary
+      // number — try each so the client can actually see the plan. If unresolved, the row is
+      // still stored (client_id kept) and can be back-linked later, but we WARN because an
+      // unlinked plan is invisible to the client until then.
       let userId: string | null = null;
       try {
         const u = await pgQuery<{ id: string }>(
-          `SELECT id FROM app_users WHERE id = $1 OR email = $1 LIMIT 1`,
+          `SELECT id FROM app_users WHERE id = $1 OR lower(email) = lower($1) LIMIT 1`,
           [clientId],
         );
         userId = u?.rows[0]?.id || null;
       } catch { userId = null; }
+      // Fallback: resolve via the warehouse-link / intermediary number for this warehouse.
+      if (!userId && body.intermediaryNumber) {
+        try {
+          const l = await pgQuery<{ user_id: string }>(
+            `SELECT user_id FROM oms_warehouse_links
+              WHERE warehouse_code = $1 AND (metadata->>'intermediaryNumber' = $2 OR connection_code = $2)
+              ORDER BY connected_at DESC NULLS LAST LIMIT 1`,
+            [body.warehouseCode || body.owningWarehouseCode || '', body.intermediaryNumber],
+          );
+          userId = l?.rows[0]?.user_id || null;
+        } catch { userId = null; }
+      }
+      if (!userId) {
+        req.log?.warn({ clientId, decisionId, intermediaryNumber: body.intermediaryNumber },
+          '[cortex-relay-plan] could not resolve OMS user_id — plan stored but invisible until back-linked');
+      }
 
       await pgQuery(
         `INSERT INTO oms_cortex_plans

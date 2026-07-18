@@ -88,7 +88,15 @@ export async function omsCortexPlansRoutes(fastify: FastifyInstance) {
       // Ask WMS to create the APPROVAL-GATED draft transfer for this decision. WMS reuses its
       // buildDraftFromTransferSet path (status 'reviewing', waiting_approval) — it never
       // auto-moves stock; the warehouse still completes the transfer to physically move it.
+      // WMS execute-plan is idempotent per decision_id (dedupes on the open draft), so rolling
+      // back to pending on failure and letting the client retry cannot create a second transfer.
       let wmsResult: any = null;
+      const rollbackToPending = async () => {
+        await pgQuery(
+          `UPDATE oms_cortex_plans SET status='pending_client_approval', approved_at=NULL, updated_at=now() WHERE id=$1`,
+          [id],
+        ).catch(() => null);
+      };
       try {
         wmsResult = await callWmsInternal('/internal/oms/execute-plan', {
           decisionId: plan.decision_id,
@@ -98,13 +106,18 @@ export async function omsCortexPlansRoutes(fastify: FastifyInstance) {
           approvedByUserId: userId,
         });
       } catch (err: any) {
-        // Execution failed — leave the plan 'approved' (claimed) so it isn't silently retried
-        // into a double transfer; the operator can investigate the WMS side.
-        await pgQuery(
-          `UPDATE oms_cortex_plans SET status='approved', updated_at=now() WHERE id=$1`,
-          [id],
-        );
-        return reply.code(502).send({ error: 'Approved, but WMS execution failed', detail: err?.message || String(err) });
+        // Transport/HTTP error — roll back so the client can retry (no draft was created).
+        await rollbackToPending();
+        return reply.code(502).send({ error: 'WMS execution failed; please try again', detail: err?.message || String(err) });
+      }
+      // LOGICAL failure: WMS returns HTTP 200 with ok:false (e.g. no resolvable legs, item not
+      // found). Do NOT mark executed — roll back so the client isn't shown a false success.
+      if (!wmsResult || wmsResult.ok !== true) {
+        await rollbackToPending();
+        return reply.code(502).send({
+          error: 'WMS could not build an executable transfer from this plan',
+          detail: wmsResult?.message || wmsResult?.notes || 'no executable legs',
+        });
       }
 
       await pgQuery(
