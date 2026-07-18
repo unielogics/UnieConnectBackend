@@ -31,6 +31,8 @@ export type KeepaLookupResult = {
   verdict?: any | null;
   opportunity?: any | null;
   charts?: any | null;
+  // The FULL Cortex demand_extract (all 26 sub-objects) — powers the full-screen research view.
+  extract?: any | null;
   message?: string;
 };
 
@@ -60,7 +62,7 @@ function classify(identifier: string, hint?: string): { asin?: string; upc?: str
 
 export async function lookupProductByIdentifier(
   identifier: string,
-  opts: { type?: 'asin' | 'upc' | 'ean'; tenantId?: string } = {},
+  opts: { type?: 'asin' | 'upc' | 'ean'; tenantId?: string; refresh?: boolean } = {},
 ): Promise<KeepaLookupResult> {
   const ids = classify(identifier, opts.type);
   let snap: any = null;
@@ -102,11 +104,18 @@ export async function lookupProductByIdentifier(
         cortexOpts.userId = opts.tenantId;
         cortexOpts.extraHeaders = { 'X-Unie-Tenant-Id': opts.tenantId };
       }
-      const cortex = await postCortex('/v1/integrations/keepa/product', { asin, domain: 1 }, cortexOpts as any);
+      // force_refresh pulls the RICH Keepa payload (offers[]/buy-box history) instead of the slim
+      // shared-cache snapshot — this is what populates the buy-box/seller/offer panels.
+      const cortex = await postCortex(
+        '/v1/integrations/keepa/product',
+        { asin, domain: 1, force_refresh: opts.refresh === true },
+        cortexOpts as any,
+      );
       const data = (cortex && (cortex as any).data) || cortex;
       const extract = data?.demand_extract || data?.data?.demand_extract;
       if (extract) {
         result.source = 'keepa+cortex';
+        result.extract = extract;
         result.verdict = extract.sell_decision_hybrid ?? null;
         result.opportunity = extract.opportunity_summary_ux ?? null;
         result.charts = extract.keepa_trend_bundle?.chart ?? null;

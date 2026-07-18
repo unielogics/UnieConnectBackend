@@ -21,7 +21,9 @@ async function researchKeepaForInput(userId: string, input: any, item: Row | nul
   const type: 'asin' | 'upc' | 'ean' | undefined =
     input?.asin || item?.asin ? 'asin' : input?.upc || item?.upc ? 'upc' : input?.ean || item?.ean ? 'ean' : undefined;
   try {
-    const opts: { type?: 'asin' | 'upc' | 'ean'; tenantId?: string } = { tenantId: userId };
+    // Research is an explicit user action → request the RICH Keepa pull (offers/buy-box) so the
+    // full-screen view's competition/seller/offer panels populate. Cached after first fetch.
+    const opts: { type?: 'asin' | 'upc' | 'ean'; tenantId?: string; refresh?: boolean } = { tenantId: userId, refresh: true };
     if (type) opts.type = type;
     const r = await lookupProductByIdentifier(identifier, opts);
     return r?.found ? r : null;
@@ -47,6 +49,8 @@ function attachKeepaIntelligence(result: any, keepa: KeepaLookupResult | null): 
     verdict: keepa.verdict || null,
     opportunity: keepa.opportunity || null,
     charts: keepa.charts || null,
+    // Full Cortex demand_extract → powers the full-screen research view + re-opened recents.
+    extract: keepa.extract || null,
   };
   // Surface the Cortex sellability verdict as a headline signal on the result.
   const v = keepa.verdict || {};
