@@ -940,7 +940,9 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
   const REORDER_SAFETY_BUFFER_DAYS = 3;
   const REORDER_COVER_TARGET_DAYS = 30; // reorder up to ~30 days of cover
   const repl = json(metadata.replenishment, {});
-  const reorderEnabled = repl?.enabled === true;
+  // Auto-replenishment reorder alerts default ON (opt-out): a SKU is enabled unless the seller
+  // explicitly turned it off. Never-configured SKUs (no cached metadata.replenishment) → ON.
+  const reorderEnabled = repl?.enabled !== false;
   const perDay = velocity / 30;
   const netOnHand = wmsNetworkOnHand(item);
   const reorderOnHand = netOnHand.hasWms ? netOnHand.total : available;
@@ -968,6 +970,10 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     id: String(item.id),
     sku: item.sku,
     title: item.title,
+    // Product image for the SKUs table thumbnail. Same source the detail-page hero uses
+    // (catalog_items.image), with the images[] JSONB array as a fallback. Was previously
+    // omitted here, so the list always fell through to the box-icon placeholder.
+    image: item.image || (Array.isArray(item.images) ? item.images[0] : json(item.images, [])[0]) || null,
     supplierId: item.supplier_id || null,
     asin: asin || null,
     enrichmentState: keepaEnrichmentState,
@@ -2671,7 +2677,7 @@ export async function getWarehouseDetail(userId: string, warehouseCode: string) 
     // low-stock signal against the item's cached reorder intent; the SKUs table + dashboard
     // carry the full velocity-aware truth.
     const repl = json(json(item.metadata, {}).replenishment, {});
-    const reorderEnabled = repl?.enabled === true;
+    const reorderEnabled = repl?.enabled !== false; // default ON (opt-out)
     const REORDER_WH_LOW_UNITS = 10;
     const reorderNeeded = reorderEnabled && available <= REORDER_WH_LOW_UNITS;
     return {
