@@ -531,7 +531,12 @@ export async function retryShipmentVendorEmail(userId: string, draftId: string, 
 function rangeStart(range: RangeKey): Date {
   const d = new Date();
   if (range === 'today') {
-    d.setHours(0, 0, 0, 0);
+    // Rolling last 24h, NOT calendar midnight-to-now. The WMS bills storage/daily fees once per
+    // night around 11pm (periodStart=the prior full day); a calendar-midnight "Today" window is
+    // therefore empty for most of the day. A rolling 24h window always spans the most recent
+    // nightly billing cutoff, so "Today" shows real activity as soon as it posts instead of only
+    // after midnight.
+    d.setHours(d.getHours() - 24);
     return d;
   }
   if (range === 'mtd') {
@@ -547,7 +552,8 @@ function rangeStart(range: RangeKey): Date {
 function previousRangeStart(range: RangeKey, currentStart: Date): Date {
   const d = new Date(currentStart);
   if (range === 'today') {
-    d.setDate(d.getDate() - 1);
+    // Same-length rolling window immediately preceding the current 24h window.
+    d.setHours(d.getHours() - 24);
     return d;
   }
   if (range === 'mtd') {
