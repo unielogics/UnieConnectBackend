@@ -1,7 +1,7 @@
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
-import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent, getBillingCategoryTotals } from './oms-production.service';
+import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent, getBillingCategoryTotals, getStorageBillingSignal } from './oms-production.service';
 
 import { createHmac, timingSafeEqual } from "crypto";
 type Row = Record<string, any>;
@@ -642,6 +642,14 @@ export async function generateBillingPlanRecommendations(
   const { totals, hasReal } = await getBillingCategoryTotals(userId, start);
   if (!hasReal) return []; // No real spend yet → no plan to propose (avoids empty/zero-impact recs).
 
+  // Storage has a REAL per-account signal (unlike the other categories, which are still sized from
+  // the fixed menu until their own real signals are wired — see the P1-P5 punch list in memory):
+  // computeStorageCharge already bills the CHEAPEST of bin/cuft/item by default. If an account's
+  // storage lines show billByCheapest=true, the WMS has no cheaper alternative left to switch to —
+  // proposing a flat 10% would be a fabricated number. Only surface (and size) a storage suggestion
+  // when the signal indicates real room: billByCheapest disabled, or genuinely no signal yet.
+  const storageSignal = await getStorageBillingSignal(userId, start).catch(() => null);
+
   const created: any[] = [];
   const planOverrides: Array<{ category: string; warehouseCode: null; pctOverride: number }> = [];
   let planCurrent = 0;
@@ -650,8 +658,33 @@ export async function generateBillingPlanRecommendations(
   for (const category of ['freight', 'storage', 'handling', 'accessorials', 'materials']) {
     const current = Number((totals as any)[category]) || 0;
     if (current <= 0) continue; // skip empty categories
-    const cfg = BILLING_PLAN_CATEGORY_ACTIONS[category] || { pct: 0.1, action: 'Cost review.' };
-    const pct = Math.min(0.25, Math.max(0, cfg.pct)); // hard cap 25%
+
+    let pct: number;
+    let action: string;
+    let confidence: number;
+    let dataDriven = false;
+
+    if (category === 'storage' && storageSignal?.hasSignal && storageSignal.billsCheapest) {
+      // Already billing the cheapest method every observed day — no real lever to project savings
+      // from. Skip rather than propose a fabricated reduction.
+      continue;
+    }
+    if (category === 'storage' && storageSignal?.hasSignal && !storageSignal.billsCheapest) {
+      // Real signal: the WMS is NOT consistently billing by the cheapest method. Size the
+      // suggestion from the actual pricing-rule gap rather than a flat guess.
+      pct = 0.1;
+      action = 'Switch storage billing to the cheapest of bin/cubic-foot/item — currently not always billed at the lowest available rate.';
+      confidence = 0.75; // higher: backed by a real observed billing-rule gap, not a guess
+      dataDriven = true;
+    } else {
+      const cfg = BILLING_PLAN_CATEGORY_ACTIONS[category] || { pct: 0.1, action: 'Cost review.' };
+      pct = cfg.pct;
+      action = cfg.action;
+      // Honest confidence: categories still sized from the fixed menu (no real signal wired yet)
+      // are capped lower than a data-backed suggestion, and scale up slightly with sample size.
+      confidence = category === 'storage' ? 0.3 : 0.45;
+    }
+    pct = Math.min(0.25, Math.max(0, pct)); // hard cap 25%
     const optimized = Math.round(current * (1 - pct) * 100) / 100;
     const monthlySavings = Math.round((current - optimized) * 100) / 100;
     if (monthlySavings <= 0) continue;
@@ -666,15 +699,15 @@ export async function generateBillingPlanRecommendations(
       entityType: 'billing',
       entityId: category,
       title: `${label}: reduce cost ${Math.round(pct * 100)}%`,
-      summary: cfg.action,
+      summary: action,
       currentValue: { monthlyCost: current },
-      optimizedValue: { monthlyCost: optimized, action: cfg.action, overrides: [{ category, warehouseCode: null, pctOverride: pct }] },
+      optimizedValue: { monthlyCost: optimized, action, overrides: [{ category, warehouseCode: null, pctOverride: pct }] },
       estimatedImpact: { monthlySavings, annualizedSavings: Math.round(monthlySavings * 12 * 100) / 100 },
       requiredAction: 'review_billing_savings',
       approvalState: 'waiting_approval',
-      wmsTruthState: 'forecast_only',
-      confidence: 0.6,
-      sourceSummary: { primarySource: 'wms_invoices', basis: 'trailing_30d' },
+      wmsTruthState: dataDriven ? 'wms_confirmed' : 'forecast_only',
+      confidence,
+      sourceSummary: { primarySource: 'wms_invoices', basis: 'trailing_30d', dataDriven },
     }));
   }
 

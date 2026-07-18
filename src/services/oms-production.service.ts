@@ -3300,7 +3300,60 @@ export async function getBillingCategoryTotals(
     const key = (BILLING_CATEGORY_KEYS.includes(r.category) ? r.category : 'accessorials') as keyof BillingCategoryTotals;
     totals[key] = money(totals[key] + amt);
   }
+  // refundsCaptured: real carrier refunds filed via the Label Audit CSV pipeline
+  // (finding_type='late_delivery_refund' — the only finding type that represents an actual refund
+  // dollar amount; optimized_service_swap/dim_weight_or_ltl_review are cost-avoidance suggestions,
+  // not captured refunds). Windowed the same way as invoice_lines so it reconciles with the range.
+  try {
+    const refundRows = await rows<{ total: string }>(
+      `SELECT COALESCE(SUM(refund_amount),0)::text AS total
+       FROM oms_label_audit_findings
+       WHERE user_id = $1 AND finding_type = 'late_delivery_refund'
+         AND created_at >= $2 AND ($3::timestamptz IS NULL OR created_at < $3)`,
+      [userId, start, end || null],
+    );
+    const refundTotal = money(number(refundRows[0]?.total));
+    if (refundTotal > 0) {
+      totals.refundsCaptured = refundTotal;
+      hasReal = true;
+    }
+  } catch {
+    /* label-audit table may be empty/missing for this account — refundsCaptured stays 0 */
+  }
   return { totals, hasReal };
+}
+
+// Real per-account storage signal for the billing-plan generator (replaces a flat guessed %).
+// computeStorageCharge (WMS) already bills the CHEAPEST of bin/cuft/item by default
+// (billByCheapest), so an account whose storage lines show billByCheapest=true has NO real lever
+// left to project savings from — the WMS is already choosing the cheapest method every night.
+// Only surface a storage suggestion when the signal shows room (billByCheapest disabled, or the
+// chosen method is inconsistent day-to-day, hinting at a cheaper stable alternative).
+export async function getStorageBillingSignal(
+  userId: string,
+  start: Date,
+): Promise<{ hasSignal: boolean; billsCheapest: boolean; distinctMethods: string[]; sampleDays: number }> {
+  try {
+    const r = await rows<{ bill_cheapest: string | null; method: string | null; days: string }>(
+      `SELECT DISTINCT ON (day) day,
+              payload->'lineMetadata'->>'billByCheapest' AS bill_cheapest,
+              payload->'lineMetadata'->>'chosenMethod' AS method
+       FROM (
+         SELECT date_trunc('day', ${BILLING_ACTIVITY_AT}) AS day, payload
+         FROM invoice_lines
+         WHERE user_id = $1 AND COALESCE(payload->>'category','') = 'storage'
+           AND ${BILLING_ACTIVITY_AT} >= $2 AND payload->'lineMetadata' IS NOT NULL
+       ) sub
+       ORDER BY day`,
+      [userId, start],
+    );
+    if (!r.length) return { hasSignal: false, billsCheapest: true, distinctMethods: [], sampleDays: 0 };
+    const methods = Array.from(new Set(r.map((x) => x.method).filter(Boolean))) as string[];
+    const billsCheapest = r.every((x) => x.bill_cheapest !== 'false');
+    return { hasSignal: true, billsCheapest, distinctMethods: methods, sampleDays: r.length };
+  } catch {
+    return { hasSignal: false, billsCheapest: true, distinctMethods: [], sampleDays: 0 };
+  }
 }
 
 // Load active approved billing rate overrides (the advisory "AI plan"). Returns a category→pct map
@@ -3383,18 +3436,32 @@ export async function getBillingProfit(
       [userId, windowStart, windowEnd || null],
     );
 
+  // refundsCaptured: real carrier refunds filed via the Label Audit CSV pipeline
+  // (finding_type='late_delivery_refund' is the only type that represents an actual refund $,
+  // not a cost-avoidance suggestion). Windowed the same way as the invoice_lines aggregates.
+  const refundRowsFor = (windowStart: Date, windowEnd?: Date) =>
+    rows<{ total: string }>(
+      `SELECT COALESCE(SUM(refund_amount),0)::text AS total
+       FROM oms_label_audit_findings
+       WHERE user_id = $1 AND finding_type = 'late_delivery_refund'
+         AND created_at >= $2 AND ($3::timestamptz IS NULL OR created_at < $3)`,
+      [userId, windowStart, windowEnd || null],
+    ).catch(() => [{ total: '0' }]);
+
   const everRowsFor = () =>
     rows<{ exists: boolean }>(
       `SELECT EXISTS(SELECT 1 FROM invoice_lines WHERE user_id = $1 AND amount > 0) AS exists`,
       [userId],
     );
 
-  const [catRows, whRows, seriesRows, prevCatRows, everRows] = await Promise.all([
+  const [catRows, whRows, seriesRows, prevCatRows, everRows, refundRows, prevRefundRows] = await Promise.all([
     catRowsFor(start, end),
     whRowsFor(start, end),
     seriesRowsFor(start, end),
     catRowsFor(prevStart, prevEnd),
     everRowsFor(),
+    refundRowsFor(start, end),
+    refundRowsFor(prevStart, prevEnd),
   ]);
   const hasRealInvoices = catRows.some((r) => number(r.total) > 0);
   // Distinguish "empty window on an account that HAS real invoices" from "brand-new account with no
@@ -3418,12 +3485,16 @@ export async function getBillingProfit(
     current.accessorials = money(counts.shipmentPlans * 9);
   }
   // else: empty window on an account with real history → real $0 (source will be 'empty').
+  // refundsCaptured is always real when present (Label Audit findings), independent of whether
+  // invoice_lines has activity in this window — never fabricated, never part of the estimate.
+  current.refundsCaptured = money(number(refundRows[0]?.total));
 
   const previous = emptyBillingCategoryTotals();
   for (const r of prevCatRows) {
     const key = (BILLING_CATEGORY_KEYS.includes(r.category) ? r.category : 'accessorials') as keyof BillingCategoryTotals;
     previous[key] = money(previous[key] + number(r.total));
   }
+  previous.refundsCaptured = money(number(prevRefundRows[0]?.total));
 
   // Optimized = the ADVISORY projection driven by APPROVED billing_rate_overrides (the real "AI
   // plan"). optimized[cat] = current[cat] * (1 - approvedPct); when nothing is approved for a
@@ -3534,7 +3605,15 @@ async function buildStorageForecast(userId: string) {
   );
   const mtd = money(agg[0]?.mtd);
   const observedBilledDays = number(agg[0]?.billed_days);
-  const projectedMonthEnd = observedBilledDays > 0 ? money((mtd / observedBilledDays) * daysInMonth) : mtd;
+  const rawProjection = observedBilledDays > 0 ? money((mtd / observedBilledDays) * daysInMonth) : mtd;
+  // MIN_SAMPLE_DAYS: a naive run-rate on day 1-2 of the month can extrapolate wildly (one $50 day
+  // in a 31-day month projects $1550 — a 31x blow-up from a single data point, especially if that
+  // first day had an atypical one-off charge). Below this sample size, DON'T extrapolate — surface
+  // only the real MTD-so-far and mark the projection preliminary, rather than showing an alarming
+  // number the confidence chip alone might not be enough to caveat.
+  const MIN_SAMPLE_DAYS = 3;
+  const preliminary = observedBilledDays < MIN_SAMPLE_DAYS;
+  const projectedMonthEnd = preliminary ? mtd : rawProjection;
   // Confidence grows with how much of the month we've observed (capped at ~0.6 for the run-rate
   // method — a naive extrapolation should never present as high-confidence; Cortex earns more).
   const confidence = observedBilledDays > 0 ? Math.min(0.6, Math.round((observedBilledDays / daysInMonth) * 100) / 100) : 0;
@@ -3543,6 +3622,7 @@ async function buildStorageForecast(userId: string) {
     storage: {
       mtd,
       projectedMonthEnd,
+      preliminary,
       method: 'run_rate' as const,
       observedBilledDays,
       daysInMonth,

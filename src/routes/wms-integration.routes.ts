@@ -513,7 +513,8 @@ async function upsertWmsAsn(userId: string, warehouseCode: string, body: any) {
 // Map a WMS invoice line CODE to the OMS Billing screen's cost bucket. OMS apply-side so the
 // WMS stays source-of-truth-neutral. Buckets match Billing.tsx CAT_META keys.
 function wmsInvoiceCategory(code: string): string {
-  switch (String(code || '').toUpperCase()) {
+  const upper = String(code || '').toUpperCase();
+  switch (upper) {
     case 'STORAGE':
       return 'storage';
     case 'LABEL_FEE':
@@ -529,12 +530,25 @@ function wmsInvoiceCategory(code: string): string {
     case 'SORT_COUNT_FEE':
     case 'RETURN_HANDLING':
     case 'RESTOCK_FEE':
-    case 'LAB_LABELING':
-    case 'LAB_REBOXING':
+    // Inventory-activity + peer-rebill codes (inventory-activity-billing.service.ts,
+    // peer-rebill.service.ts) — real handling-type charges that were silently falling into the
+    // 'accessorials' catch-all below because they weren't in this switch.
+    case 'PUTAWAY_FEE':
+    case 'CYCLE_COUNT_FEE':
+    case 'INVENTORY_TRANSFER_FEE':
+    case 'QUALITY_CONTROL_FEE':
+    case 'ORDER_ROUTING_FEE':
+    case 'ASN_ROUTING_FEE':
+    case 'DISPATCH_FEE':
+    case 'PEER_REBILL':
       return 'handling';
     case 'MATERIAL':
       return 'materials';
     default:
+      // labRatesByServiceType generates dynamic LAB_<SERVICE_TYPE> codes (LAB_BUNDLING,
+      // LAB_KITTING, LAB_GIFT_WRAPPING, etc.) — only LAB_LABELING/LAB_REBOXING were literal cases
+      // above; catch every LAB_* code so newly-added service types classify correctly too.
+      if (upper.startsWith('LAB_')) return 'handling';
       return 'accessorials';
   }
 }
@@ -556,10 +570,15 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
   // stored breakdown — just advance status across all rows of this invoice. Mirrors the
   // order-upsert guard (only rewrite detail when the event actually carries it).
   if (lineItems.length === 0) {
+    // Scope by warehouseCode too: WMS invoice NUMBERS are minted per-warehouse (each warehouse
+    // starts its own sequence at INV-...-000001), so an OMS account connected to 2+ warehouses can
+    // have invoiceKey collide across warehouses even though wmsEntityId never does. Without the
+    // warehouse guard, this UPDATE (and the DELETE below) could silently touch the WRONG
+    // warehouse's rows and corrupt/erase its billing history.
     const upd = await pgQuery(
       `UPDATE invoice_lines SET status=$4, updated_at=now()
-       WHERE user_id=$1 AND (invoice_id=$2 OR payload->>'wmsEntityId'=$3)`,
-      [userId, invoiceKey, externalId, status],
+       WHERE user_id=$1 AND (invoice_id=$2 OR payload->>'wmsEntityId'=$3) AND payload->>'warehouseCode'=$5`,
+      [userId, invoiceKey, externalId, status, warehouseCode],
     );
     const affected = upd?.rowCount || 0;
     if (affected > 0) return { statusUpdated: affected };
@@ -576,9 +595,11 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
 
   // Full invoice (with lineItems): DELETE-then-INSERT one invoice_lines row per WMS line item,
   // so the seller-visible data keeps the storage/handling/freight/materials category breakdown.
+  // Same cross-warehouse collision guard as the status-only branch above — scope the DELETE by
+  // warehouseCode so re-syncing warehouse B's "INV-...-000001" can never delete warehouse A's rows.
   await pgQuery(
-    `DELETE FROM invoice_lines WHERE user_id=$1 AND (invoice_id=$2 OR payload->>'wmsEntityId'=$3)`,
-    [userId, invoiceKey, externalId],
+    `DELETE FROM invoice_lines WHERE user_id=$1 AND (invoice_id=$2 OR payload->>'wmsEntityId'=$3) AND payload->>'warehouseCode'=$4`,
+    [userId, invoiceKey, externalId, warehouseCode],
   );
   let insertedCount = 0;
   for (const li of lineItems) {
@@ -605,6 +626,11 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
       sourceRootId: li?.source?.rootId ? String(li.source.rootId) : null,
       sourceOrderId: li?.source?.orderId ? String(li.source.orderId) : null,
       sourceAsnId: li?.source?.asnId ? String(li.source.asnId) : null,
+      // Carry the WMS line's own computed metadata (e.g. computeStorageCharge writes
+      // chosenMethod/binCount/itemCount/cubicFeet/billByCheapest) so the OMS billing-plan generator
+      // can size AI suggestions from REAL per-account signal instead of a flat guess. Namespaced
+      // (not spread) so it can never collide with the fixed wmsMetadata() fields above.
+      lineMetadata: li?.metadata && typeof li.metadata === 'object' ? li.metadata : null,
     };
     await pgQuery(
       `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, currency, status, payload)
