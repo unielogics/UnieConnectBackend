@@ -1,7 +1,7 @@
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
-import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent } from './oms-production.service';
+import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent, getBillingCategoryTotals } from './oms-production.service';
 
 import { createHmac, timingSafeEqual } from "crypto";
 type Row = Record<string, any>;
@@ -25,9 +25,22 @@ const SELLER_OPTIMIZATION_RECOMMENDATION_TYPES = [
   'order_fulfillment',
   'shipment_consolidation',
   'billing_profit',
+  'billing_plan',
+  'billing_category',
   'carrier_audit',
   'data_readiness',
 ];
+
+// Proposed per-category cost-reduction percentages for the advisory "AI billing plan". These are
+// ADVISORY projections (the WMS does not actually re-rate today), capped conservatively so the hero
+// can never imply near-free operations. Each carries the itemized action shown to the seller.
+const BILLING_PLAN_CATEGORY_ACTIONS: Record<string, { pct: number; action: string }> = {
+  freight: { pct: 0.16, action: 'Carrier/lane re-rate + shared-pallet consolidation on top outbound lanes.' },
+  storage: { pct: 0.1, action: 'Storage tier downgrade + pre-positioning of slow-movers to cheaper zones.' },
+  handling: { pct: 0.12, action: 'Split-node fulfillment to shorten pick paths and cut per-order handling.' },
+  accessorials: { pct: 0.24, action: 'Dim-weight reclass + automated accessorial disputes on flagged charges.' },
+  materials: { pct: 0.05, action: 'Right-sized packaging substitution to reduce material spend per order.' },
+};
 
 const CORTEX_TASK_STATUS = new Set(['open', 'done', 'dismissed']);
 
@@ -603,6 +616,118 @@ async function supersedeOpenRecommendations(userId: string, recommendationTypes:
   ).catch(() => null);
 }
 
+const BILLING_CATEGORY_LABELS: Record<string, string> = {
+  freight: 'Freight',
+  storage: 'Storage',
+  handling: 'Handling & pick',
+  accessorials: 'Accessorials',
+  materials: 'Materials',
+};
+
+/**
+ * Generate the advisory "AI billing plan" recommendations for the Billing screen, derived from REAL
+ * WMS-synced invoice_lines (same aggregation getBillingProfit uses, so the numbers reconcile with
+ * the hero). Emits one plan-level rec (entityId=null → the hero screenRec) plus one per-category rec
+ * (entityId=<categoryKey> → lights up that breakdown row). All are approvalState='waiting_approval'
+ * with a numeric estimatedImpact so they survive the frontend's isActionableDecisionRecommendation
+ * gate. ADVISORY: approving persists a rate-override that only drives the OMS "optimized/you save"
+ * projection — it does not change what the WMS actually bills.
+ */
+export async function generateBillingPlanRecommendations(
+  userId: string,
+  opts: { runId?: string | null } = {},
+) {
+  // Use a trailing 30-day window of real billed activity as the plan basis.
+  const start = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const { totals, hasReal } = await getBillingCategoryTotals(userId, start);
+  if (!hasReal) return []; // No real spend yet → no plan to propose (avoids empty/zero-impact recs).
+
+  const created: any[] = [];
+  const planOverrides: Array<{ category: string; warehouseCode: null; pctOverride: number }> = [];
+  let planCurrent = 0;
+  let planOptimized = 0;
+
+  for (const category of ['freight', 'storage', 'handling', 'accessorials', 'materials']) {
+    const current = Number((totals as any)[category]) || 0;
+    if (current <= 0) continue; // skip empty categories
+    const cfg = BILLING_PLAN_CATEGORY_ACTIONS[category] || { pct: 0.1, action: 'Cost review.' };
+    const pct = Math.min(0.25, Math.max(0, cfg.pct)); // hard cap 25%
+    const optimized = Math.round(current * (1 - pct) * 100) / 100;
+    const monthlySavings = Math.round((current - optimized) * 100) / 100;
+    if (monthlySavings <= 0) continue;
+    planCurrent += current;
+    planOptimized += optimized;
+    planOverrides.push({ category, warehouseCode: null, pctOverride: pct });
+
+    const label = BILLING_CATEGORY_LABELS[category] || category;
+    created.push(await createRecommendation(userId, {
+      runId: opts.runId || null,
+      recommendationType: 'billing_category',
+      entityType: 'billing',
+      entityId: category,
+      title: `${label}: reduce cost ${Math.round(pct * 100)}%`,
+      summary: cfg.action,
+      currentValue: { monthlyCost: current },
+      optimizedValue: { monthlyCost: optimized, action: cfg.action, overrides: [{ category, warehouseCode: null, pctOverride: pct }] },
+      estimatedImpact: { monthlySavings, annualizedSavings: Math.round(monthlySavings * 12 * 100) / 100 },
+      requiredAction: 'review_billing_savings',
+      approvalState: 'waiting_approval',
+      wmsTruthState: 'forecast_only',
+      confidence: 0.6,
+      sourceSummary: { primarySource: 'wms_invoices', basis: 'trailing_30d' },
+    }));
+  }
+
+  if (planOverrides.length === 0) return created;
+
+  // Plan-level rec (hero). entityId=null so Billing.tsx treats it as the whole-screen screenRec.
+  const planSavings = Math.round((planCurrent - planOptimized) * 100) / 100;
+  created.unshift(await createRecommendation(userId, {
+    runId: opts.runId || null,
+    recommendationType: 'billing_plan',
+    entityType: 'billing',
+    entityId: null,
+    title: `AI billing plan: save ${Math.round(planSavings).toLocaleString()} dollars / month`,
+    summary: `Approve to project ${planOverrides.length} cost reductions across ${planOverrides.map((o) => BILLING_CATEGORY_LABELS[o.category] || o.category).join(', ')}.`,
+    currentValue: { monthlyCost: Math.round(planCurrent * 100) / 100 },
+    optimizedValue: { monthlyCost: Math.round(planOptimized * 100) / 100, overrides: planOverrides },
+    estimatedImpact: { monthlySavings: planSavings, annualizedSavings: Math.round(planSavings * 12 * 100) / 100 },
+    requiredAction: 'review_billing_savings',
+    approvalState: 'waiting_approval',
+    wmsTruthState: 'forecast_only',
+    confidence: 0.6,
+    sourceSummary: { primarySource: 'wms_invoices', basis: 'trailing_30d' },
+  }));
+
+  return created;
+}
+
+/**
+ * Guarded lazy generation for the Billing screen: regenerate the billing plan only when there's no
+ * open billing_plan rec AND none was generated in the last `staleHours`. Best-effort — swallows
+ * errors so a billing-profit fetch never fails because of this. Lets the Billing screen always have
+ * a fresh plan without a dedicated scheduler, without thrashing supersede on every fetch.
+ */
+export async function ensureBillingPlanRecommendations(userId: string, staleHours = 12) {
+  try {
+    const existing = await one(
+      `SELECT created_at FROM oms_recommendations
+       WHERE user_id = $1 AND recommendation_type = 'billing_plan' AND status = 'open'
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId],
+    );
+    if (existing) {
+      const ageHours = (Date.now() - new Date(existing.created_at as any).getTime()) / 3_600_000;
+      if (ageHours < staleHours) return; // fresh enough
+    }
+    // Supersede stale open billing recs, then regenerate from current invoice_lines.
+    await supersedeOpenRecommendations(userId, ['billing_plan', 'billing_category', 'billing_profit']);
+    await generateBillingPlanRecommendations(userId);
+  } catch {
+    /* best-effort */
+  }
+}
+
 async function createSellerContextRecommendations(params: {
   userId: string;
   runId?: string | null;
@@ -720,26 +845,12 @@ async function createSellerContextRecommendations(params: {
     }));
   }
 
-  if (currentMonthlyCost > 0 || optimizedMonthlyCost > 0 || monthlySavings > 0) {
-    recommendations.push(await createRecommendation(userId, {
-      runId: scopedRunId,
-      recommendationType: 'billing_profit',
-      entityType: 'billing',
-      entityId: stored?.id || userId,
-      title: 'Track optimized cost basis against current spend',
-      summary: monthlySavings > 0
-        ? `Optimize Suite modeled ${Math.round(monthlySavings).toLocaleString()} dollars in monthly cost improvement.`
-        : 'Cost basis is available, but more marketplace/WMS data is needed to prove savings.',
-      currentValue: { monthlyCost: currentMonthlyCost },
-      optimizedValue: { monthlyCost: optimizedMonthlyCost },
-      estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12 },
-      requiredAction: monthlySavings > 0 ? 'review_cost_savings' : 'improve_cost_inputs',
-      approvalState: 'not_required',
-      wmsTruthState,
-      confidence,
-      sourceSummary,
-    }));
-  }
+  // Billing plan: replace the old cosmetic 'billing_profit' rec (Business-Double sourced,
+  // approvalState 'not_required' so it was hidden) with real, approvable per-category billing
+  // recommendations derived from actual WMS invoice_lines. These surface on the Billing screen and,
+  // on approval, drive the real "optimized / you save" projection via billing_rate_overrides.
+  const billingRecs = await generateBillingPlanRecommendations(userId, { runId: scopedRunId }).catch(() => []);
+  if (billingRecs.length) recommendations.push(...billingRecs);
 
   if (readiness.counts.orders > 0 || readiness.counts.csvOrders > 0 || readiness.counts.marketplaceOrders > 0) {
     const claimableBaseline = Math.max(0, Math.round(currentMonthlyCost * 0.012 * 100) / 100);
@@ -1160,6 +1271,40 @@ function screenEntityType(screen: string) {
   return '';
 }
 
+/**
+ * Side-effect of approving a billing recommendation: persist the proposed per-category reductions
+ * as active billing_rate_overrides (stored as PCT). Supersedes any prior active override for the
+ * same (user, category, warehouse) first, so approving the plan-level rec and a per-category child
+ * in any order is idempotent (the unique partial index guarantees one active row per key). These
+ * overrides drive getBillingProfit's advisory "optimized / you save" projection — they do NOT
+ * change what the WMS actually bills.
+ */
+async function applyBillingPlanApproval(userId: string, rec: any, sourceActionId?: string | null) {
+  const type = String(rec?.recommendation_type || '');
+  if (type !== 'billing_plan' && type !== 'billing_category') return;
+  const optimized = json(rec?.optimized_value, {}) as any;
+  const overrides: Array<{ category: string; warehouseCode: string | null; pctOverride: number }> =
+    Array.isArray(optimized?.overrides) ? optimized.overrides : [];
+  for (const o of overrides) {
+    const category = String(o?.category || '').trim();
+    const pct = Number(o?.pctOverride);
+    if (!category || !Number.isFinite(pct) || pct <= 0) continue;
+    const warehouseCode = o?.warehouseCode ? String(o.warehouseCode) : null;
+    // Supersede the prior active override for this key, then insert the new active one.
+    await pgQuery(
+      `UPDATE billing_rate_overrides SET status = 'superseded', updated_at = now()
+       WHERE user_id = $1 AND category = $2 AND COALESCE(warehouse_code,'') = COALESCE($3,'') AND status = 'active'`,
+      [userId, category, warehouseCode],
+    ).catch(() => null);
+    await pgQuery(
+      `INSERT INTO billing_rate_overrides
+        (user_id, category, warehouse_code, pct_override, status, source_recommendation_id, source_action_id, metadata)
+       VALUES ($1, $2, $3, $4, 'active', $5, $6, $7::jsonb)`,
+      [userId, category, warehouseCode, pct, rec.id, sourceActionId || null, JSON.stringify({ action: optimized?.action || null })],
+    ).catch(() => null);
+  }
+}
+
 export async function approveRecommendation(userId: string, recommendationId: string, body: any = {}) {
   const rec = await one('SELECT * FROM oms_recommendations WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, recommendationId]);
   if (!rec) return null;
@@ -1170,6 +1315,8 @@ export async function approveRecommendation(userId: string, recommendationId: st
      RETURNING *`,
     [userId, recommendationId],
   );
+  // Billing approvals persist rate overrides that drive the advisory savings projection.
+  await applyBillingPlanApproval(userId, updated || rec).catch(() => null);
   await pgQuery(
     `INSERT INTO oms_recommendation_actions
       (user_id, recommendation_id, action_type, status, payload, requires_approval)

@@ -3270,6 +3270,61 @@ const emptyBillingCategoryTotals = (): BillingCategoryTotals => ({
 // that predate periodStart being carried through, or for the estimate/status-only fallback rows.
 const BILLING_ACTIVITY_AT = `COALESCE((payload->>'periodStart')::timestamptz, created_at)`;
 
+// Shared helper: real per-category billing totals over a window, aggregated from WMS-synced
+// invoice_lines. Used by getBillingProfit (the hero/breakdown) AND the billing-plan recommendation
+// generator so the proposed savings reconcile exactly with what the Billing screen shows. Returns
+// only categories that actually have spend > 0 in the window (so the generator skips empty ones).
+export async function getBillingCategoryTotals(
+  userId: string,
+  start: Date,
+  end?: Date,
+): Promise<{ totals: BillingCategoryTotals; hasReal: boolean }> {
+  const catRows = await rows<{ category: string; total: string }>(
+    `SELECT COALESCE(payload->>'category','accessorials') AS category, COALESCE(SUM(amount),0)::text AS total
+     FROM invoice_lines
+     WHERE user_id = $1 AND ${BILLING_ACTIVITY_AT} >= $2 AND ($3::timestamptz IS NULL OR ${BILLING_ACTIVITY_AT} < $3)
+     GROUP BY 1`,
+    [userId, start, end || null],
+  );
+  const totals = emptyBillingCategoryTotals();
+  let hasReal = false;
+  for (const r of catRows) {
+    const amt = number(r.total);
+    if (amt > 0) hasReal = true;
+    const key = (BILLING_CATEGORY_KEYS.includes(r.category) ? r.category : 'accessorials') as keyof BillingCategoryTotals;
+    totals[key] = money(totals[key] + amt);
+  }
+  return { totals, hasReal };
+}
+
+// Load active approved billing rate overrides (the advisory "AI plan"). Returns a category→pct map
+// (warehouse_code NULL = applies to the whole category) and a (warehouse|category)→pct map for the
+// per-warehouse table. Empty when nothing is approved → optimized == current → savings $0.
+// Guarded so a missing billing_rate_overrides table (pre-migration) never breaks the billing feed.
+async function loadActiveBillingOverrides(
+  userId: string,
+): Promise<{ byCategory: Record<string, number>; byWarehouseCategory: Record<string, number> }> {
+  const byCategory: Record<string, number> = {};
+  const byWarehouseCategory: Record<string, number> = {};
+  try {
+    const ov = await rows<{ category: string; warehouse_code: string | null; pct_override: string }>(
+      `SELECT category, warehouse_code, pct_override
+       FROM billing_rate_overrides
+       WHERE user_id = $1 AND status = 'active'
+         AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())`,
+      [userId],
+    );
+    for (const r of ov) {
+      const pct = Math.max(0, Math.min(1, number(r.pct_override)));
+      if (r.warehouse_code) byWarehouseCategory[`${r.warehouse_code}::${r.category}`] = pct;
+      else byCategory[r.category] = pct;
+    }
+  } catch {
+    /* table may not exist yet (pre-migration) — no overrides, optimized == current */
+  }
+  return { byCategory, byWarehouseCategory };
+}
+
 export async function getBillingProfit(
   userId: string,
   opts: { range?: RangeKey; from?: string; to?: string } = {},
@@ -3352,15 +3407,24 @@ export async function getBillingProfit(
     previous[key] = money(previous[key] + number(r.total));
   }
 
-  // Optimized stays a Cortex-style advisory projection, now based off the REAL windowed current cost.
-  const optimized = {
-    freight: money(current.freight * 0.84),
-    storage: money(current.storage * 0.9),
-    handling: money(current.handling * 0.88),
-    accessorials: money(current.accessorials * 0.76),
-    refundsCaptured: money(current.refundsCaptured * 2.8),
-    materials: money(current.materials * 0.95),
+  // Optimized = the ADVISORY projection driven by APPROVED billing_rate_overrides (the real "AI
+  // plan"). optimized[cat] = current[cat] * (1 - approvedPct); when nothing is approved for a
+  // category, optimized == current so it contributes $0 savings. This replaces the old cosmetic
+  // hardcoded multipliers — "you save" now reflects only what the seller actually approved.
+  const overrides = await loadActiveBillingOverrides(userId);
+  const applyOverride = (cat: keyof BillingCategoryTotals) => {
+    const pct = overrides.byCategory[cat as string] || 0;
+    return money(current[cat] * (1 - pct));
   };
+  const optimized = {
+    freight: applyOverride('freight'),
+    storage: applyOverride('storage'),
+    handling: applyOverride('handling'),
+    accessorials: applyOverride('accessorials'),
+    refundsCaptured: current.refundsCaptured, // refunds are a credit, not a cost to optimize
+    materials: applyOverride('materials'),
+  };
+  const appliedCategories = Object.keys(overrides.byCategory).filter((k) => (overrides.byCategory[k] || 0) > 0);
 
   const sumTotals = (t: BillingCategoryTotals) =>
     money(Object.entries(t).reduce((sum, [key, val]) => sum + (key === 'refundsCaptured' ? -Math.abs(val) : val), 0));
@@ -3386,13 +3450,25 @@ export async function getBillingProfit(
   }
   const series = Array.from(seriesMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 
+  // Per-warehouse optimized applies the SAME approved-plan effect. whRows is grouped by warehouse
+  // only (no category split), so we apply the blended cost-reduction ratio (overall optimized/
+  // current). With nothing approved this ratio is 1 → optimized == current → $0 savings, honest.
+  const blendedRatio = currentTotal > 0 ? optimizedTotal / currentTotal : 1;
   const perWarehouse = whRows
     .filter((r) => r.code && number(r.total) > 0)
     .map((r) => {
       const cur = money(number(r.total));
-      return { code: r.code, current: cur, optimized: money(cur * 0.87) };
+      return { code: r.code, current: cur, optimized: money(cur * blendedRatio) };
     })
     .sort((a, b) => b.current - a.current);
+
+  // Month-end storage forecast (Rail A — OMS run-rate). A month-end projection is inherently a
+  // full-calendar-month view, independent of the selected range, so it always aggregates the
+  // CURRENT calendar month's storage lines. projectedMonthEnd = MTD storage / distinct billed days
+  // this month × days in the month. Distinct billed days (not calendar-elapsed) makes the estimate
+  // robust to nights the WMS scheduler skipped. Rail B (Cortex) can later replace this with a
+  // trajectory that accounts for planned inbound/outbound; until then this is the always-on floor.
+  const forecast = await buildStorageForecast(userId);
 
   return {
     range,
@@ -3410,8 +3486,48 @@ export async function getBillingProfit(
       optimized: optimizedTotal,
       savings,
       savingsPct: currentTotal ? Math.round((savings / currentTotal) * 1000) / 10 : 0,
+      savingsSource: appliedCategories.length ? 'approved_overrides' : 'none',
+      appliedCategories,
     },
+    forecast,
     source: hasRealInvoices ? 'wms_invoices' : 'estimate',
+  };
+}
+
+// Month-end storage forecast via run-rate over the current calendar month. Returns null-safe zeros
+// when there's no storage activity yet. Kept as a standalone helper so Rail B (Cortex trajectory)
+// can later override forecast.storage.method='cortex' without disturbing this fallback.
+async function buildStorageForecast(userId: string) {
+  const now = new Date();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+
+  const agg = await rows<{ mtd: string; billed_days: string }>(
+    `SELECT COALESCE(SUM(amount),0)::text AS mtd,
+            COUNT(DISTINCT date_trunc('day', ${BILLING_ACTIVITY_AT}))::text AS billed_days
+     FROM invoice_lines
+     WHERE user_id = $1
+       AND COALESCE(payload->>'category','') = 'storage'
+       AND ${BILLING_ACTIVITY_AT} >= $2`,
+    [userId, monthStart],
+  );
+  const mtd = money(agg[0]?.mtd);
+  const observedBilledDays = number(agg[0]?.billed_days);
+  const projectedMonthEnd = observedBilledDays > 0 ? money((mtd / observedBilledDays) * daysInMonth) : mtd;
+  // Confidence grows with how much of the month we've observed (capped at ~0.6 for the run-rate
+  // method — a naive extrapolation should never present as high-confidence; Cortex earns more).
+  const confidence = observedBilledDays > 0 ? Math.min(0.6, Math.round((observedBilledDays / daysInMonth) * 100) / 100) : 0;
+
+  return {
+    storage: {
+      mtd,
+      projectedMonthEnd,
+      method: 'run_rate' as const,
+      observedBilledDays,
+      daysInMonth,
+      confidence,
+      asOf: now.toISOString(),
+    },
   };
 }
 

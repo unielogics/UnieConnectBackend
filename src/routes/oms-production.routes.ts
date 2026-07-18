@@ -32,6 +32,7 @@ import {
   retryShipmentVendorEmail,
   updateOmsSkuEnrichment,
 } from '../services/oms-production.service';
+import { ensureBillingPlanRecommendations } from '../services/oms-intelligence.service';
 import { getKeepaSnapshot, peekKeepaSnapshot } from '../services/keepa';
 
 function requireUser(req: any, reply: any): string | null {
@@ -235,6 +236,9 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
   fastify.get('/oms/billing-profit', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
+    // Fire-and-forget: keep a fresh advisory billing plan available on the Billing screen without a
+    // dedicated scheduler. Self-guarded (no-op when a recent open plan exists) and error-swallowed.
+    void ensureBillingPlanRecommendations(userId);
     return getBillingProfit(userId, billingRangeParams(req.query));
   });
 
