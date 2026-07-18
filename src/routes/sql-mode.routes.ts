@@ -831,10 +831,14 @@ async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
 }
 
 async function connectedWarehousePricingContext(userId: string) {
-  const link = await one(
+  // P1d: load ALL connected links (was LIMIT 1, which re-collapsed a multi-warehouse seller
+  // to a single anchor before Cortex ever saw the network). The most-recently-connected link
+  // stays the anchor; the rest are additional candidates forwarded to Cortex pricing/placement.
+  const links = await rows(
     `SELECT
        l.warehouse_code,
        l.metadata,
+       l.connected_at,
        f.id AS facility_id,
        f.code AS facility_code,
        f.name AS facility_name,
@@ -844,10 +848,10 @@ async function connectedWarehousePricingContext(userId: string) {
      FROM oms_warehouse_links l
      LEFT JOIN facilities f ON f.id = l.facility_id
      WHERE l.user_id = $1 AND l.status = 'connected'
-     ORDER BY l.connected_at DESC NULLS LAST
-     LIMIT 1`,
+     ORDER BY l.connected_at DESC NULLS LAST`,
     [userId],
-  ).catch(() => null);
+  ).catch(() => []);
+  const link = links[0] || null;
   const metadata = json(link?.metadata, {});
   const rawNetworkPolicy = metadata?.networkPolicy || metadata?.network_policy || null;
   const address = json(link?.facility_address, {});
@@ -867,24 +871,32 @@ async function connectedWarehousePricingContext(userId: string) {
   ).toUpperCase();
   const latitude = number(link?.latitude ?? address.latitude ?? address.lat, NaN);
   const longitude = number(link?.longitude ?? address.longitude ?? address.lon ?? address.lng, NaN);
-  const warehouse = warehouseCode
-    ? {
-        warehouseCode,
-        warehouseId: trim(link?.facility_id) || warehouseCode,
-        name: trim(link?.facility_name) || warehouseCode,
-        postal: postal || undefined,
-        state: state || undefined,
-        latitude: Number.isFinite(latitude) ? latitude : undefined,
-        longitude: Number.isFinite(longitude) ? longitude : undefined,
-        isAnchor: true,
-      }
-    : null;
+  // Build a warehouse entry per connected link (anchor = first/most-recent).
+  const warehouses = links.map((l, idx) => {
+    const addr = json(l?.facility_address, {});
+    const code = trim(l?.warehouse_code || l?.facility_code);
+    if (!code) return null;
+    const pc = trim(addr.postal || addr.zip || addr.zipCode || addr.postalCode || addr.postal_code);
+    const st = trim(addr.state || addr.stateOrProvinceCode || addr.region || addr.province).toUpperCase();
+    const lat = number(l?.latitude ?? addr.latitude ?? addr.lat, NaN);
+    const lon = number(l?.longitude ?? addr.longitude ?? addr.lon ?? addr.lng, NaN);
+    return {
+      warehouseCode: code,
+      warehouseId: trim(l?.facility_id) || code,
+      name: trim(l?.facility_name) || code,
+      postal: pc || undefined,
+      state: st || undefined,
+      latitude: Number.isFinite(lat) ? lat : undefined,
+      longitude: Number.isFinite(lon) ? lon : undefined,
+      isAnchor: idx === 0,
+    };
+  }).filter(Boolean);
   const networkPolicy = normalizeNetworkPolicyForCortex(rawNetworkPolicy, warehouseCode);
   return {
     warehouseCode,
     facilityId: link?.facility_id || null,
     networkPolicy,
-    warehouses: warehouse ? [warehouse] : [],
+    warehouses,
   };
 }
 

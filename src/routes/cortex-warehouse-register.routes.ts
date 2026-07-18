@@ -86,6 +86,59 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
     }
   });
 
+  app.post('/internal/cortex/inventory-allocation', async (req: any, reply) => {
+    if (!checkInternalAuth(req)) {
+      return reply.code(401).send({ error: 'invalid internal key' });
+    }
+    const body = req.body as {
+      decision_id?: string;
+      user_id?: string;
+      plan_id?: string;
+      allocations?: Array<{ sku: string; warehouse_code?: string; proposed_units?: number; executable_units?: number; min_viable_units?: number; fill_percent?: number; service_tier?: string; status?: string; constraints?: any }>;
+    };
+    const userId = (body?.user_id || '').trim();
+    const allocations = Array.isArray(body?.allocations) ? body.allocations : [];
+    if (!userId || allocations.length === 0) {
+      return reply.code(400).send({ error: 'user_id and non-empty allocations required' });
+    }
+    try {
+      // Idempotent per (user_id, plan_id): clear the prior plan's rows, then insert fresh
+      // (the table has no natural unique key, so this avoids accumulating stale allocations).
+      if (body.plan_id) {
+        await pgQuery(`DELETE FROM oms_inventory_allocations WHERE user_id=$1 AND plan_id=$2`, [userId, body.plan_id]);
+      }
+      let n = 0;
+      for (const a of allocations) {
+        const sku = String(a?.sku || '').trim();
+        if (!sku) continue;
+        await pgQuery(
+          `INSERT INTO oms_inventory_allocations
+             (user_id, plan_id, sku, warehouse_code, proposed_units, executable_units, min_viable_units,
+              fill_percent, service_tier, status, constraints)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9,'standard'), COALESCE($10,'projected'), COALESCE($11,'[]')::jsonb)`,
+          [
+            userId,
+            body.plan_id || null,
+            sku,
+            a.warehouse_code || null,
+            Number(a.proposed_units) || 0,
+            Number(a.executable_units) || 0,
+            Number(a.min_viable_units) || 0,
+            Number(a.fill_percent) || 0,
+            a.service_tier || null,
+            a.status || null,
+            a.constraints ? JSON.stringify(a.constraints) : null,
+          ]
+        );
+        n++;
+      }
+      return reply.code(200).send({ ok: true, upserted: n, decision_id: body.decision_id || null });
+    } catch (err: any) {
+      req.log?.error({ err }, '[cortex-inventory-allocation] failed');
+      return reply.code(500).send({ error: err?.message || 'allocation ingest failed' });
+    }
+  });
+
   app.get('/internal/cortex/warehouse-register/health', async (_req, reply) => {
     return reply.code(200).send({ ok: true, route: 'cortex-warehouse-register' });
   });
