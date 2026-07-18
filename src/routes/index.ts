@@ -4,6 +4,7 @@ import { addressRoutes } from './address.routes';
 import { cortexRoutes } from './cortex.routes';
 import { cortexIngestRoutes } from './cortex-ingest.routes';
 import { cortexWarehouseRegisterRoutes } from './cortex-warehouse-register.routes';
+import { omsCortexPlansRoutes } from './oms-cortex-plans.routes';
 import { omsProductionRoutes } from './oms-production.routes';
 import { omsIntelligenceRoutes } from './oms-intelligence.routes';
 import { omsCustomizationRoutes } from './oms-customization.routes';
@@ -25,6 +26,7 @@ export async function registerRoutes(app: FastifyInstance) {
   await cortexRoutes(app);
   await cortexIngestRoutes(app);
   await cortexWarehouseRegisterRoutes(app);
+  await omsCortexPlansRoutes(app);
   await wmsIntegrationRoutes(app);
   await sqlModeRoutes(app);
 }

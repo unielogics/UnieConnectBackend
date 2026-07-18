@@ -139,6 +139,92 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
     }
   });
 
+  // WMS → OMS: relay an owning-warehouse-APPROVED Cortex placement plan to the client's OMS
+  // as a PENDING plan awaiting the CLIENT's own final approval. Stores the plan; moves no stock.
+  // The client's approval (POST /oms/cortex/plans/:id/approve, elsewhere) is the only thing that
+  // triggers a real (still approval-gated) WMS transfer. Idempotent per (user_id, decision_id).
+  app.post('/internal/cortex/relay-plan', async (req: any, reply) => {
+    if (!checkInternalAuth(req)) {
+      return reply.code(401).send({ error: 'invalid internal key' });
+    }
+    const body = req.body as {
+      decisionId?: string;
+      warehouseCode?: string;
+      wmsIntermediaryId?: string;
+      intermediaryNumber?: string;
+      clientId?: string;
+      owningWarehouseCode?: string;
+      plan?: Record<string, unknown>;
+      summary?: string | null;
+      totalSavingsUsd?: number | null;
+    };
+    const decisionId = String(body?.decisionId || '').trim();
+    const clientId = String(body?.clientId || '').trim();
+    if (!decisionId || !clientId) {
+      return reply.code(400).send({ error: 'decisionId and clientId required' });
+    }
+    try {
+      await pgQuery(`
+        CREATE TABLE IF NOT EXISTS oms_cortex_plans (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          decision_id TEXT NOT NULL,
+          user_id TEXT,
+          client_id TEXT NOT NULL,
+          wms_intermediary_id TEXT,
+          intermediary_number TEXT,
+          warehouse_code TEXT,
+          owning_warehouse_code TEXT,
+          plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+          summary TEXT,
+          total_savings_usd NUMERIC,
+          status TEXT NOT NULL DEFAULT 'pending_client_approval',
+          approved_at TIMESTAMPTZ,
+          executed_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE (decision_id)
+        )
+      `);
+      // Resolve the OMS user for this client (link via app_users.origin/owning, else leave null;
+      // the client's own dashboard reads by client_id + user_id when present).
+      let userId: string | null = null;
+      try {
+        const u = await pgQuery<{ id: string }>(
+          `SELECT id FROM app_users WHERE id = $1 OR email = $1 LIMIT 1`,
+          [clientId],
+        );
+        userId = u?.rows[0]?.id || null;
+      } catch { userId = null; }
+
+      await pgQuery(
+        `INSERT INTO oms_cortex_plans
+           (decision_id, user_id, client_id, wms_intermediary_id, intermediary_number,
+            warehouse_code, owning_warehouse_code, plan, summary, total_savings_usd, status, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,'pending_client_approval', now())
+         ON CONFLICT (decision_id) DO UPDATE SET
+           plan = EXCLUDED.plan, summary = EXCLUDED.summary,
+           total_savings_usd = EXCLUDED.total_savings_usd,
+           status = 'pending_client_approval', updated_at = now()`,
+        [
+          decisionId,
+          userId,
+          clientId,
+          body.wmsIntermediaryId || null,
+          body.intermediaryNumber || null,
+          body.warehouseCode || null,
+          body.owningWarehouseCode || null,
+          JSON.stringify(body.plan || {}),
+          body.summary || null,
+          body.totalSavingsUsd ?? null,
+        ],
+      );
+      return reply.code(200).send({ ok: true, decisionId, status: 'pending_client_approval', userLinked: !!userId });
+    } catch (err: any) {
+      req.log?.error({ err }, '[cortex-relay-plan] failed');
+      return reply.code(500).send({ error: err?.message || 'relay-plan failed' });
+    }
+  });
+
   app.get('/internal/cortex/warehouse-register/health', async (_req, reply) => {
     return reply.code(200).send({ ok: true, route: 'cortex-warehouse-register' });
   });

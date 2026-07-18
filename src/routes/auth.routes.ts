@@ -379,6 +379,73 @@ export async function authRoutes(fastify: FastifyInstance) {
     return { token: authToken, user };
   });
 
+  // Public self-signup for direct UnieConnect sellers (no warehouse invite). A direct
+  // seller is self-owned (origin='direct', no owning warehouse) and gets AI optimization
+  // "at the will of the AI": default features PLUS optimize-suite + product-research, and a
+  // Cortex credential provisioned. Warehouse-invited clients still use /auth/invite/signup.
+  fastify.post('/auth/signup', async (req: any, reply) => {
+    const { firstName, lastName, email, phone, password, companyName } = req.body || {};
+    const normalizedEmail = String(email || '').toLowerCase().trim();
+    if (!normalizedEmail || !password) {
+      return reply.code(400).send({ error: 'email and password are required' });
+    }
+    if (String(password).length < 8) {
+      return reply.code(400).send({ error: 'password must be at least 8 characters' });
+    }
+    const existing = await findSqlUserByEmail(normalizedEmail);
+    if (existing) return reply.code(409).send({ error: 'User with this email already exists' });
+
+    const userId = randomUUID();
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const role = normalizeRole('ecommerce_client');
+    // Direct sellers get the AI suite on by default (optimize-suite + product-research)
+    // so the AI can optimize their network nationwide without a warehouse gate.
+    const directFeatures = [...DEFAULT_ENABLED_FEATURE_IDS, 'optimize-suite', 'product-research'];
+    await pgQuery(
+      `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, phone, llc_name, origin, owning_warehouse_code)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'direct', NULL)`,
+      [
+        userId,
+        normalizedEmail,
+        passwordHash,
+        role,
+        trim(firstName) || null,
+        trim(lastName) || null,
+        trim(phone) || null,
+        trim(companyName) || null,
+      ],
+    );
+    await pgQuery(
+      `INSERT INTO user_features (user_id, feature_id, status, payload)
+       SELECT $1, f.id, 'enabled', '{"source":"direct_signup"}'::jsonb
+       FROM features f
+       WHERE f.id = ANY($2::TEXT[])
+       ON CONFLICT (user_id, feature_id) DO NOTHING`,
+      [userId, directFeatures],
+    ).catch(() => null);
+    await pgQuery('UPDATE app_users SET enabled_features = $2::TEXT[] WHERE id = $1', [userId, directFeatures]).catch(() => null);
+    await pgQuery('INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)', [
+      userId,
+      'direct_signup',
+      JSON.stringify({ source: 'unieconnect_public_signup' }),
+    ]).catch(() => null);
+
+    const user = await findSqlUserById(userId);
+    if (!user) return reply.code(500).send({ error: 'User created but could not be loaded' });
+    const authToken = signUser(user);
+    setAuthCookie(reply, req, authToken);
+    // Provision the Cortex credential so AI optimization is ready immediately.
+    void ensureCortexCredentialForUser(userId).catch((err: any) => {
+      req.log?.warn({ err, userId }, 'cortex credential auto-provision failed during direct signup');
+    });
+    if (shouldAutoSeed(normalizedEmail)) {
+      void seedDemoDataForUser(userId).catch((err: any) => {
+        req.log?.warn({ err, userId }, 'demo auto-seed failed during direct signup');
+      });
+    }
+    return { token: authToken, user };
+  });
+
   fastify.post('/auth/request-reset', async (req: any) => {
     const normalizedEmail = String(req.body?.email || '').toLowerCase().trim();
     if (!normalizedEmail) return { success: true };
