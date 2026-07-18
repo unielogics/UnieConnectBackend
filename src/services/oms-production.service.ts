@@ -3377,13 +3377,24 @@ export async function getBillingProfit(
       [userId, windowStart, windowEnd || null],
     );
 
-  const [catRows, whRows, seriesRows, prevCatRows] = await Promise.all([
+  const everRowsFor = () =>
+    rows<{ exists: boolean }>(
+      `SELECT EXISTS(SELECT 1 FROM invoice_lines WHERE user_id = $1 AND amount > 0) AS exists`,
+      [userId],
+    );
+
+  const [catRows, whRows, seriesRows, prevCatRows, everRows] = await Promise.all([
     catRowsFor(start, end),
     whRowsFor(start, end),
     seriesRowsFor(start, end),
     catRowsFor(prevStart, prevEnd),
+    everRowsFor(),
   ]);
   const hasRealInvoices = catRows.some((r) => number(r.total) > 0);
+  // Distinguish "empty window on an account that HAS real invoices" from "brand-new account with no
+  // invoices ever". Only the latter should show the modeled estimate — otherwise an empty window
+  // (e.g. 'Today' before the nightly scheduler runs) must show honest real $0, not fabricated data.
+  const hasAnyInvoicesEver = everRows[0]?.exists === true;
 
   const current = emptyBillingCategoryTotals();
   if (hasRealInvoices) {
@@ -3391,15 +3402,16 @@ export async function getBillingProfit(
       const key = (BILLING_CATEGORY_KEYS.includes(r.category) ? r.category : 'accessorials') as keyof BillingCategoryTotals;
       current[key] = money(current[key] + number(r.total));
     }
-  } else {
-    // Fallback (no WMS invoices synced yet in this window): keep a lightweight estimate so the
-    // screen isn't empty, clearly derived from all-time counts — not fabricated warehouse truth,
-    // and not date-scoped since it isn't derived from real dated activity.
+  } else if (!hasAnyInvoicesEver) {
+    // Brand-new account (zero invoices ever): a lightweight modeled estimate so the screen isn't
+    // empty, clearly derived from all-time counts and labeled source:'estimate'. NOT for an empty
+    // window on an account that has real history — that stays honest $0 (current left as zeros).
     current.freight = money(counts.orders * 1.1);
     current.storage = money(counts.items * 2.2);
     current.handling = money(counts.shipmentPlans * 24);
     current.accessorials = money(counts.shipmentPlans * 9);
   }
+  // else: empty window on an account with real history → real $0 (source will be 'empty').
 
   const previous = emptyBillingCategoryTotals();
   for (const r of prevCatRows) {
@@ -3490,7 +3502,10 @@ export async function getBillingProfit(
       appliedCategories,
     },
     forecast,
-    source: hasRealInvoices ? 'wms_invoices' : 'estimate',
+    // 'wms_invoices' = real charges in this window; 'empty' = account has real invoices but none in
+    // this window (honest $0); 'estimate' = brand-new account, modeled figures.
+    source: hasRealInvoices ? 'wms_invoices' : hasAnyInvoicesEver ? 'empty' : 'estimate',
+    accountHasInvoices: hasAnyInvoicesEver,
   };
 }
 
