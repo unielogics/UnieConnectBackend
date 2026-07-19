@@ -61,8 +61,8 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
         `SELECT id FROM facilities WHERE code = $1 AND user_id IS NULL LIMIT 1`,
         [code]
       );
-      if (existing.rows.length) {
-        const id = existing.rows[0].id;
+      if (existing?.rows?.length) {
+        const id = existing.rows[0]?.id;
         await pgQuery(
           `UPDATE facilities
              SET name = COALESCE($2, name),
@@ -81,7 +81,7 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
          RETURNING id`,
         [code, body.name || code, JSON.stringify(body.address || {}), JSON.stringify(meta)]
       );
-      return reply.code(200).send({ ok: true, facilityId: inserted.rows[0]?.id, status: 'created' });
+      return reply.code(200).send({ ok: true, facilityId: inserted?.rows?.[0]?.id, status: 'created' });
     } catch (err: any) {
       req.log?.error({ err }, '[cortex-warehouse-register] failed');
       return reply.code(500).send({ error: err?.message || 'register failed' });
@@ -243,6 +243,122 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
     } catch (err: any) {
       req.log?.error({ err }, '[cortex-relay-plan] failed');
       return reply.code(500).send({ error: err?.message || 'relay-plan failed' });
+    }
+  });
+
+  // WMS → OMS: attach/detach a PEER-NETWORK warehouse as a secondary rate-shop node on a client's
+  // account. When an operator accepts a peer/partner warehouse for their own warehouse, that peer
+  // should become a second connected + network-eligible warehouse for the operator's clients so
+  // multi-warehouse (single-vs-multi) rate shopping turns on. Peer-accept in the WMS otherwise only
+  // writes Warehouse.network.partners[] and never reaches the client's OMS warehouse links.
+  //
+  // Distinct from /warehouse-register (global facility only, no client link) and from the OMS
+  // /oms/connect bootstrap (full credential-provisioned primary connection). This creates a
+  // lightweight NETWORK-node link tagged metadata.source='peer_partner_network' so detach never
+  // touches a client's real primary/bootstrap connection. Idempotent per (user_id, warehouse_code).
+  app.post('/internal/cortex/client-network-warehouse', async (req: any, reply) => {
+    if (!checkInternalAuth(req)) {
+      return reply.code(401).send({ error: 'invalid internal key' });
+    }
+    const body = req.body as {
+      action?: 'attach' | 'detach';
+      warehouseCode?: string;          // the peer warehouse (WH-X) to add/remove as a network node
+      ownerWarehouseCode?: string;     // the accepting warehouse (e.g. WH-007) — used to resolve clients
+      networkEligible?: boolean;
+      clients?: Array<{
+        omsUserId?: string;
+        wmsIntermediaryId?: string;
+        externalOmsIntermediaryId?: string;
+        intermediaryNumber?: string;
+      }>;
+    };
+    const action = body?.action === 'detach' ? 'detach' : 'attach';
+    const peerCode = String(body?.warehouseCode || '').trim();
+    const ownerCode = String(body?.ownerWarehouseCode || '').trim();
+    const clients = Array.isArray(body?.clients) ? body.clients : [];
+    if (!peerCode || !ownerCode || clients.length === 0) {
+      return reply.code(400).send({ error: 'warehouseCode, ownerWarehouseCode and non-empty clients required' });
+    }
+    const isAppUserId = (v?: string) => !!v && /^[0-9a-fA-F-]{16,40}$/.test(String(v));
+    const results: Array<{ status: string; userId?: string; reason?: string }> = [];
+    try {
+      for (const client of clients) {
+        // 1) Resolve the OMS user_id. The WMS cannot invert the sha1 → the only reliable source is
+        //    the client's EXISTING link on the owner warehouse (metadata carries the WMS ids).
+        let userId: string | null = null;
+        if (isAppUserId(client.omsUserId)) {
+          const u = await pgQuery<{ id: string }>(
+            `SELECT id FROM app_users WHERE id = $1 LIMIT 1`, [client.omsUserId],
+          ).catch(() => ({ rows: [] as any[] }));
+          userId = u?.rows?.[0]?.id || null;
+        }
+        if (!userId) {
+          const l = await pgQuery<{ user_id: string }>(
+            `SELECT user_id FROM oms_warehouse_links
+              WHERE warehouse_code = $1
+                AND ( ($2 <> '' AND metadata->>'wmsIntermediaryId' = $2)
+                   OR ($3 <> '' AND metadata->>'wmsOmsIntermediaryId' = $3)
+                   OR ($4 <> '' AND connection_code = $4) )
+              ORDER BY connected_at DESC NULLS LAST LIMIT 1`,
+            [ownerCode, String(client.wmsIntermediaryId || ''), String(client.externalOmsIntermediaryId || ''), String(client.intermediaryNumber || '')],
+          ).catch(() => ({ rows: [] as any[] }));
+          userId = l?.rows?.[0]?.user_id || null;
+        }
+        if (!userId) {
+          req.log?.warn({ ownerCode, peerCode, client }, '[client-network-warehouse] unresolved OMS user — skipped');
+          results.push({ status: 'skipped', reason: 'unresolved_user' });
+          continue;
+        }
+
+        if (action === 'detach') {
+          // Only remove links this bridge created — never a client's primary/bootstrap connection.
+          await pgQuery(
+            `UPDATE oms_warehouse_links
+                SET status = 'removed', updated_at = now()
+              WHERE user_id = $1 AND warehouse_code = $2 AND metadata->>'source' = 'peer_partner_network'`,
+            [userId, peerCode],
+          ).catch(() => null);
+          results.push({ status: 'detached', userId });
+          continue;
+        }
+
+        // 2) Ensure a per-user facility for the peer warehouse with networkEligible=true (the pricing
+        //    join reads THIS facility's metadata to decide eligibility).
+        const facilityRes = await pgQuery<{ id: string }>(
+          `INSERT INTO facilities (user_id, code, name, facility_type, status, metadata)
+             VALUES ($1, $2, $2, 'warehouse', 'active', $3::jsonb)
+           ON CONFLICT (user_id, code) DO UPDATE SET
+             status = 'active',
+             metadata = facilities.metadata || $3::jsonb,
+             updated_at = now()
+           RETURNING id`,
+          [userId, peerCode, JSON.stringify({ source: 'peer_partner_network', networkEligible: body.networkEligible !== false, ownerWarehouseCode: ownerCode })],
+        ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+        const facilityId = facilityRes?.rows?.[0]?.id || null;
+
+        // 3) Upsert the connected network-node link for the client.
+        await pgQuery(
+          `INSERT INTO oms_warehouse_links (user_id, facility_id, warehouse_code, status, metadata)
+             VALUES ($1, $2, $3, 'connected', $4::jsonb)
+           ON CONFLICT (user_id, warehouse_code) DO UPDATE SET
+             facility_id = EXCLUDED.facility_id,
+             status = 'connected',
+             connected_at = now(),
+             metadata = oms_warehouse_links.metadata || EXCLUDED.metadata,
+             updated_at = now()`,
+          [
+            userId,
+            facilityId,
+            peerCode,
+            JSON.stringify({ source: 'peer_partner_network', ownerWarehouseCode: ownerCode, partnerAcceptedAt: new Date().toISOString() }),
+          ],
+        ).catch((err: any) => { req.log?.error({ err, userId, peerCode }, '[client-network-warehouse] link upsert failed'); });
+        results.push({ status: 'attached', userId });
+      }
+      return reply.code(200).send({ ok: true, action, warehouseCode: peerCode, results });
+    } catch (err: any) {
+      req.log?.error({ err }, '[client-network-warehouse] failed');
+      return reply.code(500).send({ error: err?.message || 'client-network-warehouse failed' });
     }
   });
 
