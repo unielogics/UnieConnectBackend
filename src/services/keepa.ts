@@ -128,10 +128,32 @@ function denormalize(product: any): Partial<KeepaSnapshot> {
   };
 }
 
+/**
+ * Fill any missing denormalized hot-fields from the raw `payload`.
+ *
+ * The Keepa snapshot table is a SHARED cache: this OMS client writes it, but so does Cortex's
+ * own Python KeepaService (incl. its ~60h refresh sweep). Cortex writes a fresh `payload` but
+ * does NOT populate this service's OMS-specific denorm columns (image/description/sales_rank/…),
+ * and rows written before those columns existed also lack them. Either way the result is a
+ * "fresh" row whose hot-fields are null even though the data is right there in `payload`.
+ * Denormalizing only on our own writes can't fix that — so we re-derive missing fields from
+ * `payload` at READ time. Only fills null/undefined fields; never overwrites a real value.
+ */
+function hydrateSnapshot(snap: KeepaSnapshot | null): KeepaSnapshot | null {
+  if (!snap || !snap.ok || !snap.payload) return snap;
+  const derived = denormalize(snap.payload as any);
+  for (const [k, v] of Object.entries(derived)) {
+    if (v != null && (snap as any)[k] == null) {
+      (snap as any)[k] = v;
+    }
+  }
+  return snap;
+}
+
 async function getCached(asin: string, domain: number): Promise<KeepaSnapshot | null> {
   try {
     const res = await ddb().send(new GetCommand({ TableName: TABLE, Key: { asin, domain } }));
-    return (res.Item as KeepaSnapshot) || null;
+    return hydrateSnapshot((res.Item as KeepaSnapshot) || null);
   } catch (err) {
     return null;
   }
