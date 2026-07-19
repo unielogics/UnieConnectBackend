@@ -1722,6 +1722,25 @@ export async function updateOmsSkuEnrichment(userId: string, skuOrId: string, in
     ],
   );
 
+  // Invalidate any cached fulfillment economics for this SKU when a pricing-relevant physical/cost
+  // field was edited. The stored oms_sku_fulfillment_economics row (35-day TTL) is computed from
+  // the catalog snapshot at generation time, so filling in weight/dims/cost/price/supplier would
+  // otherwise keep serving stale "Missing SKU weight/dimensions" blockers until TTL expiry. Deleting
+  // is cheap + correct: the next pricing-preview / SkuDetail read misses the cache and recomputes
+  // fresh from the now-complete catalog data.
+  const pricingFieldTouched =
+    input.weight !== undefined
+    || input.dimensions !== undefined
+    || input.cost !== undefined
+    || input.price !== undefined
+    || input.supplierId !== undefined;
+  if (pricingFieldTouched && (await tableExists('oms_sku_fulfillment_economics'))) {
+    await pgQuery(
+      'DELETE FROM oms_sku_fulfillment_economics WHERE user_id = $1 AND item_id = $2',
+      [userId, current.id],
+    ).catch(() => null);
+  }
+
   await writeOmsLedgerEvent({
     userId,
     entityType: 'sku',
