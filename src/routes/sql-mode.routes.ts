@@ -832,8 +832,11 @@ async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
 
 async function connectedWarehousePricingContext(userId: string) {
   // P1d: load ALL connected links (was LIMIT 1, which re-collapsed a multi-warehouse seller
-  // to a single anchor before Cortex ever saw the network). The most-recently-connected link
-  // stays the anchor; the rest are additional candidates forwarded to Cortex pricing/placement.
+  // to a single anchor before Cortex ever saw the network). The anchor (links[0]) must be the
+  // client's OWNING/primary warehouse, NOT a peer-network node: a peer_partner_network link is a
+  // secondary rate-shop candidate attached by the peer-accept bridge and gets connected_at=now()
+  // when accepted, so a plain "connected_at DESC" order would let a freshly-accepted peer hijack
+  // the anchor slot from the owner. Sort peer links LAST, then most-recent within each group.
   const links = await rows(
     `SELECT
        l.warehouse_code,
@@ -849,7 +852,7 @@ async function connectedWarehousePricingContext(userId: string) {
      FROM oms_warehouse_links l
      LEFT JOIN facilities f ON f.id = l.facility_id
      WHERE l.user_id = $1 AND l.status = 'connected'
-     ORDER BY l.connected_at DESC NULLS LAST`,
+     ORDER BY (COALESCE(l.metadata->>'source', '') = 'peer_partner_network') ASC, l.connected_at DESC NULLS LAST`,
     [userId],
   ).catch(() => []);
   const link = links[0] || null;

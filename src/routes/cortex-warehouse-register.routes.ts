@@ -265,6 +265,13 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
       warehouseCode?: string;          // the peer warehouse (WH-X) to add/remove as a network node
       ownerWarehouseCode?: string;     // the accepting warehouse (e.g. WH-007) — used to resolve clients
       networkEligible?: boolean;
+      // The peer warehouse's physical address, sent by the WMS fan-out. WITHOUT this the peer
+      // facility has no rateable origin, so the single-vs-multi rate shop can't quote it (label
+      // rate unavailable, savings $0). name is the peer's display name.
+      name?: string;
+      address?: Record<string, unknown>;
+      latitude?: number;
+      longitude?: number;
       clients?: Array<{
         omsUserId?: string;
         wmsIntermediaryId?: string;
@@ -323,17 +330,50 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
         }
 
         // 2) Ensure a per-user facility for the peer warehouse with networkEligible=true (the pricing
-        //    join reads THIS facility's metadata to decide eligibility).
+        //    join reads THIS facility's metadata to decide eligibility) AND its physical address
+        //    (the rate shop needs an origin to quote the peer node — without it the single-vs-multi
+        //    card shows "label rate unavailable" and $0 savings). lat/lon may arrive top-level or
+        //    nested in address; the pricing context reads facilities.address {postal,state,lat,lon}.
+        // Strict coordinate parse: reject '', null, boolean, and exactly 0 (Number('')/Number(false)
+        // both coerce to 0 — a (0,0) origin is a bogus ocean point that silently breaks rate shopping).
+        const coord = (v: unknown): number | null => {
+          if (v === '' || v === null || v === undefined || typeof v === 'boolean') return null;
+          const n = Number(v);
+          return Number.isFinite(n) && n !== 0 ? n : null;
+        };
+        const addr = (body.address && typeof body.address === 'object') ? { ...body.address } as Record<string, unknown> : {};
+        const lat = coord(body.latitude ?? (addr.latitude as any) ?? (addr.lat as any));
+        const lon = coord(body.longitude ?? (addr.longitude as any) ?? (addr.lon as any) ?? (addr.lng as any));
+        const hasAddress = Object.keys(addr).length > 0;
+        // Raw name: null when absent so the COALESCE guard actually preserves an existing display name
+        // (defaulting to peerCode here would make NULLIF dead code and clobber a good name on re-attach).
+        const facilityName = String(body.name || '').trim() || null;
         const facilityRes = await pgQuery<{ id: string }>(
-          `INSERT INTO facilities (user_id, code, name, facility_type, status, metadata)
-             VALUES ($1, $2, $2, 'warehouse', 'active', $3::jsonb)
+          `INSERT INTO facilities (user_id, code, name, facility_type, status, address, latitude, longitude, metadata)
+             VALUES ($1, $2, COALESCE($3, $2), 'warehouse', 'active', $4::jsonb, $5, $6, $7::jsonb)
            ON CONFLICT (user_id, code) DO UPDATE SET
              status = 'active',
-             metadata = facilities.metadata || $3::jsonb,
+             name = COALESCE($3, facilities.name),
+             -- Address + coordinates move together: when a non-empty address is sent, take the new
+             -- address AND its (possibly null) coords so we never pair a new address with stale coords.
+             -- When no address is sent, keep the existing address and only fill missing coords.
+             address = CASE WHEN $8 THEN EXCLUDED.address ELSE facilities.address END,
+             latitude = CASE WHEN $8 THEN EXCLUDED.latitude ELSE COALESCE(EXCLUDED.latitude, facilities.latitude) END,
+             longitude = CASE WHEN $8 THEN EXCLUDED.longitude ELSE COALESCE(EXCLUDED.longitude, facilities.longitude) END,
+             metadata = facilities.metadata || $7::jsonb,
              updated_at = now()
            RETURNING id`,
-          [userId, peerCode, JSON.stringify({ source: 'peer_partner_network', networkEligible: body.networkEligible !== false, ownerWarehouseCode: ownerCode })],
-        ).catch(() => ({ rows: [] as Array<{ id: string }> }));
+          [
+            userId,
+            peerCode,
+            facilityName,
+            JSON.stringify(hasAddress ? addr : {}),
+            lat,
+            lon,
+            JSON.stringify({ source: 'peer_partner_network', networkEligible: body.networkEligible !== false, ownerWarehouseCode: ownerCode }),
+            hasAddress,
+          ],
+        ).catch((err: any) => { req.log?.error({ err, userId, peerCode }, '[client-network-warehouse] facility upsert failed'); return { rows: [] as Array<{ id: string }> }; });
         const facilityId = facilityRes?.rows?.[0]?.id || null;
 
         // 3) Upsert the connected network-node link for the client.
