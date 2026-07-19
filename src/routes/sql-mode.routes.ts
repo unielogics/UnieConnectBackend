@@ -843,6 +843,7 @@ async function connectedWarehousePricingContext(userId: string) {
        f.code AS facility_code,
        f.name AS facility_name,
        f.address AS facility_address,
+       f.metadata AS facility_metadata,
        f.latitude,
        f.longitude
      FROM oms_warehouse_links l
@@ -880,6 +881,10 @@ async function connectedWarehousePricingContext(userId: string) {
     const st = trim(addr.state || addr.stateOrProvinceCode || addr.region || addr.province).toUpperCase();
     const lat = number(l?.latitude ?? addr.latitude ?? addr.lat, NaN);
     const lon = number(l?.longitude ?? addr.longitude ?? addr.lon ?? addr.lng, NaN);
+    // networkEligible lives in facilities.metadata (written by the warehouse-register hook).
+    // Absent → treat as eligible (don't silently drop a connected warehouse that predates the flag).
+    const fMeta = json(l?.facility_metadata, {});
+    const networkEligible = fMeta.networkEligible !== false;
     return {
       warehouseCode: code,
       warehouseId: trim(l?.facility_id) || code,
@@ -888,10 +893,15 @@ async function connectedWarehousePricingContext(userId: string) {
       state: st || undefined,
       latitude: Number.isFinite(lat) ? lat : undefined,
       longitude: Number.isFinite(lon) ? lon : undefined,
+      networkEligible,
       isAnchor: idx === 0,
     };
   }).filter(Boolean);
-  const networkPolicy = normalizeNetworkPolicyForCortex(rawNetworkPolicy, warehouseCode);
+  const eligibleCodes = uniqueWarehouseCodes([
+    warehouseCode,
+    warehouses.filter((w: any) => w && w.networkEligible !== false).map((w: any) => w.warehouseCode),
+  ]);
+  const networkPolicy = normalizeNetworkPolicyForCortex(rawNetworkPolicy, warehouseCode, eligibleCodes);
   return {
     warehouseCode,
     facilityId: link?.facility_id || null,
@@ -912,16 +922,22 @@ function uniqueWarehouseCodes(values: unknown[]): string[] {
   return out;
 }
 
-function normalizeNetworkPolicyForCortex(policy: AnyRow | null | undefined, anchorWarehouseCode?: string) {
+function normalizeNetworkPolicyForCortex(policy: AnyRow | null | undefined, anchorWarehouseCode?: string, connectedEligibleCodes?: string[]) {
   const hasWmsPolicy = Boolean(policy && Object.keys(policy).length);
   if (!hasWmsPolicy) {
+    // Self-service (no WMS-managed policy): scope rate shopping to the user's connected +
+    // network-eligible warehouses explicitly (manual mode) instead of leaving it open, so Cortex
+    // honors "warehouses allowed in the OMS". Single warehouse → auto/anchor-only naturally.
+    const eligible = uniqueWarehouseCodes([anchorWarehouseCode, connectedEligibleCodes || []]);
+    const expansion = eligible.filter((c) => c && c !== trim(anchorWarehouseCode).toUpperCase());
+    const manual = expansion.length > 0;
     return {
       policySource: 'self_service',
-      nodeSelectionMode: 'auto',
+      nodeSelectionMode: manual ? 'manual' : 'auto',
       multiWarehouseOptimizationEnabled: true,
       anchorWarehouseCode: anchorWarehouseCode || null,
       anchorWarehouseMustReceiveInventory: false,
-      allowedExpansionWarehouseCodes: [],
+      allowedExpansionWarehouseCodes: expansion,
       blockedExpansionWarehouseCodes: [],
     };
   }
@@ -941,10 +957,27 @@ function normalizeNetworkPolicyForCortex(policy: AnyRow | null | undefined, anch
   };
 }
 
+// The connected warehouses this OMS user may rate-shop across, filtered to network-eligible ones
+// (facilities.metadata.networkEligible). Anchor first. Empty → caller lets Cortex fall back.
+function connectedEligibleWarehouseCodes(context: AnyRow): string[] {
+  const anchor = trim(context.networkPolicy?.anchorWarehouseCode || context.warehouseCode);
+  const eligible = (Array.isArray(context.warehouses) ? context.warehouses : [])
+    .filter((w: any) => w && w.networkEligible !== false)
+    .map((w: any) => trim(w.warehouseCode))
+    .filter(Boolean);
+  return uniqueWarehouseCodes([anchor, eligible]);
+}
+
 function warehouseCodesForCortexPricing(context: AnyRow) {
   const policy = context.networkPolicy || {};
   const anchor = trim(policy.anchorWarehouseCode || context.warehouseCode);
-  if (policy.policySource === 'self_service') return undefined;
+  if (policy.policySource === 'self_service') {
+    // Previously returned undefined (Cortex then rate-shopped ALL connected links, ignoring the
+    // OMS-allowed set). Now scope self-service users to their connected + network-eligible
+    // warehouses so single-vs-multi rate shopping honors "warehouses allowed in the OMS".
+    const codes = connectedEligibleWarehouseCodes(context);
+    return codes.length ? codes : (anchor ? [anchor] : undefined);
+  }
   if (policy.multiWarehouseOptimizationEnabled === false) return anchor ? [anchor] : undefined;
   if (policy.nodeSelectionMode === 'manual') {
     return uniqueWarehouseCodes([anchor, policy.allowedExpansionWarehouseCodes]);
