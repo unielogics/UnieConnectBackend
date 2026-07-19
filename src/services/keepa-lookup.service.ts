@@ -19,6 +19,7 @@ export type KeepaLookupResult = {
   ean?: string | null;
   title?: string | null;
   brand?: string | null;
+  description?: string | null;
   image?: string | null;
   category?: string | null;
   salesRank?: number | null;
@@ -35,14 +36,6 @@ export type KeepaLookupResult = {
   extract?: any | null;
   message?: string;
 };
-
-/** First image token from Keepa `imagesCSV` → an Amazon media URL. */
-function imageFromKeepaPayload(payload: any): string | null {
-  const csv = payload?.imagesCSV || payload?.images;
-  if (typeof csv !== 'string' || !csv.trim()) return null;
-  const token = csv.split(',')[0]?.trim();
-  return token ? `https://m.media-amazon.com/images/I/${token}._SL400_.jpg` : null;
-}
 
 const ASIN_RE = /^[A-Z0-9]{10}$/;
 
@@ -85,7 +78,8 @@ export async function lookupProductByIdentifier(
     ean: ids.ean || (typeof payload.ean === 'string' ? payload.ean : null),
     title: snap.title || null,
     brand: snap.brand || null,
-    image: imageFromKeepaPayload(payload),
+    description: snap.description || null,
+    image: snap.image || null,
     category: snap.category || null,
     salesRank: snap.sales_rank ?? null,
     buyBoxPrice: snap.buybox_price_cents != null ? snap.buybox_price_cents / 100 : null,
@@ -123,6 +117,7 @@ export async function lookupProductByIdentifier(
         const lp = extract.listing_profile || {};
         result.title = result.title || lp.title || null;
         result.brand = result.brand || lp.manufacturer || lp.brand || null;
+        result.description = result.description || lp.description || null;
         result.category = result.category || (Array.isArray(lp.category_labels_guess) ? lp.category_labels_guess[0] : null);
         result.upc = result.upc || lp.upc || null;
         result.ean = result.ean || lp.ean || null;

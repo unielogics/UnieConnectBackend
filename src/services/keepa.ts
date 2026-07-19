@@ -41,6 +41,8 @@ export type KeepaSnapshot = {
   ok: boolean;
   title?: string | null;
   brand?: string | null;
+  description?: string | null;
+  image?: string | null;
   category?: string | null;
   buybox_price_cents?: number | null;
   sales_rank?: number | null;
@@ -90,6 +92,18 @@ function firstCategoryTreeName(product: any): string | null {
   return null;
 }
 
+/**
+ * Keepa's `images` field (present only when the request passes `images=1`) is an ARRAY of
+ * `{ l, m, ... }` filename-token objects — NOT a comma-joined "imagesCSV" string. Build a
+ * real Amazon media URL from the first image's large token.
+ */
+function firstImageUrl(product: any): string | null {
+  const images = product?.images;
+  if (!Array.isArray(images) || !images.length) return null;
+  const token = images[0]?.l || images[0]?.m;
+  return token ? `https://m.media-amazon.com/images/I/${token}` : null;
+}
+
 /** Denormalize the Keepa product into the cache columns. Defensive — every field is best-effort. */
 function denormalize(product: any): Partial<KeepaSnapshot> {
   if (!product) return {};
@@ -100,6 +114,8 @@ function denormalize(product: any): Partial<KeepaSnapshot> {
   return {
     title: product.title || null,
     brand: product.brand || product.manufacturer || null,
+    description: product.description || null,
+    image: firstImageUrl(product),
     category: firstCategoryTreeName(product),
     buybox_price_cents: buyboxCents != null ? buyboxCents : null,
     sales_rank: salesRank != null ? salesRank : null,
@@ -148,7 +164,7 @@ async function writeSnapshot(snapshot: KeepaSnapshot): Promise<void> {
 async function callKeepa(asin: string, domain: number): Promise<{ ok: boolean; product: any | null; raw: any }> {
   const key = process.env.KEEPA_API_KEY;
   if (!key) throw new Error('KEEPA_API_KEY is not configured');
-  const url = `${KEEPA_API_BASE}/product?key=${encodeURIComponent(key)}&domain=${domain}&asin=${encodeURIComponent(asin)}&stats=30`;
+  const url = `${KEEPA_API_BASE}/product?key=${encodeURIComponent(key)}&domain=${domain}&asin=${encodeURIComponent(asin)}&stats=30&images=1`;
   const res = await fetch(url, { method: 'GET' });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -164,7 +180,7 @@ async function callKeepa(asin: string, domain: number): Promise<{ ok: boolean; p
 async function callKeepaCode(code: string, domain: number): Promise<{ ok: boolean; product: any | null; raw: any }> {
   const key = process.env.KEEPA_API_KEY;
   if (!key) throw new Error('KEEPA_API_KEY is not configured');
-  const url = `${KEEPA_API_BASE}/product?key=${encodeURIComponent(key)}&domain=${domain}&code=${encodeURIComponent(code)}&stats=30`;
+  const url = `${KEEPA_API_BASE}/product?key=${encodeURIComponent(key)}&domain=${domain}&code=${encodeURIComponent(code)}&stats=30&images=1`;
   const res = await fetch(url, { method: 'GET' });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
