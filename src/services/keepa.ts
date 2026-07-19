@@ -73,7 +73,9 @@ function mmToIn(mm: unknown): number | null {
 function gToLb(g: unknown): number | null {
   const n = Number(g);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return Number((n / 453.59237).toFixed(3));
+  // 2 decimals to match the catalog Weight (lbs) input's step="0.01" / placeholder="0.00"
+  // (siblings mmToIn/rating already use toFixed(2)); avoids a 3-decimal prefill like 0.123.
+  return Number((n / 453.59237).toFixed(2));
 }
 
 function keepaStatCurrent(product: any, idx: number): number | null {
