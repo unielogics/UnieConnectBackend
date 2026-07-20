@@ -830,7 +830,54 @@ async function getWmsInternal<T = AnyRow>(path: string): Promise<T> {
   return data as T;
 }
 
-async function connectedWarehousePricingContext(userId: string) {
+type GeoPoint = { lat: number; lon: number };
+
+/** Great-circle distance in miles between two lat/lon points. Returns null if either is invalid. */
+function haversineMiles(a?: GeoPoint | null, b?: GeoPoint | null): number | null {
+  if (!a || !b) return null;
+  const { lat: lat1, lon: lon1 } = a;
+  const { lat: lat2, lon: lon2 } = b;
+  if (![lat1, lon1, lat2, lon2].every((n) => Number.isFinite(n))) return null;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const R = 3958.7613; // earth radius, miles
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
+/** Pull a {lat,lon} from a supplier/facility address JSONB (lat/lon may be top-level or nested). */
+function pointFromAddress(address: AnyRow | null | undefined): GeoPoint | null {
+  const a = json(address, {}) as AnyRow;
+  const lat = number(a.latitude ?? a.lat, NaN);
+  const lon = number(a.longitude ?? a.lon ?? a.lng, NaN);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
+}
+
+/** Resolve the supplier location for a SKU (its catalog_items.supplier_id → suppliers.address).
+ *  Best-effort: returns null when there's no supplier or no geocoded address. Drives the
+ *  closest-warehouse-to-supplier anchor selection in connectedWarehousePricingContext. */
+async function supplierLocationForItem(userId: string, itemIdOrSku?: string): Promise<GeoPoint | null> {
+  const key = trim(itemIdOrSku);
+  if (!key) return null;
+  try {
+    const row = await one<{ address: any }>(
+      `SELECT s.address
+         FROM catalog_items c
+         JOIN suppliers s ON s.id = c.supplier_id AND s.user_id = c.user_id
+        WHERE c.user_id = $1 AND (c.id = $2 OR c.sku = $2)
+        LIMIT 1`,
+      [userId, key],
+    );
+    return pointFromAddress(row?.address);
+  } catch {
+    return null;
+  }
+}
+
+async function connectedWarehousePricingContext(userId: string, supplierLocation?: GeoPoint | null) {
   // P1d: load ALL connected links (was LIMIT 1, which re-collapsed a multi-warehouse seller
   // to a single anchor before Cortex ever saw the network). The anchor (links[0]) must be the
   // client's OWNING/primary warehouse, NOT a peer-network node: a peer_partner_network link is a
@@ -855,6 +902,21 @@ async function connectedWarehousePricingContext(userId: string) {
      ORDER BY (COALESCE(l.metadata->>'source', '') = 'peer_partner_network') ASC, l.connected_at DESC NULLS LAST`,
     [userId],
   ).catch(() => []);
+  // Closest-warehouse-to-supplier anchor: when a supplier location is known, the receiving anchor
+  // (links[0] = the "single warehouse" baseline + where the client ships) is the connected +
+  // network-eligible warehouse GEOGRAPHICALLY closest to the supplier — even if that's a peer. This
+  // supersedes the peer-sorts-last order (which only breaks ties when no supplier geography exists).
+  if (supplierLocation && Array.isArray(links) && links.length > 1) {
+    const distFor = (l: any): number => {
+      const pt =
+        (Number.isFinite(number(l?.latitude, NaN)) && Number.isFinite(number(l?.longitude, NaN)))
+          ? { lat: number(l.latitude, NaN), lon: number(l.longitude, NaN) }
+          : pointFromAddress(l?.facility_address);
+      const d = haversineMiles(supplierLocation, pt);
+      return d == null ? Number.POSITIVE_INFINITY : d; // links with no geo sort last
+    };
+    links.sort((a: any, b: any) => distFor(a) - distFor(b));
+  }
   const link = links[0] || null;
   const metadata = json(link?.metadata, {});
   const rawNetworkPolicy = metadata?.networkPolicy || metadata?.network_policy || null;
@@ -1440,7 +1502,13 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
     : optimizedHubCount > 1
       ? money(Math.max(3.95, domesticLabelPerUnit * 0.82))
       : domesticLabelPerUnit;
-  const twoNodeTransferPerUnit = isPrep || optimizedHubCount < 2 ? 0 : money(0.06);
+  // LTL inter-warehouse transfer per unit — a weight-scaled estimate (offline model; the live
+  // Cortex path computes a real lane rate). Replaces the old flat $0.06 which made the multi total
+  // look like label-only. Small floor so a routed unit always carries a non-trivial transfer cost.
+  const twoNodeTransferPerUnit = isPrep || optimizedHubCount < 2 ? 0 : money(Math.max(0.35, weight * 0.12));
+  // Optimized/multi reuses the single-node non-label fulfillment stack = "inherit anchor rates"
+  // (receiving/pick/pack/handling/materials/storage). This is intentional: a peer node without its
+  // own pricing profile is priced at the anchor's fulfillment rates, never $0.
   const nonLabelCurrentPerUnit = money(totalPerUnit - domesticLabelPerUnit);
   const optimizedPerUnit = isPrep
     ? totalPerUnit
@@ -1493,6 +1561,7 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
       transferPerUnit: fallbackOptimizedBlockedReason ? null : twoNodeTransferPerUnit,
       totalPerUnit: fallbackOptimizedBlockedReason ? null : optimizedPerUnit,
       savingsPerUnit: fallbackOptimizedBlockedReason ? null : money(Math.max(0, totalPerUnit - optimizedPerUnit)),
+      optimizedFulfillmentRatesSource: 'anchor_inherited',
       source: !multiWarehouseAllowed
         ? 'modeled_only_network_policy_blocked'
         : optimizedHubCount > 1
@@ -3332,7 +3401,10 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const workflowType = normalizeWorkflowType(req.body || {});
     const items = await pricingItemsWithCatalog(userId, req.body?.items);
     const units = items.reduce((sum: number, item: any) => sum + number(item.quantity, 1), 0);
-    const context = await connectedWarehousePricingContext(userId);
+    // Anchor to the warehouse closest to the plan's supplier (first item's supplier as the proxy).
+    const firstItem = items[0] as AnyRow | undefined;
+    const supplierLocation = firstItem ? await supplierLocationForItem(userId, trim(firstItem.itemId || firstItem.id || firstItem.sku)) : null;
+    const context = await connectedWarehousePricingContext(userId, supplierLocation);
     const cached = await latestSkuEconomics(userId, items, workflowType, context.warehouseCode || null);
     const cachedEconomics = items
       .map((item: AnyRow) => {
@@ -3440,7 +3512,6 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     const workflowType = normalizeWorkflowType(req.query || {});
-    const context = await connectedWarehousePricingContext(userId);
     const item = await one(
       `SELECT id, sku, title, weight, dimensions, metadata
        FROM catalog_items
@@ -3449,6 +3520,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       [userId, req.params.skuId],
     );
     if (!item) return reply.code(404).send({ error: 'SKU not found' });
+    const supplierLocation = await supplierLocationForItem(userId, item.id || item.sku);
+    const context = await connectedWarehousePricingContext(userId, supplierLocation);
     const cached = await latestSkuEconomics(userId, [{ itemId: item.id }], workflowType, context.warehouseCode || null);
     const row = cached.get(String(item.id));
     const economics = row ? mapSkuEconomicsRow(row) : null;
@@ -3614,7 +3687,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     );
     if (!item) return reply.code(404).send({ error: 'SKU not found' });
     const items = await pricingItemsWithCatalog(userId, [{ ...(req.body?.item || {}), itemId: item.id, sku: item.sku, quantity: number(req.body?.quantity, 1) }]);
-    const context = await connectedWarehousePricingContext(userId);
+    const supplierLocation = await supplierLocationForItem(userId, item.id || item.sku);
+    const context = await connectedWarehousePricingContext(userId, supplierLocation);
     const cortex = await postCortex('/v1/oms/sku-fulfillment-economics', {
       userId,
       items,
@@ -3862,6 +3936,150 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         createdAt: iso(asn?.created_at),
       },
       plan: mapShipmentPlan({ ...plan, status: 'asn_created' }),
+    };
+  });
+
+  // The client accepted the suggested multi-warehouse plan in the shipment wizard's step 4. The
+  // client ships ALL units to ONE receiving warehouse (the anchor, closest to the supplier); we
+  // cross-dock a routed portion at the anchor and LTL it to the second warehouse. This resolves the
+  // anchor + second node + the routed split from the plan's items and the stored networkComparison,
+  // then asks the WMS to stage the receiving Cross-Docking ASN + the approval-gated transfer. The
+  // client never ships to two warehouses; nothing moves stock until the warehouse operator receives.
+  app.post('/shipment-plans/:id/accept-multi-warehouse', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const plan = await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
+    if (!plan) return reply.code(404).send({ error: 'Shipment plan not found' });
+
+    // Idempotency: an already-accepted plan returns its stored result instead of re-staging a
+    // second receiving ASN + second cross-dock transfer (double cross-dock on retry/double-click).
+    if (plan.status === 'multi_warehouse_accepted') {
+      const mw = (json(plan.metadata, {}) as AnyRow)?.multiWarehouse || {};
+      return {
+        ok: true,
+        alreadyAccepted: true,
+        anchorWarehouseCode: mw.anchorWarehouseCode || null,
+        secondWarehouseCode: mw.secondWarehouseCode || null,
+        wms: mw.wms || null,
+        plan: mapShipmentPlan(plan),
+      };
+    }
+
+    const planItems: AnyRow[] = Array.isArray(json(plan.items, [])) ? json(plan.items, []) : [];
+    if (planItems.length === 0) return reply.code(400).send({ error: 'Plan has no items' });
+
+    // Anchor = warehouse closest to the plan's supplier; second node = the multi-warehouse partner.
+    const supplierLocation = await supplierLocationForItem(userId, trim(planItems[0]?.itemId || planItems[0]?.sku))
+      || pointFromAddress(json(plan.ship_from_address, {}));
+    const context = await connectedWarehousePricingContext(userId, supplierLocation);
+    const anchorCode = trim(context.warehouseCode).toUpperCase();
+    if (!anchorCode) return reply.code(400).send({ error: 'No connected warehouse to receive this shipment' });
+    const eligibleCodes = connectedEligibleWarehouseCodes(context).map((c) => trim(c).toUpperCase());
+    const eligible = eligibleCodes.filter((c) => c && c !== anchorCode);
+    // A client-supplied secondWarehouseCode must still be a connected+eligible node distinct from
+    // the anchor — never trust the request body to route to an arbitrary/unauthorized warehouse.
+    const requestedSecond = trim(req.body?.secondWarehouseCode).toUpperCase();
+    const secondCode = requestedSecond
+      ? (eligible.includes(requestedSecond) ? requestedSecond : '')
+      : (eligible[0] || '');
+    if (requestedSecond && !eligible.includes(requestedSecond)) {
+      return reply.code(400).send({ error: 'second_warehouse_not_eligible', message: `${requestedSecond} is not a connected, network-eligible warehouse for this client.` });
+    }
+    if (!secondCode || secondCode === anchorCode) {
+      return reply.code(400).send({ error: 'multi_warehouse_unavailable', message: 'No distinct second warehouse is eligible for this client.' });
+    }
+
+    // Resolve the WMS intermediary identity from the client's OWNER/primary connected link — NOT the
+    // geographic anchor, which may be a peer_partner_network node whose bridge-created link lacks the
+    // WMS ids. The identity link is the non-peer connected link carrying wmsIntermediaryId.
+    const identityLink = await one<{ metadata: any }>(
+      `SELECT metadata FROM oms_warehouse_links
+        WHERE user_id = $1 AND status = 'connected'
+          AND COALESCE(metadata->>'source','') <> 'peer_partner_network'
+          AND (metadata ? 'wmsIntermediaryId' OR metadata ? 'wmsOmsIntermediaryId')
+        ORDER BY connected_at DESC NULLS LAST LIMIT 1`,
+      [userId],
+    );
+    const linkMeta = json(identityLink?.metadata, {});
+    const wmsIntermediaryId = trim(linkMeta.wmsIntermediaryId || linkMeta.wmsOmsIntermediaryId);
+    if (!wmsIntermediaryId) {
+      return reply.code(409).send({ error: 'wms_identity_unresolved', message: 'Client is not linked to a WMS intermediary.' });
+    }
+
+    // Ship-from (supplier) address for the receiving ASN vendor.
+    const supplier = plan.supplier_id
+      ? await one<{ name: string; address: any }>('SELECT name, address FROM suppliers WHERE id = $1 AND user_id = $2', [plan.supplier_id, userId])
+      : null;
+    const supplierAddr = json(supplier?.address, json(plan.ship_from_address, {}));
+
+    // Compute the routed split per item. Default routing = half the units to the second node
+    // (rounded down), overridable per SKU via req.body.routing { [sku|itemId]: routedUnits }.
+    const routingOverride: AnyRow = (req.body?.routing && typeof req.body.routing === 'object') ? req.body.routing : {};
+    const lineItems = planItems.map((it) => {
+      const sku = trim(it.sku || it.wmsSku);
+      const quantity = Math.max(0, Math.floor(number(it.quantity ?? (number(it.boxCount, 0) * number(it.unitsPerBox, 0)), 0)));
+      const override = number(routingOverride[sku] ?? routingOverride[trim(it.itemId)], NaN);
+      const routedQuantity = Number.isFinite(override) ? Math.max(0, Math.min(quantity, Math.floor(override))) : Math.floor(quantity / 2);
+      return {
+        sku,
+        wmsSku: trim(it.wmsSku) || sku,
+        itemName: trim(it.title || it.itemName || sku),
+        quantity,
+        routedQuantity,
+        unitsPerContainer: number(it.unitsPerBox ?? it.unitsPerContainer, undefined as any) || undefined,
+        containersCount: number(it.boxCount ?? it.containersCount, undefined as any) || undefined,
+        image: trim(it.imageUrl || it.image) || undefined,
+      };
+    }).filter((l) => l.sku && l.quantity > 0);
+
+    if (!lineItems.some((l) => l.routedQuantity > 0)) {
+      return reply.code(400).send({ error: 'no_routed_units', message: 'No units selected to route to the second warehouse.' });
+    }
+
+    let wms: AnyRow | null = null;
+    try {
+      wms = await callWmsInternal('/internal/oms/multi-warehouse-shipment', {
+        anchorWarehouseCode: anchorCode,
+        secondWarehouseCode: secondCode,
+        wmsIntermediaryId,
+        omsSupplierId: plan.supplier_id || undefined,
+        // Deterministic per-plan PO so a retry hits the WMS duplicate-PO path (idempotent recovery)
+        // instead of minting a second receiving ASN.
+        poNumber: `UC-MW-${plan.id}`,
+        planId: plan.id,
+        shipFromAddress: {
+          name: supplier?.name || supplierAddr.name,
+          addressLine1: supplierAddr.addressLine1 || supplierAddr.street,
+          city: supplierAddr.city,
+          stateOrProvinceCode: supplierAddr.stateOrProvinceCode || supplierAddr.state,
+          postalCode: supplierAddr.postalCode || supplierAddr.zipCode,
+          countryCode: supplierAddr.countryCode || supplierAddr.country || 'US',
+        },
+        lineItems,
+        transferRate: req.body?.transferRate || undefined,
+      });
+    } catch (err: any) {
+      req.log?.error({ err, planId: plan.id }, 'accept-multi-warehouse WMS call failed');
+      return reply.code(502).send({ error: 'wms_execute_failed', message: err?.message || 'WMS could not stage the multi-warehouse shipment.' });
+    }
+
+    await pgQuery(
+      `UPDATE shipment_plans SET status = 'multi_warehouse_accepted',
+         metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb, updated_at = now()
+       WHERE id = $1 AND user_id = $2`,
+      [plan.id, userId, JSON.stringify({ multiWarehouse: { anchorWarehouseCode: anchorCode, secondWarehouseCode: secondCode, acceptedAt: new Date().toISOString(), wms } })],
+    ).catch(() => null);
+    await pgQuery(
+      'INSERT INTO shipment_activity_log (user_id, shipment_plan_id, action, summary, payload) VALUES ($1, $2, $3, $4, $5::jsonb)',
+      [userId, plan.id, 'multi_warehouse_accepted', `Client accepted multi-warehouse plan: ship to ${anchorCode}, cross-dock to ${secondCode}.`, JSON.stringify({ anchorCode, secondCode, wms })],
+    ).catch(() => null);
+
+    return {
+      ok: true,
+      anchorWarehouseCode: anchorCode,
+      secondWarehouseCode: secondCode,
+      wms,
+      plan: mapShipmentPlan({ ...plan, status: 'multi_warehouse_accepted' }),
     };
   });
 
