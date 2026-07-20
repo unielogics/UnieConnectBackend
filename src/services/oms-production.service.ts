@@ -283,6 +283,10 @@ function mapOmsSupplier(row: Row, skuCount = 0) {
     notes: metadata.notes || null,
     country: address.countryCode || address.country || metadata.country || null,
     region: address.stateOrProvinceCode || address.state || address.city || metadata.region || null,
+    // Distinct city/state so the UI can render "City, State" and detect an address-less (online) supplier.
+    city: address.city || metadata.city || null,
+    state: address.stateOrProvinceCode || address.state || metadata.state || null,
+    onlineSupplier: Boolean(metadata.onlineSupplier ?? false),
     leadTime: metadata.leadTimeDays ?? metadata.leadTime,
     onTime: metadata.onTimeRate ?? metadata.onTime,
     qualityPass: metadata.qualityPassRate ?? metadata.qualityPass,
