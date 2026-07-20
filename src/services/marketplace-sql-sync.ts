@@ -5,6 +5,7 @@ import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { ebayGet } from './ebay';
 import { setSyncStatus } from './channel-sync-status';
+import { pushOrderToWms } from '../routes/sql-mode.routes';
 
 type PullResult = { products?: number; orders?: number; customers?: number; inventory?: number; errors?: Record<string, string> };
 
@@ -296,6 +297,18 @@ async function upsertOrder(ctx: SyncContext, channel: 'shopify' | 'ebay', raw: a
         JSON.stringify({ source: `${channel}_sync`, raw: line }),
       ],
     );
+  }
+
+  // Push to the WMS once per order — subsequent polls of the same order shouldn't re-push (the
+  // WMS/upsertWmsOrder match is idempotent, but skip the redundant network call). Never throws:
+  // a WMS-side failure must not abort the rest of this sync batch.
+  const wmsStatus = (order.metadata as any)?.wms?.status;
+  if (wmsStatus !== 'pushed') {
+    try {
+      await pushOrderToWms(ctx.userId, order.id);
+    } catch (err: any) {
+      ctx.log?.warn?.({ err, orderId: order.id, channel }, 'pushOrderToWms failed during marketplace sync');
+    }
   }
 }
 

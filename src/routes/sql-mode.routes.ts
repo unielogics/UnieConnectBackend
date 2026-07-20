@@ -975,6 +975,141 @@ async function connectedWarehousePricingContext(userId: string, supplierLocation
   };
 }
 
+/** Split a display name into WMS-required firstName/lastName (customers.name is a single field). */
+function splitCustomerName(name?: string | null): { firstName: string; lastName: string } {
+  // The WMS hard-requires BOTH a non-empty firstName and lastName (internal-order.controller.ts).
+  // A missing name or a single-token name (guest checkouts, usernames) must never yield an empty
+  // lastName — that would 400 every push and the push would fail identically on every retry.
+  const trimmed = trim(name);
+  if (!trimmed) return { firstName: 'Customer', lastName: 'Order' };
+  const parts = trimmed.split(/\s+/);
+  const firstName = parts[0] || 'Customer';
+  const lastName = parts.slice(1).join(' ') || firstName;
+  return { firstName, lastName };
+}
+
+/**
+ * Push a native OMS order into the WMS so it becomes a real warehouse Order + picking task.
+ * Every order-ingestion path (manual create, marketplace sync, Amazon pull) must call this — it
+ * was previously entirely missing (the old Mongo-era wms-order-creation.service.ts/createOrderInWms
+ * was deleted during the Postgres migration and never replaced), so OMS orders were created
+ * OMS-only with no WMS-side effect at all.
+ *
+ * Reuses callWmsInternal (shared-secret auth, the same mechanism the WMS's
+ * /internal/oms/order/create route is gated by) and connectedWarehousePricingContext (anchor
+ * warehouse selection). alternativeOrderNumber = this order's own OMS id — the WMS stamps that
+ * on its Order doc, and the EXISTING WMS→OMS reverse sync (emitOrderToOms → /internal/wms/events
+ * → upsertWmsOrder) matches back on that same field, so once this push lands the order's status
+ * updates flow back automatically with no further changes needed on either side.
+ *
+ * Never throws: a WMS outage, unlinked client, or WMS-side rejection (insufficient inventory,
+ * backorder limit) must never break OMS order creation. The outcome is recorded on
+ * orders.metadata.wms and as an oms_execution_ledger entry so an operator can see/retry it.
+ */
+export async function pushOrderToWms(userId: string, orderId: string): Promise<{
+  ok: boolean;
+  warehouseCode?: string;
+  wmsOrderNumber?: string;
+  error?: string;
+}> {
+  // Atomically claim the push before doing any work: the WMS has no dedup of its own on
+  // alternativeOrderNumber (a duplicate call creates a fully separate WMS order + picking task +
+  // inventory reservation), so this OMS-side conditional UPDATE is the only guard against two
+  // concurrent callers (e.g. an overlapping marketplace poll + a manual retry) both pushing the
+  // same order. Only the caller whose UPDATE actually matches a row proceeds to call the WMS;
+  // everyone else sees 0 rows updated and backs off immediately.
+  const claim = await pgQuery(
+    `UPDATE orders SET metadata = COALESCE(metadata,'{}'::jsonb) || $2::jsonb, updated_at = now()
+     WHERE id = $1 AND user_id = $3
+       AND COALESCE(metadata->'wms'->>'status', '') <> 'pushed'
+       -- A 'pushing' claim only blocks a second caller for 5 minutes — beyond that, treat it as a
+       -- crashed/never-completed attempt (this call is synchronous within one request) and let a
+       -- retry re-claim it, so a stuck request can never permanently block the manual retry endpoint.
+       AND (
+         COALESCE(metadata->'wms'->>'status', '') <> 'pushing'
+         OR (metadata->'wms'->>'claimedAt')::timestamptz < now() - interval '5 minutes'
+       )
+     RETURNING id`,
+    [orderId, JSON.stringify({ wms: { status: 'pushing', claimedAt: new Date().toISOString() } }), userId],
+  ).catch(() => null);
+  if (!claim?.rows?.length) {
+    return { ok: false, error: 'already_pushed_or_pushing' };
+  }
+
+  try {
+    const order = await one<AnyRow>('SELECT * FROM orders WHERE id = $1 AND user_id = $2', [orderId, userId]);
+    if (!order) return { ok: false, error: 'order_not_found' };
+
+    const lines = await rows<AnyRow>('SELECT * FROM order_lines WHERE order_id = $1 AND user_id = $2', [orderId, userId]);
+    if (!lines.length) return { ok: false, error: 'order_has_no_lines' };
+
+    const context = await connectedWarehousePricingContext(userId);
+    const warehouseCode = trim(context.warehouseCode);
+    if (!warehouseCode) {
+      const error = 'no_connected_warehouse';
+      await pgQuery(
+        `UPDATE orders SET metadata = COALESCE(metadata,'{}'::jsonb) || $2::jsonb, updated_at = now() WHERE id = $1`,
+        [orderId, JSON.stringify({ wms: { status: 'push_failed', error, pushedAt: new Date().toISOString() } })],
+      ).catch(() => null);
+      await writeLedger(userId, {
+        entityType: 'order', entityId: orderId, eventType: 'wms_push_failed', sourceSystem: 'wms_push',
+        summary: `Could not push order to WMS: ${error}.`, payload: { error },
+      });
+      return { ok: false, error };
+    }
+
+    const customer = order.customer_id
+      ? await one<AnyRow>('SELECT * FROM customers WHERE id = $1 AND user_id = $2', [order.customer_id, userId])
+      : null;
+    const { firstName, lastName } = splitCustomerName(customer?.name);
+    const shipTo = wmsBillingAddress(order.shipping_address);
+
+    const payload = {
+      warehouseCode,
+      omsIntermediaryId: wmsExternalOmsObjectId(userId),
+      customer: {
+        firstName,
+        lastName,
+        email: customer?.email || undefined,
+        phone: customer?.phone || undefined,
+        ...shipTo,
+      },
+      lineItems: lines.map((l) => ({
+        sku: l.sku,
+        quantity: Math.max(1, number(l.quantity, 1)),
+        itemName: l.title || l.sku,
+        unitPrice: number(l.unit_price, 0),
+      })),
+      alternativeOrderNumber: order.id,
+      shipByDate: order.ship_by_date || undefined,
+      serviceLevel: order.service_level || undefined,
+    };
+
+    const wmsResult = await callWmsInternal<{ orderId: string; orderNumber: string }>('/internal/oms/order/create', payload);
+    await pgQuery(
+      `UPDATE orders SET metadata = COALESCE(metadata,'{}'::jsonb) || $2::jsonb, updated_at = now() WHERE id = $1`,
+      [orderId, JSON.stringify({ wms: { status: 'pushed', warehouseCode, orderNumber: wmsResult.orderNumber, wmsOrderId: wmsResult.orderId, pushedAt: new Date().toISOString() } })],
+    ).catch(() => null);
+    await writeLedger(userId, {
+      entityType: 'order', entityId: orderId, eventType: 'wms_push_succeeded', sourceSystem: 'wms_push',
+      summary: `Order pushed to WMS ${warehouseCode} as ${wmsResult.orderNumber}.`,
+      payload: { warehouseCode, wmsOrderNumber: wmsResult.orderNumber },
+    });
+    return { ok: true, warehouseCode, wmsOrderNumber: wmsResult.orderNumber };
+  } catch (err: any) {
+    const error = err?.payload?.error || err?.message || 'wms_push_failed';
+    await pgQuery(
+      `UPDATE orders SET metadata = COALESCE(metadata,'{}'::jsonb) || $2::jsonb, updated_at = now() WHERE id = $1`,
+      [orderId, JSON.stringify({ wms: { status: 'push_failed', error: String(error), pushedAt: new Date().toISOString() } })],
+    ).catch(() => null);
+    await writeLedger(userId, {
+      entityType: 'order', entityId: orderId, eventType: 'wms_push_failed', sourceSystem: 'wms_push',
+      summary: `Could not push order to WMS: ${error}.`, payload: { error: String(error), status: err?.status },
+    });
+    return { ok: false, error: String(error) };
+  }
+}
+
 function uniqueWarehouseCodes(values: unknown[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -3121,7 +3256,27 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       summary: `Manual OMS order ${result.order.order_number || result.order.external_order_id || result.order.id} created with ${result.lines.length} line item(s).`,
       payload: { source: body.source || 'oms_manual', lineCount: result.lines.length, total },
     });
-    return mapOrder(result.order, result.lines);
+    // Push to the WMS immediately so the operator sees warehouse status right away. Never throws —
+    // a WMS-side failure still returns the created OMS order (see pushOrderToWms doc comment).
+    const wms = await pushOrderToWms(userId, result.order.id);
+    return { ...mapOrder(result.order, result.lines), wms };
+  });
+
+  // Manual retry for an order whose WMS push failed (or was never attempted) — lets an operator
+  // recover from a transient WMS outage or a since-fixed connection issue without needing a
+  // backend fix. Reuses the exact same push path as order creation.
+  app.post('/orders/:id/push-to-wms', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const order = await one<AnyRow>('SELECT id, metadata FROM orders WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
+    if (!order) return reply.code(404).send({ error: 'Order not found' });
+    const currentWmsStatus = json(order.metadata, {})?.wms?.status;
+    if (currentWmsStatus === 'pushed') {
+      return { ok: true, alreadyPushed: true, wms: json(order.metadata, {}).wms };
+    }
+    const wms = await pushOrderToWms(userId, order.id);
+    if (!wms.ok) return reply.code(502).send({ error: wms.error || 'wms_push_failed', wms });
+    return { ok: true, wms };
   });
 
   app.get('/orders/:id', async (req: any, reply) => {

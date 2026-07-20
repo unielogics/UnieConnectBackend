@@ -4,6 +4,7 @@ import { config } from '../config/env';
 import { pgQuery } from '../db/postgres';
 import { refreshAccessToken } from './amazon-auth';
 import { setSyncStatus } from './channel-sync-status';
+import { pushOrderToWms } from '../routes/sql-mode.routes';
 
 const aws4 = require('aws4');
 
@@ -224,6 +225,17 @@ async function upsertAmazonOrder(params: { userId: string; channelAccountId: str
        WHERE id = $1 AND user_id = $2`,
       [saved.id, userId, JSON.stringify({ amazonOrderItemsSync: 'failed_or_not_authorized' })],
     );
+  }
+
+  // Push to the WMS once per order (subsequent poll cycles skip — the WMS-side match is
+  // idempotent, but avoid the redundant network call). Never throws: a WMS failure must not
+  // abort the rest of this Amazon sync batch.
+  if ((saved.metadata as any)?.wms?.status !== 'pushed') {
+    try {
+      await pushOrderToWms(userId, saved.id);
+    } catch {
+      // logged/recorded inside pushOrderToWms; swallow here so the batch continues
+    }
   }
   return true;
 }
