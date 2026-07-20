@@ -4017,7 +4017,11 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const routingOverride: AnyRow = (req.body?.routing && typeof req.body.routing === 'object') ? req.body.routing : {};
     const lineItems = planItems.map((it) => {
       const sku = trim(it.sku || it.wmsSku);
-      const quantity = Math.max(0, Math.floor(number(it.quantity ?? (number(it.boxCount, 0) * number(it.unitsPerBox, 0)), 0)));
+      // Plan items carry EITHER an explicit quantity, or a carton count × units/carton. Different
+      // creation paths use boxCount/unitsPerBox vs cartons/unitsPerCarton — accept all shapes.
+      const cartons = number(it.boxCount ?? it.cartons ?? it.containersCount, 0);
+      const perCarton = number(it.unitsPerBox ?? it.unitsPerCarton ?? it.unitsPerContainer, 0);
+      const quantity = Math.max(0, Math.floor(number(it.quantity ?? (cartons * perCarton), 0)));
       const override = number(routingOverride[sku] ?? routingOverride[trim(it.itemId)], NaN);
       const routedQuantity = Number.isFinite(override) ? Math.max(0, Math.min(quantity, Math.floor(override))) : Math.floor(quantity / 2);
       return {
@@ -4026,8 +4030,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         itemName: trim(it.title || it.itemName || sku),
         quantity,
         routedQuantity,
-        unitsPerContainer: number(it.unitsPerBox ?? it.unitsPerContainer, undefined as any) || undefined,
-        containersCount: number(it.boxCount ?? it.containersCount, undefined as any) || undefined,
+        unitsPerContainer: number(it.unitsPerBox ?? it.unitsPerCarton ?? it.unitsPerContainer, undefined as any) || undefined,
+        containersCount: number(it.boxCount ?? it.cartons ?? it.containersCount, undefined as any) || undefined,
         image: trim(it.imageUrl || it.image) || undefined,
       };
     }).filter((l) => l.sku && l.quantity > 0);
