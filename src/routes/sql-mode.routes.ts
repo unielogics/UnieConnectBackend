@@ -129,6 +129,36 @@ function supplierMetadataFromBody(body: any) {
   return metadata;
 }
 
+/** Normalize a supplier address payload before it's stored: fold the `lat`/`long` spelling
+ *  (used by the legacy /suppliers page's address form) onto the canonical `latitude`/`longitude`
+ *  keys that pointFromAddress() actually reads — otherwise a saved address's longitude is
+ *  silently unusable for every distance-based routing decision (found live this session: the
+ *  address form sends `long`, but the geo helper only ever checked `lon`/`lng`). */
+function normalizeSupplierAddress(address: any): Record<string, unknown> {
+  const addr = { ...(address && typeof address === 'object' ? address : {}) };
+  const lat = addr.latitude ?? addr.lat;
+  const lon = addr.longitude ?? addr.lon ?? addr.lng ?? addr.long;
+  if (lat != null && Number.isFinite(Number(lat))) addr.latitude = Number(lat);
+  if (lon != null && Number.isFinite(Number(lon))) addr.longitude = Number(lon);
+  return addr;
+}
+
+/** A non-online supplier must carry enough of a real address to route/geocode by — city + state
+ *  at minimum, matching what the (pre-existing) /suppliers page already enforces client-side.
+ *  This is now enforced server-side too, since the canonical creation surface (NewSupplierModal)
+ *  previously had no address fields at all and could create an address-less non-online supplier
+ *  that silently broke distance-based warehouse routing. Online suppliers are exempt — no
+ *  physical pickup point to require an address for. */
+function supplierAddressSatisfiesOnlineRule(onlineSupplier: boolean, address: any): boolean {
+  if (onlineSupplier) return true;
+  const addr = address && typeof address === 'object' ? address : {};
+  const city = trim(addr.city);
+  const state = trim(addr.state || addr.stateOrProvinceCode || addr.region || addr.province);
+  const hasGeo = Number.isFinite(Number(addr.latitude ?? addr.lat)) && Number.isFinite(Number(addr.longitude ?? addr.lon ?? addr.lng ?? addr.long));
+  const zip = trim(addr.zip || addr.zipCode || addr.postalCode || addr.postal);
+  return Boolean(city && state) || hasGeo || Boolean(city && zip);
+}
+
 function supplierPickupProfile(row: AnyRow) {
   const metadata = json(row.metadata, {});
   const pickup = metadata.pickupProfile || metadata.pickup || {};
@@ -391,9 +421,10 @@ function validateListingPayload(payload: AnyRow) {
   return { required, errors, warnings };
 }
 
-function mapSupplier(row: AnyRow) {
+function mapSupplier(row: AnyRow, lastOrder?: { lastOrderAt?: string | null; lastOrderNumber?: string | null }) {
   const metadata = json(row.metadata, {});
   const pickupProfile = supplierPickupProfile(row);
+  const address = json(row.address, {});
   return {
     _id: row.id,
     id: row.id,
@@ -404,10 +435,15 @@ function mapSupplier(row: AnyRow) {
     email: row.email,
     phone: row.phone,
     status: row.status,
-    address: json(row.address, {}),
+    address,
+    // Distinct city/state so any UI can render "City, State" without unpacking the address blob.
+    city: address.city || metadata.city || null,
+    state: address.state || address.stateOrProvinceCode || metadata.state || null,
     website: metadata.website || null,
     notes: metadata.notes || null,
     onlineSupplier: Boolean(metadata.onlineSupplier ?? false),
+    lastOrderAt: lastOrder?.lastOrderAt ? iso(lastOrder.lastOrderAt) : null,
+    lastOrderNumber: lastOrder?.lastOrderNumber || null,
     hoursOfOperation: pickupProfile.hoursOfOperation,
     loadingDock: pickupProfile.loadingDock,
     maxVehicleSize: pickupProfile.maxVehicleSize,
@@ -424,6 +460,28 @@ function mapSupplier(row: AnyRow) {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
+}
+
+/** Batched "last order" lookup for a set of supplier ids — ONE query for the whole list rather
+ *  than N+1. Reuses the same orders↔order_lines↔catalog_items↔supplier join getOmsSupplierActivity
+ *  already proves out, just grouped by supplier instead of scoped to one. */
+async function lastOrdersBySupplierId(userId: string, supplierIds: string[]): Promise<Map<string, { lastOrderAt: string; lastOrderNumber: string }>> {
+  const ids = Array.from(new Set(supplierIds.filter(Boolean)));
+  const result = new Map<string, { lastOrderAt: string; lastOrderNumber: string }>();
+  if (ids.length === 0) return result;
+  const data = await rows<{ supplier_id: string; order_number: string; at: string }>(
+    `SELECT DISTINCT ON (ci.supplier_id) ci.supplier_id, o.order_number, COALESCE(o.placed_at, o.created_at) AS at
+       FROM orders o
+       INNER JOIN order_lines ol ON ol.order_id = o.id
+       INNER JOIN catalog_items ci ON ci.id = ol.item_id
+      WHERE o.user_id = $1 AND ci.supplier_id = ANY($2::text[])
+      ORDER BY ci.supplier_id, at DESC`,
+    [userId, ids],
+  ).catch(() => []);
+  for (const row of data) {
+    result.set(String(row.supplier_id), { lastOrderAt: row.at, lastOrderNumber: row.order_number });
+  }
+  return result;
 }
 
 function mapCustomer(row: AnyRow) {
@@ -857,20 +915,25 @@ function pointFromAddress(address: AnyRow | null | undefined): GeoPoint | null {
 }
 
 /** Resolve the supplier location for a SKU (its catalog_items.supplier_id → suppliers.address).
- *  Best-effort: returns null when there's no supplier or no geocoded address. Drives the
- *  closest-warehouse-to-supplier anchor selection in connectedWarehousePricingContext. */
+ *  Best-effort: returns null when there's no supplier, no geocoded address, OR the supplier is
+ *  marked online (metadata.onlineSupplier) — an online supplier has no physical pickup point, so
+ *  geography must never drive the anchor for it. Returning null here makes
+ *  connectedWarehousePricingContext fall through to its default owner-first sort (no distance
+ *  override), which is the correct behavior for an online supplier at every call site that
+ *  funnels through this one function. */
 async function supplierLocationForItem(userId: string, itemIdOrSku?: string): Promise<GeoPoint | null> {
   const key = trim(itemIdOrSku);
   if (!key) return null;
   try {
-    const row = await one<{ address: any }>(
-      `SELECT s.address
+    const row = await one<{ address: any; metadata: any }>(
+      `SELECT s.address, s.metadata
          FROM catalog_items c
          JOIN suppliers s ON s.id = c.supplier_id AND s.user_id = c.user_id
         WHERE c.user_id = $1 AND (c.id = $2 OR c.sku = $2)
         LIMIT 1`,
       [userId, key],
     );
+    if (json(row?.metadata, {})?.onlineSupplier) return null;
     return pointFromAddress(row?.address);
   } catch {
     return null;
@@ -3326,7 +3389,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const { limit, offset } = pagination(req.query);
     const data = await rows('SELECT * FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
-    return data.map(mapSupplier);
+    const lastOrders = await lastOrdersBySupplierId(userId, data.map((s: AnyRow) => s.id));
+    return data.map((s: AnyRow) => mapSupplier(s, lastOrders.get(String(s.id))));
   });
 
   app.post('/suppliers', async (req: any, reply) => {
@@ -3335,10 +3399,17 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const body = req.body || {};
     if (!trim(body.name)) return reply.code(400).send({ error: 'name required' });
     const metadata = supplierMetadataFromBody(body);
+    const address = normalizeSupplierAddress(body.address);
+    if (!supplierAddressSatisfiesOnlineRule(Boolean((metadata as any).onlineSupplier), address)) {
+      return reply.code(400).send({
+        error: 'address_required_unless_online',
+        message: 'A ship-from address (city + state, or a valid ZIP/lat-lon) is required unless this supplier is marked as an online supplier.',
+      });
+    }
     const supplier = await one(
       `INSERT INTO suppliers (user_id, name, email, phone, status, address, metadata)
        VALUES ($1, $2, $3, $4, COALESCE($5, 'active'), $6::jsonb, $7::jsonb) RETURNING *`,
-      [userId, trim(body.name), normalizedEmail(body.email) || null, body.phone || null, body.status || 'active', JSON.stringify(body.address || {}), JSON.stringify(metadata)],
+      [userId, trim(body.name), normalizedEmail(body.email) || null, body.phone || null, body.status || 'active', JSON.stringify(address), JSON.stringify(metadata)],
     );
     syncOmsCatalogToConnectedWms(userId, req.log).catch((err: any) =>
       req.log?.warn?.({ err, userId, supplierId: supplier?.id }, 'OMS supplier create WMS catalog sync failed'),
@@ -3358,7 +3429,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const supplier = await one('SELECT * FROM suppliers WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     if (!supplier) return reply.code(404).send({ error: 'Not found' });
-    return mapSupplier(supplier);
+    const lastOrders = await lastOrdersBySupplierId(userId, [supplier.id]);
+    return mapSupplier(supplier, lastOrders.get(String(supplier.id)));
   });
 
   app.patch('/suppliers/:id', async (req: any, reply) => {
@@ -3385,12 +3457,33 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         'contactName',
       ].some((key) => body[key] !== undefined);
     const metadata = hasMetadataPatch ? supplierMetadataFromBody(body) : null;
+    const normalizedAddress = body.address === undefined ? null : normalizeSupplierAddress(body.address);
+
+    // Validate the RESULTING state (existing row merged with this patch), not just the patch in
+    // isolation — a patch that only flips onlineSupplier:false on an already address-less supplier
+    // must still be rejected, and a patch that only changes phone on an already-valid supplier
+    // must not be rejected just because the patch itself doesn't include an address.
+    if (normalizedAddress !== null || (hasMetadataPatch && (metadata as any)?.onlineSupplier !== undefined)) {
+      const existing = await one<{ address: any; metadata: any }>('SELECT address, metadata FROM suppliers WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
+      if (!existing) return reply.code(404).send({ error: 'Not found' });
+      const resultingAddress = normalizedAddress ?? json(existing.address, {});
+      const resultingOnline = Boolean(
+        (metadata as any)?.onlineSupplier !== undefined ? (metadata as any).onlineSupplier : json(existing.metadata, {})?.onlineSupplier,
+      );
+      if (!supplierAddressSatisfiesOnlineRule(resultingOnline, resultingAddress)) {
+        return reply.code(400).send({
+          error: 'address_required_unless_online',
+          message: 'A ship-from address (city + state, or a valid ZIP/lat-lon) is required unless this supplier is marked as an online supplier.',
+        });
+      }
+    }
+
     const supplier = await one(
       `UPDATE suppliers
        SET name = COALESCE($3, name), email = COALESCE($4, email), phone = COALESCE($5, phone), status = COALESCE($6, status),
            address = COALESCE($7::jsonb, address), metadata = metadata || COALESCE($8::jsonb, '{}'::jsonb), updated_at = now()
        WHERE id = $1 AND user_id = $2 RETURNING *`,
-      [req.params.id, userId, body.name ?? null, body.email === undefined ? null : normalizedEmail(body.email), body.phone ?? null, body.status ?? null, body.address === undefined ? null : JSON.stringify(body.address || {}), metadata === null ? null : JSON.stringify(metadata)],
+      [req.params.id, userId, body.name ?? null, body.email === undefined ? null : normalizedEmail(body.email), body.phone ?? null, body.status ?? null, normalizedAddress === null ? null : JSON.stringify(normalizedAddress), metadata === null ? null : JSON.stringify(metadata)],
     );
     if (!supplier) return reply.code(404).send({ error: 'Not found' });
     syncOmsCatalogToConnectedWms(userId, req.log).catch((err: any) =>
@@ -4022,7 +4115,15 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const plan = await one('SELECT * FROM shipment_plans WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     if (!plan) return reply.code(404).send({ error: 'Not found' });
-    return mapShipmentPlan(plan);
+    const mapped = mapShipmentPlan(plan);
+    if (plan.supplier_id) {
+      const supplier = await one<AnyRow>('SELECT * FROM suppliers WHERE id = $1 AND user_id = $2', [plan.supplier_id, userId]);
+      if (supplier) {
+        const lastOrders = await lastOrdersBySupplierId(userId, [String(supplier.id)]);
+        (mapped as AnyRow).supplier = mapSupplier(supplier, lastOrders.get(String(supplier.id)));
+      }
+    }
+    return mapped;
   });
 
   app.put('/shipment-plans/:id', async (req: any, reply) => {
@@ -4124,8 +4225,16 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (planItems.length === 0) return reply.code(400).send({ error: 'Plan has no items' });
 
     // Anchor = warehouse closest to the plan's supplier; second node = the multi-warehouse partner.
-    const supplierLocation = await supplierLocationForItem(userId, trim(planItems[0]?.itemId || planItems[0]?.sku))
-      || pointFromAddress(json(plan.ship_from_address, {}));
+    // An online supplier has no physical pickup point — skip geo entirely so the anchor is the
+    // account's owner warehouse (connectedWarehousePricingContext's default), never a fallback
+    // ship-from address that would otherwise smuggle a distance override past the online check
+    // already applied inside supplierLocationForItem.
+    const planSupplier = plan.supplier_id ? await one<{ metadata: any }>('SELECT metadata FROM suppliers WHERE id = $1 AND user_id = $2', [plan.supplier_id, userId]) : null;
+    const planSupplierOnline = Boolean(json(planSupplier?.metadata, {})?.onlineSupplier);
+    const supplierLocation = planSupplierOnline
+      ? null
+      : (await supplierLocationForItem(userId, trim(planItems[0]?.itemId || planItems[0]?.sku))
+        || pointFromAddress(json(plan.ship_from_address, {})));
     const context = await connectedWarehousePricingContext(userId, supplierLocation);
     const anchorCode = trim(context.warehouseCode).toUpperCase();
     if (!anchorCode) return reply.code(400).send({ error: 'No connected warehouse to receive this shipment' });

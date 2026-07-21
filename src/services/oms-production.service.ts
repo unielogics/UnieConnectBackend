@@ -10,6 +10,7 @@ import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
 import { LabelAuditFinding, LabelAuditRun } from './oms-production.types';
 import { postCortex, cortexConfigStatus } from './cortex-orchestration';
+import { resolveShipmentWarehouse } from './warehouse-routing.service';
 
 type RangeKey = 'today' | '7d' | '30d' | '90d' | 'mtd';
 type Row = Record<string, any>;
@@ -267,7 +268,7 @@ async function createWmsAsnForShipment(params: {
   };
 }
 
-function mapOmsSupplier(row: Row, skuCount = 0) {
+function mapOmsSupplier(row: Row, skuCount = 0, lastOrder?: { lastOrderAt?: string | null; lastOrderNumber?: string | null }) {
   const metadata = json(row.metadata, {});
   const address = json(row.address, {});
   const pickupProfile = supplierPickupProfile(row);
@@ -287,6 +288,8 @@ function mapOmsSupplier(row: Row, skuCount = 0) {
     city: address.city || metadata.city || null,
     state: address.stateOrProvinceCode || address.state || metadata.state || null,
     onlineSupplier: Boolean(metadata.onlineSupplier ?? false),
+    lastOrderAt: lastOrder?.lastOrderAt ? iso(lastOrder.lastOrderAt) : null,
+    lastOrderNumber: lastOrder?.lastOrderNumber || null,
     leadTime: metadata.leadTimeDays ?? metadata.leadTime,
     onTime: metadata.onTimeRate ?? metadata.onTime,
     qualityPass: metadata.qualityPassRate ?? metadata.qualityPass,
@@ -303,6 +306,28 @@ function mapOmsSupplier(row: Row, skuCount = 0) {
     updatedAt: iso(row.updated_at),
     metadata,
   };
+}
+
+/** Batched "last order" lookup for a set of supplier ids — ONE query for the whole list rather
+ *  than N+1. Local twin of the same helper in sql-mode.routes.ts (module-local rows()/one()
+ *  can't be cross-imported cleanly; the query itself is identical). */
+async function lastOrdersBySupplierId(userId: string, supplierIds: string[]): Promise<Map<string, { lastOrderAt: string; lastOrderNumber: string }>> {
+  const ids = Array.from(new Set(supplierIds.filter(Boolean).map(String)));
+  const result = new Map<string, { lastOrderAt: string; lastOrderNumber: string }>();
+  if (ids.length === 0) return result;
+  const data = await rows<{ supplier_id: string; order_number: string; at: string }>(
+    `SELECT DISTINCT ON (ci.supplier_id) ci.supplier_id, o.order_number, COALESCE(o.placed_at, o.created_at) AS at
+       FROM orders o
+       INNER JOIN order_lines ol ON ol.order_id = o.id
+       INNER JOIN catalog_items ci ON ci.id = ol.item_id
+      WHERE o.user_id = $1 AND ci.supplier_id = ANY($2::text[])
+      ORDER BY ci.supplier_id, at DESC`,
+    [userId, ids],
+  ).catch(() => []);
+  for (const row of data) {
+    result.set(String(row.supplier_id), { lastOrderAt: row.at, lastOrderNumber: row.order_number });
+  }
+  return result;
 }
 
 function itemLines(value: unknown): any[] {
@@ -1813,6 +1838,8 @@ export async function getOmsAsns(userId: string) {
             sp.estimated_arrival_date,
             sp.items,
             s.name AS supplier_name,
+            s.address AS supplier_address,
+            s.metadata AS supplier_metadata,
             f.code AS facility_code,
             f.name AS facility_name
      FROM asns a
@@ -1824,12 +1851,16 @@ export async function getOmsAsns(userId: string) {
      LIMIT 200`,
     [userId],
   );
+  const lastOrders = await lastOrdersBySupplierId(userId, asns.map((a) => a.supplier_id).filter(Boolean));
   return {
     asns: asns.map((asn) => {
       const items = json(asn.items, []);
       const units = Array.isArray(items)
         ? items.reduce((sum, item) => sum + number(item.quantity || item.units || 0), 0)
         : 0;
+      const supplierAddress = json(asn.supplier_address, {});
+      const supplierMetadata = json(asn.supplier_metadata, {});
+      const lastOrder = asn.supplier_id ? lastOrders.get(String(asn.supplier_id)) : undefined;
       return {
         id: asn.id,
         _id: asn.id,
@@ -1844,6 +1875,10 @@ export async function getOmsAsns(userId: string) {
         supplierId: asn.supplier_id || null,
         supplierDisplayId: asn.supplier_id ? publicEntityId('SU', asn.supplier_id) : null,
         supplierName: asn.supplier_name || null,
+        supplierCity: supplierAddress.city || null,
+        supplierState: supplierAddress.state || supplierAddress.stateOrProvinceCode || null,
+        supplierOnline: Boolean(supplierMetadata.onlineSupplier ?? false),
+        supplierLastOrderAt: lastOrder?.lastOrderAt ? iso(lastOrder.lastOrderAt) : null,
         facilityId: asn.facility_id || null,
         facilityCode: asn.facility_code || null,
         facilityName: asn.facility_name || null,
@@ -1881,8 +1916,9 @@ export async function getOmsSuppliers(userId: string) {
     ),
   ]);
   const countBySupplier = new Map(skuCounts.map((row) => [String(row.supplier_id), number(row.sku_count)]));
+  const lastOrders = await lastOrdersBySupplierId(userId, suppliers.map((s) => s.id));
   return {
-    suppliers: suppliers.map((supplier) => mapOmsSupplier(supplier, countBySupplier.get(String(supplier.id)) || 0)),
+    suppliers: suppliers.map((supplier) => mapOmsSupplier(supplier, countBySupplier.get(String(supplier.id)) || 0, lastOrders.get(String(supplier.id)))),
     locations,
   };
 }
@@ -2100,8 +2136,16 @@ export async function getOmsSupplierActivity(userId: string, supplierId: string)
   const orderUnits = orderRows.reduce((sum, order) => sum + number(order.units), 0);
   const documents = records.filter((record) => record.type === 'asn' || record.type === 'bol' || record.type === 'label').length;
 
+  // orderRows is already sorted newest-first (ORDER BY placed_at/created_at DESC), so its head
+  // IS the last order — no extra query needed here (unlike the list endpoints, which batch this
+  // across many suppliers at once via lastOrdersBySupplierId).
+  const lastOrderRow = orderRows[0] as Row | undefined;
+  const lastOrder = lastOrderRow
+    ? { lastOrderAt: lastOrderRow.placed_at || lastOrderRow.created_at, lastOrderNumber: lastOrderRow.order_number }
+    : undefined;
+
   return {
-    supplier: mapOmsSupplier(supplier, skus.length),
+    supplier: mapOmsSupplier(supplier, skus.length, lastOrder),
     summary: {
       skus: skus.length,
       shipmentPlans: shipmentPlans.length,
@@ -2112,6 +2156,8 @@ export async function getOmsSupplierActivity(userId: string, supplierId: string)
       shipmentUnits,
       invoiceAmount: money(invoiceRows.reduce((sum, line) => sum + number(line.amount), 0)),
       lastActivityAt: records[0]?.date || iso(supplier.updated_at),
+      lastOrderAt: lastOrder?.lastOrderAt ? iso(lastOrder.lastOrderAt) : null,
+      lastOrderNumber: lastOrder?.lastOrderNumber || null,
     },
     records,
   };
@@ -2160,31 +2206,24 @@ async function defaultFacility(userId: string) {
   );
 }
 
-async function connectedShipmentFacility(userId: string, facilityId?: string | null) {
-  if (facilityId) {
-    const verified = await one(
-      `SELECT f.*
-       FROM oms_warehouse_links l
-       JOIN facilities f ON f.id = l.facility_id
-       WHERE l.user_id = $1
-         AND l.status = 'connected'
-         AND l.facility_id = $2
-       ORDER BY l.connected_at DESC NULLS LAST
-       LIMIT 1`,
-      [userId, facilityId],
-    );
-    if (verified) return verified;
+/**
+ * Which connected warehouse should receive this shipment. Routes through the shared
+ * resolveShipmentWarehouse (online supplier / no address → owner warehouse; non-online with a
+ * real address → closest connected + network-eligible warehouse, even a peer). Previously this
+ * function had NO geo/online logic at all — it just grabbed the most-recently-connected facility,
+ * which is why an online supplier could route to the wrong (non-owner) warehouse whenever the
+ * account had more than one connected link.
+ */
+async function connectedShipmentFacility(userId: string, facilityId?: string | null, supplierId?: string | null) {
+  const resolved = await resolveShipmentWarehouse(userId, { supplierId, requestedFacilityId: facilityId });
+  if (!resolved) return null;
+  if (resolved.facilityId) {
+    const byId = await one('SELECT * FROM facilities WHERE id = $1', [resolved.facilityId]);
+    if (byId) return byId;
   }
-  return one(
-    `SELECT f.*
-     FROM oms_warehouse_links l
-     JOIN facilities f ON f.id = l.facility_id
-     WHERE l.user_id = $1
-       AND l.status = 'connected'
-     ORDER BY l.connected_at DESC NULLS LAST
-     LIMIT 1`,
-    [userId],
-  );
+  // No facility row (a link with only a warehouse_code, no facilities join) — synthesize enough
+  // of a facilities-row shape for findWmsLinkForFacility's code/id lookups downstream.
+  return { id: resolved.facilityId, code: resolved.warehouseCode, name: resolved.facilityName, address: resolved.facilityAddress, metadata: resolved.facilityMetadata };
 }
 
 export async function confirmShipmentWizardDraft(userId: string, draftId: string, body: any, log?: FastifyBaseLogger) {
@@ -2226,7 +2265,7 @@ export async function confirmShipmentWizardDraft(userId: string, draftId: string
     };
   }
 
-  const connectedFacility = await connectedShipmentFacility(userId, requestedFacilityId);
+  const connectedFacility = await connectedShipmentFacility(userId, requestedFacilityId, supplierId);
   const facility = connectedFacility || (await defaultFacility(userId));
   if (!facility) {
     return {
