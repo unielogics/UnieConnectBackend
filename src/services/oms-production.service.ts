@@ -287,6 +287,9 @@ function mapOmsSupplier(row: Row, skuCount = 0, lastOrder?: { lastOrderAt?: stri
     // Distinct city/state so the UI can render "City, State" and detect an address-less (online) supplier.
     city: address.city || metadata.city || null,
     state: address.stateOrProvinceCode || address.state || metadata.state || null,
+    // Full raw address so edit forms (NewSupplierModal) can pre-fill street/zip/lat/lon — city/state
+    // alone (above) isn't enough to round-trip the address back into the edit form.
+    address,
     onlineSupplier: Boolean(metadata.onlineSupplier ?? false),
     lastOrderAt: lastOrder?.lastOrderAt ? iso(lastOrder.lastOrderAt) : null,
     lastOrderNumber: lastOrder?.lastOrderNumber || null,

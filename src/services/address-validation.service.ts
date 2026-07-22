@@ -3,8 +3,8 @@ import { config } from '../config/env';
 
 export interface ValidatedAddress {
   formatted: string;
-  houseNumber?: string;
-  street?: string;
+  houseNumber?: string | undefined;
+  street?: string | undefined;
   city?: string;
   state?: string;
   stateCode?: string;
@@ -50,7 +50,9 @@ export async function validateAddressWithGeoapify(query: string): Promise<Valida
   return {
     formatted: p.formatted || query,
     houseNumber: p.housenumber,
-    street: p.street || p.address_line1,
+    // Geoapify's `street` is the street NAME only ("Main St"), never the house number — prepend
+    // it so callers get a real street line ("123 Main St") instead of losing the number.
+    street: [p.housenumber, p.street || p.address_line1].filter(Boolean).join(' ') || undefined,
     city: p.city || p.town || p.village,
     state: p.state,
     stateCode: p.state_code,
@@ -88,7 +90,7 @@ export async function suggestAddressesWithGeoapify(query: string): Promise<Valid
       return {
         formatted: p.formatted || query,
         houseNumber: p.housenumber,
-        street: p.street || p.address_line1,
+        street: [p.housenumber, p.street || p.address_line1].filter(Boolean).join(' ') || undefined,
         city: p.city || p.town || p.village,
         state: p.state,
         stateCode: p.state_code,
