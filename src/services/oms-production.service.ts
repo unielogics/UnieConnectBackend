@@ -2621,6 +2621,10 @@ function mapWarehouseLink(row: Row) {
 }
 
 async function warehouseLinks(userId: string) {
+  // Owner/primary links (metadata.source <> 'peer_partner_network') sort first, most-recent
+  // within each group. Plain `connected_at DESC` let a freshly-accepted peer warehouse sort
+  // ahead of the account's own owner warehouse — anything treating this list's first row as
+  // "the primary warehouse" (e.g. ShipmentWizard's warehouses[0]) got the wrong warehouse.
   return rows(
     `SELECT l.*, f.code AS facility_code, f.name AS facility_name, f.name, f.address
      FROM oms_warehouse_links l
@@ -2629,7 +2633,7 @@ async function warehouseLinks(userId: string) {
        AND l.status = 'connected'
        AND COALESCE(l.metadata->>'source', '') <> 'demo'
        AND COALESCE(f.metadata->>'source', '') NOT IN ('sql_default','demo')
-     ORDER BY l.connected_at DESC`,
+     ORDER BY (COALESCE(l.metadata->>'source', '') = 'peer_partner_network') ASC, l.connected_at DESC`,
     [userId],
   );
 }
