@@ -563,6 +563,12 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
   const status = textValue(payload.status, body.operation) || 'open';
   const currency = textValue(payload.currency) || 'USD';
   const lineItems = Array.isArray(payload.lineItems) ? payload.lineItems : [];
+  // Credit memos and dispute-resolution credits/debits live in the WMS invoice's separate
+  // `adjustments` array (Invoice.adjustments, e.g. {type:'dispute', amount:-25}), not
+  // `lineItems` — without syncing these too, the OMS side's aggregate total silently
+  // disagrees with what the WMS Billing screen shows (the sum of `lineItems` alone), even
+  // though `payload.totals.total` (used elsewhere) is correct.
+  const adjustments = Array.isArray(payload.adjustments) ? payload.adjustments : [];
   const periodStart = payload.periodStart || null;
   const periodEnd = payload.periodEnd || null;
 
@@ -636,6 +642,29 @@ async function upsertWmsInvoice(userId: string, warehouseCode: string, body: any
       `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, currency, status, payload)
        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
       [userId, invoiceKey, textValue(li?.description, code, `WMS invoice ${invoiceKey}`), amount, currency, status, JSON.stringify(linePayload)],
+    );
+    insertedCount += 1;
+  }
+  for (const adj of adjustments) {
+    const amount = Number(adj?.amount) || 0;
+    if (!amount) continue;
+    const adjPayload = {
+      ...metadata,
+      code: `ADJUSTMENT_${String(adj?.type || 'other').toUpperCase()}`,
+      category: 'accessorials',
+      invoiceNumber,
+      periodStart,
+      periodEnd,
+      warehouseCode,
+      wmsEntityId: externalId || undefined,
+      invoiceStatus: status,
+      invoiceTotal: Number(payload?.totals?.total ?? payload?.total ?? 0) || 0,
+      adjustmentType: adj?.type || 'other',
+    };
+    await pgQuery(
+      `INSERT INTO invoice_lines (user_id, invoice_id, description, amount, currency, status, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [userId, invoiceKey, textValue(adj?.description, `Adjustment (${adj?.type || 'other'})`), amount, currency, status, JSON.stringify(adjPayload)],
     );
     insertedCount += 1;
   }
