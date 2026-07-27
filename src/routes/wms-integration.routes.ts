@@ -678,13 +678,14 @@ async function upsertWmsSupportTicket(userId: string, warehouseCode: string, bod
     normalizeSupportPriority(payload.priority),
     normalizeSupportStatus(payload.status),
     textValue(payload.owner) || 'WMS',
+    warehouseCode || null,
   ];
 
   let ticketId = existing?.rows?.[0]?.id;
   if (ticketId) {
     await pgQuery(
       `UPDATE support_tickets
-       SET subject=$3, body=$4, channel='wms', priority=$6, status=$7, owner=$8, updated_at=now()
+       SET subject=$3, body=$4, channel='wms', priority=$6, status=$7, owner=$8, warehouse_code=$9, updated_at=now()
        WHERE user_id=$1 AND id=$2`,
       ticketValues,
     );
@@ -692,10 +693,10 @@ async function upsertWmsSupportTicket(userId: string, warehouseCode: string, bod
     // Own param list: the shared ticketValues includes $2 (existing id) which the INSERT never
     // references → untyped bare-null param → 42P18. Cast the nullable body param too.
     const inserted = await pgQuery(
-      `INSERT INTO support_tickets (user_id, subject, body, entity_type, entity_id, channel, priority, status, owner)
-       VALUES ($1,$2,$3::text,'support_ticket',$4,'wms',$5,$6,$7)
+      `INSERT INTO support_tickets (user_id, subject, body, entity_type, entity_id, channel, priority, status, owner, warehouse_code)
+       VALUES ($1,$2,$3::text,'support_ticket',$4,'wms',$5,$6,$7,$8)
        RETURNING id`,
-      [ticketValues[0], ticketValues[2], ticketValues[3], ticketValues[4], ticketValues[5], ticketValues[6], ticketValues[7]],
+      [ticketValues[0], ticketValues[2], ticketValues[3], ticketValues[4], ticketValues[5], ticketValues[6], ticketValues[7], ticketValues[8]],
     );
     ticketId = inserted?.rows?.[0]?.id;
   }
@@ -765,6 +766,63 @@ async function upsertWmsSupportTicketMessage(userId: string, warehouseCode: stri
   return { upserted: inserted?.rows?.[0]?.id || null };
 }
 
+/**
+ * Warehouse-wide rate-card summary — a pure display mirror for the client, deliberately NOT
+ * wired into billing_rate_overrides (that stays the separate, advisory-only "you save"
+ * projection). One row per (user, warehouse); a fresh push just overwrites the summary fields.
+ */
+async function upsertWmsPricingProfile(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const pricingProfileId = textValue(payload.pricingProfileId, body.externalReference);
+  if (!pricingProfileId) return { skipped: true, reason: 'missing_pricing_profile_id' };
+
+  await pgQuery(
+    `INSERT INTO wms_pricing_profiles
+      (user_id, warehouse_code, pricing_profile_id, rate_version, effective_from, currency, status, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+     ON CONFLICT (user_id, warehouse_code) DO UPDATE SET
+       pricing_profile_id = EXCLUDED.pricing_profile_id,
+       rate_version = EXCLUDED.rate_version,
+       effective_from = EXCLUDED.effective_from,
+       currency = EXCLUDED.currency,
+       status = EXCLUDED.status,
+       updated_at = now()`,
+    [
+      userId,
+      warehouseCode,
+      pricingProfileId,
+      Number(payload.rateVersion) || 1,
+      payload.effectiveFrom || null,
+      textValue(payload.currency) || 'USD',
+      textValue(payload.status) || 'active',
+    ],
+  );
+
+  return { upserted: pricingProfileId };
+}
+
+/**
+ * Client-facing Inbox row — duplicates one emitEmailEvent-originated send. ON CONFLICT DO NOTHING
+ * on (user_id, wms_message_id) makes a retried/duplicate WMS emit a no-op instead of a
+ * double-insert.
+ */
+async function upsertWmsMailboxMessage(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const wmsMessageId = String(body.entityId || body.entity_id || '');
+  const subject = textValue(payload.subject, body.externalReference);
+  if (!wmsMessageId || !subject) return { skipped: true, reason: 'missing_mailbox_message_identity' };
+
+  const inserted = await pgQuery(
+    `INSERT INTO oms_mailbox_messages (user_id, subject, body, from_email, thread_id, wms_message_id, event_type, warehouse_code)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (user_id, wms_message_id) WHERE wms_message_id IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [userId, subject, textValue(payload.body), textValue(payload.fromEmail), textValue(payload.threadId), wmsMessageId, textValue(payload.eventType), warehouseCode],
+  );
+
+  return { upserted: inserted?.rows?.[0]?.id || null };
+}
+
 async function applyEntityEvent(params: { userId: string; warehouseCode: string; body: any }) {
   const entityType = String(params.body.entityType || params.body.entity_type || '').toLowerCase();
   if (!['entity_upsert', 'entity_status', 'entity_archive'].includes(String(params.body.eventType || ''))) return null;
@@ -776,6 +834,8 @@ async function applyEntityEvent(params: { userId: string; warehouseCode: string;
   if (entityType === 'invoice') return upsertWmsInvoice(params.userId, params.warehouseCode, params.body);
   if (entityType === 'support_ticket') return upsertWmsSupportTicket(params.userId, params.warehouseCode, params.body);
   if (entityType === 'support_ticket_message') return upsertWmsSupportTicketMessage(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'pricing_profile') return upsertWmsPricingProfile(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'mailbox_message') return upsertWmsMailboxMessage(params.userId, params.warehouseCode, params.body);
   return { skipped: true, reason: `unsupported_entity_type:${entityType}` };
 }
 
@@ -969,6 +1029,4 @@ export async function wmsIntegrationRoutes(app: FastifyInstance) {
   app.post('/internal/wms/order-status', async (req, reply) => acceptWmsEvent(req, reply, 'order_status'));
   app.post('/internal/wms/inventory-snapshot', async (req, reply) => acceptWmsEvent(req, reply, 'inventory_snapshot'));
   app.post('/internal/wms/asn-status', async (req, reply) => acceptWmsEvent(req, reply, 'asn_status'));
-  app.post('/internal/wms/billing-event', async (req, reply) => acceptWmsEvent(req, reply, 'billing_event'));
-  app.post('/internal/wms/dispute-event', async (req, reply) => acceptWmsEvent(req, reply, 'dispute_event'));
 }

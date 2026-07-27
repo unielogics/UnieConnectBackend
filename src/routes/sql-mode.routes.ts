@@ -832,7 +832,7 @@ async function buildWmsOmsProfile(userId: string) {
   };
 }
 
-async function callWmsInternal<T = AnyRow>(path: string, body: AnyRow): Promise<T> {
+export async function callWmsInternal<T = AnyRow>(path: string, body: AnyRow): Promise<T> {
   if (!config.wmsApiUrl) {
     const err = new Error('WMS_API_URL is not configured');
     (err as any).status = 503;

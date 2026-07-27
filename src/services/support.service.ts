@@ -1,5 +1,6 @@
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { prefixForEntity, publicEntityId } from '../lib/public-id';
+import { callWmsInternal } from '../routes/sql-mode.routes';
 
 type Row = Record<string, any>;
 
@@ -188,5 +189,22 @@ export async function addTicketMessage(
     err.statusCode = 503;
     throw err;
   }
+
+  // Push client-authored replies back to the originating WMS ticket. Fire-and-forget — a WMS
+  // outage or missing warehouse_code (ticket wasn't WMS-originated) must never block the
+  // client's reply from saving. WMS-authored messages never take this path (authorType would be
+  // 'warehouse', not 'client'), so this can't loop back to itself.
+  const authorType = String(body.authorType || 'client');
+  const warehouseCode = ticket[0]?.warehouse_code;
+  if (authorType === 'client' && ticket[0]?.entity_type === 'support_ticket' && ticket[0]?.entity_id && warehouseCode) {
+    callWmsInternal('/internal/oms/support-ticket-message', {
+      warehouseCode,
+      wmsTicketId: ticket[0].entity_id,
+      body: text,
+      authorName: body.authorName || 'Client',
+      attachments,
+    }).catch((err) => console.error('[support] failed to push client reply to WMS:', err?.message || err));
+  }
+
   return { message: mapMessage(inserted[0]) };
 }
