@@ -6,7 +6,7 @@ import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
 import { publicEntityId } from '../lib/public-id';
-import { registerWmsCredential } from '../services/oms-wms-credentials.service';
+import { registerWmsCredential, getWmsCredentialHeaders } from '../services/oms-wms-credentials.service';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { postCortex } from '../services/cortex-orchestration';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
@@ -4521,6 +4521,75 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       ? await rows('SELECT * FROM invoice_lines WHERE user_id = $1 AND shipment_plan_id = $2 ORDER BY created_at DESC', [userId, shipmentPlanId])
       : await rows('SELECT * FROM invoice_lines WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200', [userId]);
     return { invoices: data.map((line) => ({ _id: line.id, id: line.id, shipmentPlanId: line.shipment_plan_id, invoiceId: line.invoice_id, description: line.description, amount: money(line.amount), currency: line.currency, status: line.status, payload: json(line.payload, {}), createdAt: iso(line.created_at) })) };
+  });
+
+  // "Pay Now" — proxies through to the WMS on-demand charge endpoint, which charges the client's
+  // card/ACH already on file against the warehouse's own Stripe Connect account (WMS is the one
+  // billing system; OMS never holds payment-method data). :invoiceId is the WMS invoice_lines
+  // payload.wmsEntityId (the real Mongo Invoice/GrandInvoice _id) — resolved + ownership-checked
+  // against this user's own rows before any outbound call, same WHERE user_id=$1 pattern as
+  // GET /invoices above.
+  app.post('/invoices/:invoiceId/pay', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const invoiceId = trim(req.params?.invoiceId);
+    if (!invoiceId) return reply.code(400).send({ error: 'invoiceId is required' });
+
+    const line = await one<AnyRow>(
+      `SELECT * FROM invoice_lines
+       WHERE user_id = $1 AND (payload->>'wmsEntityId' = $2 OR invoice_id = $2)
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId, invoiceId],
+    );
+    if (!line) return reply.code(404).send({ error: 'Invoice not found' });
+    if (line.status === 'paid') {
+      return reply.code(200).send({ outcome: 'charged', reason: 'Already paid' });
+    }
+
+    const payload = json(line.payload, {}) as AnyRow;
+    const warehouseCode = trim(payload.warehouseCode);
+    const wmsEntityId = trim(payload.wmsEntityId) || invoiceId;
+    if (!warehouseCode) return reply.code(400).send({ error: 'This invoice has no linked warehouse — cannot pay yet' });
+    if (!config.wmsApiUrl) return reply.code(503).send({ error: 'WMS API is not configured' });
+
+    const credentialHeaders = await getWmsCredentialHeaders({ userId, warehouseCode });
+    if (!credentialHeaders) {
+      return reply.code(409).send({ error: 'No WMS integration credential on file for this warehouse. Contact your warehouse to enable payments.' });
+    }
+
+    let chargeResult: AnyRow;
+    try {
+      // No invoiceType hint: the WMS->OMS sync payload doesn't mark daily-vs-consolidated, so the
+      // charge endpoint tries both invoice collections itself (see on-demand-charge.service.ts).
+      const res = await fetch(`${config.wmsApiUrl}/api/v1/wms-integration/invoices/${encodeURIComponent(wmsEntityId)}/charge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...credentialHeaders },
+        body: JSON.stringify({}),
+      });
+      chargeResult = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return reply.code(res.status >= 400 && res.status < 500 ? res.status : 502).send({ error: chargeResult?.error || 'Charge failed' });
+      }
+    } catch (err: any) {
+      req.log?.error?.({ err, warehouseCode, invoiceId }, 'WMS on-demand charge request failed');
+      return reply.code(502).send({ error: 'Could not reach WMS to process payment. Please try again.' });
+    }
+
+    // Reflect success immediately — don't wait for the async WMS->OMS invoice-sync tick to land.
+    if (chargeResult?.outcome === 'charged') {
+      await pgQuery(
+        `UPDATE invoice_lines SET status = 'paid', updated_at = now()
+         WHERE user_id = $1 AND (payload->>'wmsEntityId' = $2 OR invoice_id = $2)`,
+        [userId, invoiceId],
+      );
+    }
+
+    return reply.code(200).send({
+      outcome: chargeResult?.outcome || 'failed',
+      paidAmount: chargeResult?.paidAmount,
+      paymentReference: chargeResult?.paymentReference,
+      reason: chargeResult?.reason,
+    });
   });
 
   app.get('/notes', async (req: any, reply) => {

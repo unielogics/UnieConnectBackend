@@ -518,6 +518,10 @@ function wmsInvoiceCategory(code: string): string {
     case 'STORAGE':
       return 'storage';
     case 'LABEL_FEE':
+    // LTL/freight cost billed to a client (freight-billing.service.ts on the WMS side, marked up
+    // per WarehousePricingProfile.freightMarkup) — same 'freight' bucket as label fees.
+    case 'FREIGHT_FEE':
+    case 'LTL_FEE':
       return 'freight';
     case 'PICK_FEE':
     case 'PACK_FEE':
