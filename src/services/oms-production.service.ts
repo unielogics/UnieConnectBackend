@@ -713,7 +713,7 @@ async function tableExists(tableName: string) {
   return Boolean(found?.exists);
 }
 
-async function recentLedger(userId: string, limit = 30) {
+export async function recentLedger(userId: string, limit = 30) {
   return rows(
     'SELECT id, entity_type, entity_id, event_type, source_system, summary, payload, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2',
     [userId, limit],

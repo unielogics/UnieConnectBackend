@@ -393,6 +393,8 @@ export async function cortexWarehouseRegisterRoutes(app: FastifyInstance) {
             JSON.stringify({ source: 'peer_partner_network', ownerWarehouseCode: ownerCode, partnerAcceptedAt: new Date().toISOString() }),
           ],
         ).catch((err: any) => { req.log?.error({ err, userId, peerCode }, '[client-network-warehouse] link upsert failed'); });
+        const { resetFulfillmentStatusIfNeeded } = await import('../services/support-notifications.service');
+        await resetFulfillmentStatusIfNeeded(userId);
         results.push({ status: 'attached', userId });
       }
       return reply.code(200).send({ ok: true, action, warehouseCode: peerCode, results });

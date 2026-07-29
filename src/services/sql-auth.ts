@@ -15,6 +15,9 @@ type SqlUserRow = {
   billing_address: any;
   enabled_features: string[] | null;
   last_login_at: Date | string | null;
+  fulfillment_status: string | null;
+  fulfillment_status_note: string | null;
+  fulfillment_status_at: Date | string | null;
 };
 
 export type AppUserProfile = {
@@ -29,6 +32,9 @@ export type AppUserProfile = {
   billingAddress?: any;
   enabledFeatures?: string[];
   lastLoginAt?: Date | string | null;
+  fulfillmentStatus?: 'active' | 'paused' | 'blocked';
+  fulfillmentStatusNote?: string;
+  fulfillmentStatusAt?: Date | string | null;
 };
 
 const toProfile = (row: SqlUserRow): AppUserProfile => {
@@ -38,6 +44,7 @@ const toProfile = (row: SqlUserRow): AppUserProfile => {
     role: normalizeRole(row.role),
     enabledFeatures: row.enabled_features || [],
     lastLoginAt: row.last_login_at,
+    fulfillmentStatus: (row.fulfillment_status as any) || 'active',
   };
   if (row.first_name) profile.firstName = row.first_name;
   if (row.last_name) profile.lastName = row.last_name;
@@ -45,6 +52,8 @@ const toProfile = (row: SqlUserRow): AppUserProfile => {
   if (row.avatar_url) profile.avatarUrl = row.avatar_url;
   if (row.llc_name) profile.llcName = row.llc_name;
   if (row.billing_address) profile.billingAddress = row.billing_address;
+  if (row.fulfillment_status_note) profile.fulfillmentStatusNote = row.fulfillment_status_note;
+  if (row.fulfillment_status_at) profile.fulfillmentStatusAt = row.fulfillment_status_at;
   return profile;
 };
 
@@ -55,7 +64,7 @@ export function isSqlAuthEnabled() {
 export async function findSqlUserById(userId: string): Promise<AppUserProfile | null> {
   if (!isSqlAuthEnabled()) return null;
   const res = await pgQuery<SqlUserRow>(
-    `SELECT id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at
+    `SELECT id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at, fulfillment_status, fulfillment_status_note, fulfillment_status_at
      FROM app_users WHERE id = $1 LIMIT 1`,
     [userId],
   );
@@ -67,7 +76,7 @@ export async function findSqlUserByEmail(email: string): Promise<(AppUserProfile
   if (!isSqlAuthEnabled()) return null;
   const normalizedEmail = email.toLowerCase().trim();
   const res = await pgQuery<SqlUserRow>(
-    `SELECT id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at
+    `SELECT id, email, password_hash, role, first_name, last_name, phone, avatar_url, llc_name, billing_address, enabled_features, last_login_at, fulfillment_status, fulfillment_status_note, fulfillment_status_at
      FROM app_users WHERE email = $1 LIMIT 1`,
     [normalizedEmail],
   );

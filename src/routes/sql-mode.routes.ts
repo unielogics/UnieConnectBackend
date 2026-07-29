@@ -5056,6 +5056,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         ],
       );
 
+      const { resetFulfillmentStatusIfNeeded } = await import('../services/support-notifications.service');
+      await resetFulfillmentStatusIfNeeded(userId);
+
       const catalogSync = await syncOmsCatalogToWms({
         userId,
         warehouseCode,
@@ -5379,6 +5382,8 @@ export async function sqlModeRoutes(app: FastifyInstance) {
        ON CONFLICT (user_id, warehouse_code) DO UPDATE SET oms_account_id = EXCLUDED.oms_account_id, facility_id = EXCLUDED.facility_id, status = 'connected', connected_at = now(), updated_at = now()`,
       [account.user_id || req.user.userId, account.id, facility.id, facility.code, JSON.stringify({ linkedBy: req.user.userId })],
     );
+    const { resetFulfillmentStatusIfNeeded } = await import('../services/support-notifications.service');
+    await resetFulfillmentStatusIfNeeded(account.user_id || req.user.userId);
     return { success: true, message: 'Linked.' };
   });
 

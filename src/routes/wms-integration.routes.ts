@@ -856,8 +856,82 @@ async function upsertWmsMailboxMessage(userId: string, warehouseCode: string, bo
   return { upserted: inserted?.rows?.[0]?.id || null };
 }
 
+/**
+ * A warehouse deleted its client relationship in WMS. Never delete the OMS account — only sever
+ * the specific oms_warehouse_links row for this warehouse. If the severed link was the client's
+ * PRIMARY (non-peer) connection, escalate: log a primary-severing ledger event, set
+ * app_users.fulfillment_status ('paused' if a peer link remains, 'blocked' if none do), and email
+ * support@unielogics.com with the reason and a full activity digest. A peer-link severing is just
+ * logged — no banner, no email (the client still has a working fulfillment path).
+ */
+async function handleWmsIntermediaryDeleted(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const reason = textValue(payload.reason);
+  const deletedBy = textValue(payload.deletedBy);
+
+  const linkRes = await pgQuery<{ id: string; metadata: any }>(
+    `SELECT id, metadata FROM oms_warehouse_links WHERE user_id = $1 AND warehouse_code = $2 LIMIT 1`,
+    [userId, warehouseCode],
+  );
+  const link = linkRes?.rows?.[0];
+  if (!link) return { skipped: true, reason: 'no_matching_oms_warehouse_link' };
+
+  const isPeerLink = String(link.metadata?.source || '') === 'peer_partner_network';
+  const nextMetadata = { ...(link.metadata || {}), deletionReason: reason || null, deletedBy: deletedBy || null, deletedAt: new Date().toISOString() };
+
+  await pgQuery(
+    `UPDATE oms_warehouse_links SET status = 'removed', metadata = $3::jsonb, updated_at = now() WHERE id = $1 AND user_id = $2`,
+    [link.id, userId, JSON.stringify(nextMetadata)],
+  );
+
+  if (isPeerLink) {
+    await pgQuery(
+      `INSERT INTO oms_execution_ledger (user_id, entity_type, entity_id, event_type, source_system, summary, payload)
+       VALUES ($1, 'oms_warehouse_link', $2, 'peer_link_removed', 'wms', $3, $4::jsonb)`,
+      [userId, link.id, `Peer warehouse ${warehouseCode} link removed by the warehouse. Reason: ${reason || '(none provided)'}`, JSON.stringify({ warehouseCode, reason, deletedBy })],
+    );
+    return { severed: 'peer', warehouseCode };
+  }
+
+  const remaining = await pgQuery<{ count: string }>(
+    `SELECT count(*) FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected'`,
+    [userId],
+  );
+  const remainingConnectedCount = Number(remaining?.rows?.[0]?.count || 0);
+  const fulfillmentStatus = remainingConnectedCount === 0 ? 'blocked' : 'paused';
+
+  await pgQuery(
+    `INSERT INTO oms_execution_ledger (user_id, entity_type, entity_id, event_type, source_system, summary, payload)
+     VALUES ($1, 'oms_warehouse_link', $2, 'primary_link_removed', 'wms', $3, $4::jsonb)`,
+    [userId, link.id, `Primary warehouse ${warehouseCode} link removed by the warehouse. Reason: ${reason || '(none provided)'}`, JSON.stringify({ warehouseCode, reason, deletedBy, remainingConnectedCount })],
+  );
+  await pgQuery(
+    `UPDATE app_users SET fulfillment_status = $2, fulfillment_status_note = $3, fulfillment_status_at = now() WHERE id = $1`,
+    [userId, fulfillmentStatus, reason || null],
+  );
+
+  try {
+    const { sendSupportSeveredClientEmail } = await import('../services/support-notifications.service');
+    await sendSupportSeveredClientEmail({
+      userId,
+      warehouseCode,
+      reason: reason || '',
+      remainingConnectedCount,
+      ...(deletedBy ? { deletedBy } : {}),
+    });
+  } catch (err) {
+    console.error('[wms-integration] Failed to send severed-client support email:', err);
+  }
+
+  return { severed: 'primary', warehouseCode, fulfillmentStatus };
+}
+
 async function applyEntityEvent(params: { userId: string; warehouseCode: string; body: any }) {
   const entityType = String(params.body.entityType || params.body.entity_type || '').toLowerCase();
+  const operation = String(params.body.operation || '').toLowerCase();
+  if (entityType === 'intermediary' && operation === 'deleted') {
+    return handleWmsIntermediaryDeleted(params.userId, params.warehouseCode, params.body);
+  }
   if (!['entity_upsert', 'entity_status', 'entity_archive'].includes(String(params.body.eventType || ''))) return null;
   if (entityType === 'item' || entityType === 'catalog_item') return upsertWmsItem(params.userId, params.warehouseCode, params.body);
   if (entityType === 'supplier' || entityType === 'vendor') return upsertWmsSupplier(params.userId, params.warehouseCode, params.body);
