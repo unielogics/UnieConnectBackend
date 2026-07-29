@@ -35,8 +35,17 @@ export const config = {
     // 2026-01 may not be released; webhook registration fails. Use 2024-01 for compatibility.
     apiVersion: (process.env.SHOPIFY_API_VERSION || '2024-01').replace(/^2026-/, '2024-'),
   },
-  /** Base URL of the frontend app for post-OAuth redirects (e.g. https://user.unieconnect.com) */
-  frontendOrigin: process.env.FRONTEND_ORIGIN || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
+  /**
+   * Base URL of the frontend app for post-OAuth redirects and invite links (e.g.
+   * https://user.unieconnect.com). Falls back to localhost only outside production so a missing
+   * env var can never silently ship real users a localhost link/redirect in prod (confirmed this
+   * actually happened: FRONTEND_ORIGIN/NEXT_PUBLIC_APP_URL were unset, so every WMS-intermediary
+   * invite email and every Shopify/eBay/Amazon OAuth-connect redirect pointed at localhost:3000).
+   */
+  frontendOrigin:
+    process.env.FRONTEND_ORIGIN ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    (process.env.NODE_ENV === 'production' ? 'https://user.unieconnect.com' : 'http://localhost:3000'),
   ebay: {
     clientId: process.env.EBAY_CLIENT_ID || '',
     clientSecret: process.env.EBAY_CLIENT_SECRET || '',
