@@ -4023,6 +4023,50 @@ export async function getOmsAsn(userId: string, asnId: string) {
   };
 }
 
+// ── Returns/RMA (migration 028) ─────────────────────────────────────────────────────────────
+// Flatter than ASN/order: no shipment_plans/suppliers join, no OMS-native line-item table --
+// `returns` is a payload-snapshot table only, populated entirely by upsertWmsReturn
+// (wms-integration.routes.ts) from the WMS's full Return doc. lineItems/mediaCaptures/rmaNumber
+// etc. are read straight out of that snapshot rather than normalized SQL columns.
+
+function returnRowToView(row: Row) {
+  const payload = json(row.payload, {});
+  const lineItems = Array.isArray(payload.lineItems) ? payload.lineItems : [];
+  const mediaCaptures = Array.isArray(payload.mediaCaptures) ? payload.mediaCaptures : [];
+  return {
+    id: row.id,
+    _id: row.id,
+    publicId: publicEntityId('RT', row.id),
+    displayId: publicEntityId('RT', row.id),
+    rmaNumber: row.rma_number,
+    status: row.status || 'requested',
+    originalOrderNumber: payload.originalOrderNumber || null,
+    customerNumber: payload.customerNumber || null,
+    reason: payload.reason || null,
+    lineItems,
+    totals: payload.totals || { items: lineItems.length, quantity: 0 },
+    mediaCaptures,
+    warehouseCode: payload.warehouseCode || null,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+
+export async function getOmsReturns(userId: string) {
+  const returnRows = await rows(
+    `SELECT * FROM returns WHERE user_id = $1 ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 200`,
+    [userId],
+  );
+  return { returns: returnRows.map(returnRowToView) };
+}
+
+export async function getOmsReturn(userId: string, returnId: string) {
+  if (!returnId) return null;
+  const row = await one(`SELECT * FROM returns WHERE user_id = $1 AND id = $2 LIMIT 1`, [userId, returnId]);
+  if (!row) return null;
+  return returnRowToView(row);
+}
+
 export async function getLedger(userId: string) {
   const stored = await recentLedger(userId, 100);
   if (stored.length) return { events: stored, persistence: 'aurora_postgres' };

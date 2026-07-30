@@ -22,6 +22,8 @@ import {
   getOmsCustomers,
   getOmsOrder,
   getOmsOrders,
+  getOmsReturn,
+  getOmsReturns,
   getOmsSkuDetail,
   getOmsSkus,
   getOmsSupplierActivity,
@@ -125,6 +127,20 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const asn = await getOmsAsn(userId, String(req.params?.asnId || ''));
     if (!asn) return reply.code(404).send({ error: 'ASN not found' });
     return { asn };
+  });
+
+  fastify.get('/oms/returns', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return getOmsReturns(userId);
+  });
+
+  fastify.get('/oms/returns/:returnId', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const ret = await getOmsReturn(userId, String(req.params?.returnId || ''));
+    if (!ret) return reply.code(404).send({ error: 'Return not found' });
+    return { return: ret };
   });
 
   fastify.get('/oms/customers', async (req: any, reply) => {

@@ -187,6 +187,8 @@ const WMS_STATUS_RANK: Record<string, Record<string, number>> = {
   order: { pending: 0, confirmed: 1, picking: 2, packing: 3, ready_to_ship: 4, shipped: 5, completed: 6 },
   // ASN receiving lifecycle; putaway is tracked separately in payload, not this column.
   asn: { 'in-transit': 0, pending: 0, partial: 1, received: 2, completed: 3 },
+  // Return/RMA lifecycle -- mirrors Return.ts's RETURN_STATUSES on the WMS side exactly.
+  return: { requested: 0, authorized: 1, in_transit: 2, received: 3, restocked: 4, closed: 5 },
 }
 
 /**
@@ -195,7 +197,7 @@ const WMS_STATUS_RANK: Record<string, Record<string, number>> = {
  * - 'cancelled' is terminal: once cancelled, a non-cancelled WMS event cannot revive it,
  * - otherwise apply only when incoming rank >= current rank (no downgrade).
  */
-function wmsStatusAllowsTransition(entity: 'order' | 'asn', current?: string | null, incoming?: string | null): boolean {
+function wmsStatusAllowsTransition(entity: 'order' | 'asn' | 'return', current?: string | null, incoming?: string | null): boolean {
   const cur = String(current || '').trim().toLowerCase()
   const inc = String(incoming || '').trim().toLowerCase()
   if (!inc) return false
@@ -506,6 +508,50 @@ async function upsertWmsAsn(userId: string, warehouseCode: string, body: any) {
      VALUES ($1,$2,$3,$4::jsonb)
      RETURNING id`,
     [userId, asnNumber, incomingStatus || 'created', JSON.stringify(asnPayload)],
+  );
+  return { upserted: inserted?.rows?.[0]?.id || null };
+}
+
+/**
+ * Upsert a Return/RMA row (returns table, migration 028) -- mirrors upsertWmsAsn's structure
+ * exactly: identity by rma_number (WMS's own RMA-xxxx is stable and never re-keyed on the OMS
+ * side, unlike ASN's client-vs-WMS dual-identity dance), no-downgrade status transitions via
+ * WMS_STATUS_RANK, full payload snapshot merged on every update (includes mediaCaptures --
+ * the condition-on-arrival video/photo evidence -- so the OMS Returns screen always has the
+ * latest capture list without a separate fetch back to the WMS).
+ */
+async function upsertWmsReturn(userId: string, warehouseCode: string, body: any) {
+  const payload = bodyPayload(body);
+  const metadata = wmsMetadata(body, warehouseCode);
+  const rmaNumber = textValue(payload.rmaNumber, body.externalReference);
+  if (!rmaNumber) return { skipped: true, reason: 'missing_rma_number' };
+
+  const existing = await pgQuery(
+    `SELECT id, status FROM returns WHERE user_id=$1 AND rma_number=$2 LIMIT 1`,
+    [userId, rmaNumber],
+  );
+  const matchedId = existing?.rows?.[0]?.id || null;
+  const currentStatus = existing?.rows?.[0]?.status || null;
+  const incomingStatus = textValue(payload.status, body.operation);
+  const returnPayload = { ...payload, ...metadata };
+
+  if (matchedId) {
+    const applyStatus = incomingStatus && wmsStatusAllowsTransition('return', currentStatus, incomingStatus);
+    await pgQuery(
+      `UPDATE returns
+       SET status = CASE WHEN $3::boolean THEN $4 ELSE status END,
+           payload = payload || $5::jsonb,
+           updated_at = now()
+       WHERE user_id=$1 AND id=$2`,
+      [userId, matchedId, Boolean(applyStatus), incomingStatus || currentStatus || 'requested', JSON.stringify(returnPayload)],
+    );
+    return { upserted: matchedId };
+  }
+  const inserted = await pgQuery(
+    `INSERT INTO returns (user_id, rma_number, status, payload)
+     VALUES ($1,$2,$3,$4::jsonb)
+     RETURNING id`,
+    [userId, rmaNumber, incomingStatus || 'requested', JSON.stringify(returnPayload)],
   );
   return { upserted: inserted?.rows?.[0]?.id || null };
 }
@@ -938,6 +984,7 @@ async function applyEntityEvent(params: { userId: string; warehouseCode: string;
   if (entityType === 'customer') return upsertWmsCustomer(params.userId, params.warehouseCode, params.body);
   if (entityType === 'order') return upsertWmsOrder(params.userId, params.warehouseCode, params.body);
   if (entityType === 'asn') return upsertWmsAsn(params.userId, params.warehouseCode, params.body);
+  if (entityType === 'return') return upsertWmsReturn(params.userId, params.warehouseCode, params.body);
   if (entityType === 'invoice') return upsertWmsInvoice(params.userId, params.warehouseCode, params.body);
   if (entityType === 'support_ticket') return upsertWmsSupportTicket(params.userId, params.warehouseCode, params.body);
   if (entityType === 'support_ticket_message') return upsertWmsSupportTicketMessage(params.userId, params.warehouseCode, params.body);
