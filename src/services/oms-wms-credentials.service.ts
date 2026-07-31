@@ -62,6 +62,35 @@ export async function getWmsCredentialHeaders(params: {
   };
 }
 
+/**
+ * Any one of this user's active WMS integration credentials, regardless of which warehouse it's
+ * pinned to. Used for OMS-ACCOUNT-level (not warehouse-scoped) WMS routes — e.g. the direct-with-
+ * UnieLogics platform payment-method routes — where the identity the WMS side resolves
+ * (omsIntermediaryId, via the credential's OmsIntermediaryWarehouse link) is the same CENTRAL
+ * OmsIntermediary no matter which connected warehouse's credential authenticates the call.
+ * Prefers `preferredWarehouseCode` (e.g. the account's billingOwningWarehouseCode) when that
+ * warehouse has an active credential on file; otherwise falls back to any active one.
+ */
+export async function getAnyWmsCredentialHeaders(params: {
+  userId: string;
+  preferredWarehouseCode?: string;
+}): Promise<Record<string, string> | null> {
+  const res = await pgQuery<CredentialRow>(
+    `SELECT * FROM oms_wms_credentials
+     WHERE user_id = $1 AND status = 'active'
+     ORDER BY (warehouse_code = $2) DESC, created_at DESC
+     LIMIT 1`,
+    [params.userId, params.preferredWarehouseCode || null],
+  );
+  const credential = res?.rows[0];
+  if (!credential?.passkey_enc) return null;
+  if (credential.expires_at && new Date(credential.expires_at).getTime() <= Date.now()) return null;
+  return {
+    'X-WMS-Client-ID': credential.client_id,
+    'X-WMS-Passkey': decryptPasskey(credential.passkey_enc),
+  };
+}
+
 export async function verifyIncomingWmsCredential(clientId: string, passkey: string): Promise<CredentialRow | null> {
   const res = await pgQuery<CredentialRow>(
     `SELECT * FROM oms_wms_credentials WHERE client_id = $1 AND status = 'active' LIMIT 1`,

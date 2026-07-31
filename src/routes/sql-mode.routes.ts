@@ -6,7 +6,7 @@ import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
 import { publicEntityId } from '../lib/public-id';
-import { registerWmsCredential, getWmsCredentialHeaders } from '../services/oms-wms-credentials.service';
+import { registerWmsCredential, getWmsCredentialHeaders, getAnyWmsCredentialHeaders } from '../services/oms-wms-credentials.service';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { postCortex } from '../services/cortex-orchestration';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
@@ -787,7 +787,7 @@ async function recordOmsWmsConnectionAttempt(input: {
 
 async function buildWmsOmsProfile(userId: string) {
   const user = await one(
-    `SELECT id, email, first_name, last_name, phone, llc_name, billing_address
+    `SELECT id, email, first_name, last_name, phone, llc_name, billing_address, origin, owning_warehouse_code
      FROM app_users
      WHERE id = $1`,
     [userId],
@@ -827,6 +827,11 @@ async function buildWmsOmsProfile(userId: string) {
       omsEmail: email,
       omsLlcName: llcName,
       omsBillingAddress: billingAddress,
+      // Forwarded verbatim to WMS's /internal/oms/connect (spread into its body at the call
+      // site below) so a NEW OmsIntermediary's billingOwnerType reflects how this user actually
+      // signed up, not just whichever warehouse happens to provision it first.
+      origin: user.origin === 'direct' ? 'direct' : 'warehouse_invited',
+      owningWarehouseCode: user.owning_warehouse_code || undefined,
     },
     missing,
   };
@@ -2362,6 +2367,11 @@ const DEFAULT_WMS_BRIDGE_SCOPES = [
   'asns:create',
   'asns:update',
   'billing:read',
+  // Gates the WMS-side platform payment-method routes (direct-with-UnieLogics OMS-account
+  // billing) as well as the existing "Pay Now" on-demand charge — self-service /oms/connect is
+  // the ONLY path a direct (non-warehouse-invited) client goes through, so this credential must
+  // carry billing:write or that client can never manage their own card/ACH on file.
+  'billing:write',
   'events:write',
   'disputes:write',
   'account:deactivate',
@@ -4590,6 +4600,98 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       paymentReference: chargeResult?.paymentReference,
       reason: chargeResult?.reason,
     });
+  });
+
+  // Direct-with-UnieLogics platform billing (card/ACH on file) — proxies through to WMS's
+  // /wms-integration/oms-account/* routes, same pattern/credential trust as "Pay Now" above.
+  // Unlike Pay Now, this is NOT warehouse-scoped: the WMS side resolves the central
+  // OmsIntermediary via whichever warehouse's credential authenticates the call (any active
+  // one works — see getAnyWmsCredentialHeaders), since the identity being billed is the OMS
+  // account itself, not a specific warehouse relationship.
+  async function omsBillingCredentialHeaders(req: any, reply: any): Promise<Record<string, string> | null> {
+    const userId = requireUser(req, reply);
+    if (!userId) return null;
+    const owningWarehouseCode = trim((await one<AnyRow>('SELECT owning_warehouse_code FROM app_users WHERE id = $1', [userId]))?.owning_warehouse_code || '');
+    const headers = await getAnyWmsCredentialHeaders(
+      owningWarehouseCode ? { userId, preferredWarehouseCode: owningWarehouseCode } : { userId },
+    );
+    if (!headers) {
+      reply.code(409).send({ error: 'No WMS integration credential on file. Connect a warehouse first.' });
+      return null;
+    }
+    return headers;
+  }
+
+  app.get('/billing/payment-method', async (req: any, reply) => {
+    const headers = await omsBillingCredentialHeaders(req, reply);
+    if (!headers) return;
+    if (!config.wmsApiUrl) return reply.code(503).send({ error: 'WMS API is not configured' });
+    try {
+      const res = await fetch(`${config.wmsApiUrl}/api/v1/wms-integration/oms-account/payment-method`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json', ...headers },
+      });
+      const data = await res.json().catch(() => ({}));
+      return reply.code(res.status).send(data);
+    } catch (err: any) {
+      req.log?.error?.({ err }, 'WMS oms-account payment-method fetch failed');
+      return reply.code(502).send({ error: 'Could not reach WMS.' });
+    }
+  });
+
+  app.post('/billing/payment-method/setup-intent', async (req: any, reply) => {
+    const headers = await omsBillingCredentialHeaders(req, reply);
+    if (!headers) return;
+    if (!config.wmsApiUrl) return reply.code(503).send({ error: 'WMS API is not configured' });
+    try {
+      const res = await fetch(`${config.wmsApiUrl}/api/v1/wms-integration/oms-account/payment-method/setup-intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      return reply.code(res.status).send(data);
+    } catch (err: any) {
+      req.log?.error?.({ err }, 'WMS oms-account setup-intent request failed');
+      return reply.code(502).send({ error: 'Could not reach WMS.' });
+    }
+  });
+
+  app.delete('/billing/payment-method', async (req: any, reply) => {
+    const headers = await omsBillingCredentialHeaders(req, reply);
+    if (!headers) return;
+    if (!config.wmsApiUrl) return reply.code(503).send({ error: 'WMS API is not configured' });
+    try {
+      const res = await fetch(`${config.wmsApiUrl}/api/v1/wms-integration/oms-account/payment-method`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', ...headers },
+      });
+      const data = await res.json().catch(() => ({}));
+      return reply.code(res.status).send(data);
+    } catch (err: any) {
+      req.log?.error?.({ err }, 'WMS oms-account payment-method delete failed');
+      return reply.code(502).send({ error: 'Could not reach WMS.' });
+    }
+  });
+
+  app.post('/billing/terms-accept', async (req: any, reply) => {
+    const headers = await omsBillingCredentialHeaders(req, reply);
+    if (!headers) return;
+    const termsVersion = trim(req.body?.termsVersion);
+    if (!termsVersion) return reply.code(400).send({ error: 'termsVersion is required' });
+    if (!config.wmsApiUrl) return reply.code(503).send({ error: 'WMS API is not configured' });
+    try {
+      const res = await fetch(`${config.wmsApiUrl}/api/v1/wms-integration/oms-account/terms-accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({ termsVersion }),
+      });
+      const data = await res.json().catch(() => ({}));
+      return reply.code(res.status).send(data);
+    } catch (err: any) {
+      req.log?.error?.({ err }, 'WMS oms-account terms-accept request failed');
+      return reply.code(502).send({ error: 'Could not reach WMS.' });
+    }
   });
 
   app.get('/notes', async (req: any, reply) => {

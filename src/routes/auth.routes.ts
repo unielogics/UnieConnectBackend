@@ -134,6 +134,11 @@ async function autoConnectWarehouseFromInvite(userId: string, metadata: any, req
     omsEmail: String(profile.email || '').toLowerCase().trim(),
     omsLlcName: trim(profile.llcName || profile.companyName),
     omsBillingAddress: billingAddress,
+    // This function only fires for metadata.source === 'wms_intermediary_invite' (checked
+    // above), so origin is always warehouse_invited here — matches app_users.origin for
+    // the account this invite created. Drives OmsIntermediary.billingOwnerType on WMS's side.
+    origin: 'warehouse_invited' as const,
+    owningWarehouseCode: warehouseCode,
   };
   const connected = await callWmsInternal<{
     warehouseCode: string;
