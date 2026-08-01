@@ -347,6 +347,18 @@ async function upsertWmsOrder(userId: string, warehouseCode: string, body: any) 
   const orderNumber = textValue(wmsOrderNumber, altOrderNumber, externalOrderId);
   if (!externalOrderId && !orderNumber) return { skipped: true, reason: 'missing_order_identity' };
   const metadata = wmsMetadata(body, warehouseCode);
+  // Seller-visible "this order needs a WMS shipping decision" signal (rate-shop fee/service-level
+  // approval gate) -- namespaced, not spread, so it can never collide with the fixed
+  // wmsMetadata() fields above. Read by the OMS frontend's Orders screen (Orders.tsx's norm())
+  // and order detail modal (OrderModal.tsx) to surface a Hold tab/chip + reason banner. Present
+  // (even when held:false) on every hold-related sync so a release clears a stale banner.
+  if (payload.held !== undefined) {
+    (metadata as any).wmsHold = {
+      held: !!payload.held,
+      reason: payload.heldReason || null,
+      at: payload.heldAt || null,
+    };
+  }
 
   // Identity match precedence (all scoped to user_id = this OMS account):
   //  1. alternativeOrderNumber → the client's native order (id / order_number / external_order_id).
