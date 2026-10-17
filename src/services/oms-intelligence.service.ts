@@ -1738,7 +1738,6 @@ function recommendationTaskTarget(rec: any) {
 
 function recommendationBelongsInTaskInbox(rec: any) {
   const state = String(rec?.approvalState || '').toLowerCase();
-  if (['waiting_approval', 'approved', 'rejected'].includes(state)) return false;
 
   const text = [
     rec?.recommendationType,
@@ -1753,8 +1752,11 @@ function recommendationBelongsInTaskInbox(rec: any) {
 
   // The task inbox is for prerequisite work. Concrete current-vs-suggested
   // decisions remain in the decision surface where approve/deny has meaning.
-  return state.includes('blocked') ||
+  const isPrerequisiteWork = state.includes('blocked') ||
     /(upload|connect|configure|complete|missing|readiness|evidence|feed|enrich|baseline|required data|data source)/.test(text);
+  if (isPrerequisiteWork && !['approved', 'rejected'].includes(state)) return true;
+  if (['waiting_approval', 'approved', 'rejected'].includes(state)) return false;
+  return false;
 }
 
 function priorityForTask(text: string, score?: number) {
@@ -1937,7 +1939,7 @@ export async function refreshCortexTasks(userId: string) {
   }
 
   for (const rec of (recs.recommendations || []).filter(recommendationBelongsInTaskInbox) as any[]) {
-    const dedupeKey = `work:${taskDedupeSlug(`${rec.entityType || rec.recommendationType}:${rec.entityId || rec.title}`)}`;
+    const dedupeKey = `work:${taskDedupeSlug(`${rec.entityType || rec.recommendationType}:${rec.entityId || ''}:${rec.title}`)}`;
     activeKeys.add(dedupeKey);
     const target = recommendationTaskTarget(rec);
     await upsertCortexTask(userId, {
@@ -3478,6 +3480,11 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
   }
 
   for (const item of aiItems.slice(0, 8)) {
+    const recommendationText = [item?.category, item?.title, item?.why, item?.action]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    const isPrerequisiteWork = /(data|readiness|enrich|feed|upload|evidence|missing|connect|configure|complete)/.test(recommendationText);
     await createRecommendation(userId, {
       runId: run?.id || null,
       recommendationType: String(item?.category || 'data_readiness'),
@@ -3489,7 +3496,7 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
       optimizedValue: { action: item?.action || null },
       estimatedImpact: { priority: String(item?.priority || 'medium') },
       requiredAction: String(item?.action || 'review'),
-      approvalState: 'waiting_approval',
+      approvalState: isPrerequisiteWork ? 'not_required' : 'waiting_approval',
       wmsTruthState: 'forecast_only',
       confidence,
       sourceSummary: {
