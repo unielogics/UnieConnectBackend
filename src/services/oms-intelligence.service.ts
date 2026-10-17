@@ -2096,7 +2096,8 @@ function humanizeCortexTimestamp(value: string) {
 }
 
 function polishCortexChatText(text: string) {
-  return scrubVendorLanguage(text)
+  const proseOnly = String(text || '').split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence):/i, 1)[0] || '';
+  return scrubVendorLanguage(proseOnly)
     .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/Cortex response unavailable; used scoped OMS fallback\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/\bread_locations\s+scope\b/gi, 'Shopify location inventory permission')
@@ -2165,7 +2166,7 @@ function normalizeChatAction(value: any) {
 }
 
 function chatRequestsActions(message: string) {
-  return /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|improve|resolve|set up|get started)/i.test(message);
+  return /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
 }
 
 function chatEntityLookupTerms(message: string) {
