@@ -1851,7 +1851,7 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     getCortexTasks(userId, { status: 'open', limit: 20, refresh: options.refreshTasks }),
     rows(`SELECT entity_type, entity_id, event_type, source_system, summary, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]).catch(() => []),
     rows(`SELECT id, sku, title, weight, dimensions, attributes, metadata, wms_inventory FROM catalog_items WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
-    rows(`SELECT id, order_number, channel, status, total, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(`SELECT id, order_number, channel, status, totals, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT warehouse_code, status, facility_id, metadata, connected_at FROM oms_warehouse_links WHERE user_id = $1 ORDER BY connected_at DESC NULLS LAST LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, name, status, email, metadata, updated_at FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, filename, status, row_count, findings_count, estimated_refunds, optimized_service_savings, created_at FROM oms_label_audit_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10`, [userId]).catch(() => []),
@@ -1904,7 +1904,15 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     ledger,
     samples: {
       skus: skus.map((r) => ({ id: r.id, sku: r.sku, title: r.title, weight: r.weight, dimensions: json(r.dimensions, {}), source: r.metadata?.source || r.metadata?.importSource || null })),
-      orders: orders.map((r) => ({ id: r.id, orderNumber: r.order_number, channel: r.channel, status: r.status, total: money(r.total), state: r.shipping_address?.state || r.shipping_address?.province || null })),
+      orders: orders.map((r) => ({
+        id: r.id,
+        orderNumber: r.order_number,
+        channel: r.channel,
+        status: r.status,
+        total: money(r.totals?.total ?? r.totals?.grandTotal ?? r.totals?.price ?? r.totals?.amount),
+        currency: r.totals?.currency || r.totals?.currencyCode || 'USD',
+        state: r.shipping_address?.state || r.shipping_address?.province || null,
+      })),
       warehouses,
       suppliers,
       labelAuditRuns: labelRuns,
@@ -2021,9 +2029,138 @@ function chatRequestsActions(message: string) {
   return /(what should|what can|how (?:do|can|should)|next step|action|recommend|help me|fix|improve|resolve|set up|get started)/i.test(message);
 }
 
-function buildChatFocusContext(message: string, screen: string, context: any) {
+function chatEntityLookupTerms(message: string) {
+  const quoted = Array.from(String(message || '').matchAll(/["'`]([^"'`]{2,80})["'`]/g))
+    .map((match) => match[1]);
+  const tokens = String(message || '').match(/[A-Za-z0-9][A-Za-z0-9._:/#-]{3,79}/g) || [];
+  return Array.from(new Set([...quoted, ...tokens]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter((value) => value.length >= 4 && (/\d/.test(value) || /[-_/#]/.test(value)))))
+    .slice(0, 8);
+}
+
+async function resolveChatEntities(userId: string, message: string) {
+  const terms = chatEntityLookupTerms(message);
+  if (!terms.length) return { terms: [], skus: [], orders: [], asns: [] };
+
+  const [skus, orders, asns] = await Promise.all([
+    rows(
+      `SELECT ci.id, ci.sku, ci.title,
+              COALESCE(ci.metadata->>'subtitle', ci.metadata->>'subTitle', ci.attributes->>'subtitle', ci.sub_category) AS subtitle,
+              COALESCE(ci.metadata->>'brand', ci.attributes->>'brand') AS brand,
+              ci.description,
+              COALESCE(ci.metadata->>'size', ci.attributes->>'size') AS size,
+              ci.weight, ci.dimensions, ci.upc, ci.ean, ci.asin, ci.image, ci.images,
+              ci.attributes, ci.metadata, ci.wms_inventory, ci.supplier_id,
+              s.name AS supplier_name
+         FROM catalog_items ci
+         LEFT JOIN suppliers s ON s.id = ci.supplier_id AND s.user_id = ci.user_id
+        WHERE ci.user_id = $1
+          AND COALESCE(ci.archived, false) = false
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(ci.id) = term
+                OR lower(ci.sku) = term
+                OR lower(COALESCE(ci.asin, '')) = term
+                OR lower(COALESCE(ci.upc, '')) = term
+                OR lower(COALESCE(ci.ean, '')) = term
+                OR lower(ci.sku) LIKE '%' || term || '%'
+          )
+        ORDER BY ci.updated_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+    rows(
+      `SELECT o.id, o.order_number, o.external_order_id, o.channel, o.status, o.totals,
+              COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'id', ol.id, 'sku', ol.sku, 'title', ol.title,
+                  'quantity', ol.quantity, 'unitPrice', ol.unit_price,
+                  'totalPrice', ol.total_price
+                ) ORDER BY ol.created_at)
+                FROM order_lines ol
+                WHERE ol.user_id = o.user_id AND ol.order_id = o.id
+              ), '[]'::jsonb) AS line_items,
+              o.shipping_address, o.tracking_number, o.placed_at, o.updated_at
+         FROM orders o
+        WHERE o.user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(o.id) = term
+                OR lower(COALESCE(o.order_number, '')) = term
+                OR lower(COALESCE(o.external_order_id, '')) = term
+                OR lower(COALESCE(o.tracking_number, '')) = term
+                OR lower(COALESCE(o.order_number, '')) LIKE '%' || term || '%'
+          )
+        ORDER BY COALESCE(o.placed_at, o.updated_at) DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+    rows(
+      `SELECT id, asn_number, status, shipment_plan_id, payload, created_at, updated_at
+         FROM asns
+        WHERE user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(id) = term
+                OR lower(COALESCE(asn_number, '')) = term
+                OR lower(COALESCE(asn_number, '')) LIKE '%' || term || '%'
+          )
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+  ]);
+
+  return {
+    terms,
+    skus: skus.map((item: any) => ({
+      id: item.id,
+      sku: item.sku,
+      title: item.title,
+      subtitle: item.subtitle,
+      brand: item.brand,
+      description: item.description,
+      size: item.size,
+      weight: item.weight,
+      dimensions: json(item.dimensions, {}),
+      identifiers: { upc: item.upc, ean: item.ean, asin: item.asin },
+      imageCount: Array.isArray(item.images) ? item.images.length : item.image ? 1 : 0,
+      supplier: item.supplier_id ? { id: item.supplier_id, name: item.supplier_name } : null,
+      attributes: json(item.attributes, {}),
+      metadata: json(item.metadata, {}),
+      wmsInventory: json(item.wms_inventory, {}),
+    })),
+    orders: orders.map((order: any) => ({
+      id: order.id,
+      orderNumber: order.order_number,
+      externalOrderId: order.external_order_id,
+      channel: order.channel,
+      status: order.status,
+      total: money(order.totals?.total ?? order.totals?.grandTotal ?? order.totals?.price ?? order.totals?.amount),
+      currency: order.totals?.currency || order.totals?.currencyCode || 'USD',
+      lineItems: json(order.line_items, []),
+      shippingAddress: json(order.shipping_address, {}),
+      trackingNumber: order.tracking_number,
+      placedAt: iso(order.placed_at),
+      updatedAt: iso(order.updated_at),
+    })),
+    asns: asns.map((asn: any) => ({
+      id: asn.id,
+      asnNumber: asn.asn_number,
+      status: asn.status,
+      shipmentPlanId: asn.shipment_plan_id,
+      payload: json(asn.payload, {}),
+      createdAt: iso(asn.created_at),
+      updatedAt: iso(asn.updated_at),
+    })),
+  };
+}
+
+async function buildChatFocusContext(userId: string, message: string, screen: string, context: any) {
   const q = String(message || '').toLowerCase();
   const samples = context?.samples || {};
+  const resolvedEntities = await resolveChatEntities(userId, message);
   if (screen === 'connections' || /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q)) {
     const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
     const connections = (samples.marketplaceConnections || [])
@@ -2051,7 +2188,8 @@ function buildChatFocusContext(message: string, screen: string, context: any) {
       topic: 'shipments_and_asns',
       instruction: 'Answer from shipment plans and ASNs first.',
       shipmentPlans: samples.shipmentPlans || [],
-      asns: samples.asns || [],
+      asns: resolvedEntities.asns.length ? resolvedEntities.asns : samples.asns || [],
+      resolvedEntities,
     };
   }
   if (screen === 'billing' || /(billing|invoice|cost|margin|profit)/.test(q)) {
@@ -2062,10 +2200,26 @@ function buildChatFocusContext(message: string, screen: string, context: any) {
     };
   }
   if (screen === 'orders' || /\border(s)?\b/.test(q)) {
-    return { topic: 'orders', instruction: 'Answer from the account order sample and readiness counts first.', orders: samples.orders || [] };
+    return {
+      topic: 'orders',
+      instruction: resolvedEntities.orders.length
+        ? 'Answer from the exact account-scoped order matches first. Do not substitute another order.'
+        : 'Answer from the account order sample and readiness counts first.',
+      orders: resolvedEntities.orders.length ? resolvedEntities.orders : samples.orders || [],
+      resolvedEntities,
+      requiredSource: 'oms_orders',
+    };
   }
   if (screen === 'skus' || screen === 'sku-detail' || /\b(sku|product|listing|inventory)\b/.test(q)) {
-    return { topic: 'catalog', instruction: 'Answer from the SKU and inventory evidence first.', skus: samples.skus || [] };
+    return {
+      topic: 'catalog',
+      instruction: resolvedEntities.skus.length
+        ? 'Answer from the exact account-scoped SKU or product matches first. Do not substitute another item.'
+        : 'Answer from the SKU and inventory evidence first.',
+      skus: resolvedEntities.skus.length ? resolvedEntities.skus : samples.skus || [],
+      resolvedEntities,
+      requiredSource: 'oms_skus',
+    };
   }
   if (screen === 'warehouses' || /\b(warehouse|wms|facility)\b/.test(q)) {
     return { topic: 'warehouses', instruction: 'Answer from connected warehouse evidence first.', warehouses: samples.warehouses || [] };
@@ -2269,7 +2423,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
 
   const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
-  const focusContext = buildChatFocusContext(message, screen, context);
+  const focusContext = await buildChatFocusContext(userId, message, screen, context);
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
