@@ -7,7 +7,14 @@ import { ebayGet } from './ebay';
 import { setSyncStatus } from './channel-sync-status';
 import { pushOrderToWms } from '../routes/sql-mode.routes';
 
-type PullResult = { products?: number; orders?: number; customers?: number; inventory?: number; errors?: Record<string, string> };
+type PullResult = {
+  products?: number;
+  orders?: number;
+  customers?: number;
+  inventory?: number;
+  errors?: Record<string, string>;
+  warnings?: Record<string, string>;
+};
 
 type SyncContext = {
   userId: string;
@@ -531,9 +538,19 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
 
   try {
     await setSyncStatus(ctx.channelAccountId, 'inventory', 'syncing');
-    const count = await syncShopifyInventory(ctx, base, headers);
-    result.inventory = count;
-    await setSyncStatus(ctx.channelAccountId, 'inventory', 'synced', { count });
+    const inventorySync = await syncShopifyInventory(ctx, base, headers);
+    result.inventory = inventorySync.count;
+    if (inventorySync.warning) {
+      result.warnings = { ...(result.warnings || {}), inventory: inventorySync.warning };
+    }
+    await setSyncStatus(ctx.channelAccountId, 'inventory', 'synced', {
+      count: inventorySync.count,
+      metadata: {
+        source: inventorySync.source,
+        degraded: Boolean(inventorySync.warning),
+        warning: inventorySync.warning || null,
+      },
+    });
   } catch (err: any) {
     const error = err?.message || 'Inventory sync failed';
     result.errors!.inventory = error;
@@ -570,14 +587,20 @@ async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Rec
   if (!locationsRes.ok) {
     if (locationsRes.status === 401 || locationsRes.status === 403) {
       const fallback = await syncShopifyInventoryFromMappedVariants(ctx);
-      if (fallback > 0) return fallback;
+      if (fallback > 0) {
+        return {
+          count: fallback,
+          source: 'mapped_variant_fallback',
+          warning: 'Location-level inventory is unavailable. Reconnect Shopify with read_locations scope.',
+        };
+      }
       throw new Error('Locations access denied. Reconnect Shopify with read_locations scope.');
     }
     throw new Error(`HTTP ${locationsRes.status}`);
   }
   const locationsBody: any = await locationsRes.json();
   const location = Array.isArray(locationsBody?.locations) ? locationsBody.locations[0] : null;
-  if (!location?.id) return 0;
+  if (!location?.id) return { count: 0, source: 'inventory_levels' };
   const res = await fetch(`${base}/inventory_levels.json?limit=250&location_ids[]=${encodeURIComponent(String(location.id))}`, { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const body: any = await res.json();
@@ -608,7 +631,7 @@ async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Rec
     );
     count++;
   }
-  return count;
+  return { count, source: 'inventory_levels' };
 }
 
 async function syncShopifyInventoryFromMappedVariants(ctx: SyncContext) {

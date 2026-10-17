@@ -50,6 +50,8 @@ export async function runMarketplaceSyncOnce() {
       });
       await markMarketplaceRefresh(connection.id, connection.user_id, syncResult);
       const syncErrors = Object.keys(syncResult.errors || {});
+      const syncWarnings = Object.keys(syncResult.warnings || {});
+      const issueCount = syncErrors.length + syncWarnings.length;
       await pgQuery(
         `INSERT INTO oms_execution_ledger
           (user_id, entity_type, entity_id, event_type, source_system, summary, payload)
@@ -57,14 +59,14 @@ export async function runMarketplaceSyncOnce() {
         [
           connection.user_id,
           connection.id,
-          syncErrors.length ? 'scheduled_refresh_partial' : 'scheduled_refresh_completed',
-          syncErrors.length
-            ? `Scheduled Shopify refresh completed with ${syncErrors.length} warning(s) for ${connection.shop_domain}.`
+          issueCount ? 'scheduled_refresh_partial' : 'scheduled_refresh_completed',
+          issueCount
+            ? `Scheduled Shopify refresh completed with ${issueCount} warning(s) for ${connection.shop_domain}.`
             : `Scheduled Shopify refresh completed for ${connection.shop_domain}.`,
           JSON.stringify({ accountId: connection.id, syncResult }),
         ],
       ).catch(() => null);
-      if (syncErrors.length) result.failed++;
+      if (issueCount) result.failed++;
       else result.synced++;
     } catch (error: any) {
       await pgQuery(
