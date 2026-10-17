@@ -831,6 +831,8 @@ function hasMaterialOptimizedPlan(current: any, optimized: any, savings: any) {
     'sla',
     'slaDays',
     'averageDeliveryDays',
+    'estimatedMonthlyCost',
+    'stockoutRiskSkus',
   ];
   const hasMeasuredChange = comparableKeys.some((key) => {
     const before = Number(current?.[key]);
@@ -1518,7 +1520,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
   } else if (filter.channel === 'unmapped') {
     velocityClauses.push('o.channel_connection_id IS NULL');
   }
-  const [items, facilities, velocityRows, snapshot] = await Promise.all([
+  const [items, facilities, velocityRows, snapshot, billing] = await Promise.all([
     getItems(userId, 200, filter),
     getFacilities(userId),
     rows<{ sku: string; units: string }>(
@@ -1531,34 +1533,46 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
       velocityValues,
     ),
     latestSellerOptimizationSnapshot(userId),
+    getBillingCategoryTotals(userId, rangeStart('30d')),
   ]);
   const velocityBySku = new Map(velocityRows.map((row) => [String(row.sku || ''), number(row.units)]));
   const planSkus = items.map((item, index) => mapSkuPlan(item, index, velocityBySku, facilities.length, filter));
+  const observedMonthlyUnits = planSkus.reduce((sum, sku) => sum + Math.round(sku.velocity30d), 0);
+  const initialReplenishment = planSkus.reduce((sum, sku) => sum + Math.round(sku.proposedUnits), 0);
+  const observedMonthlyCost = money(
+    billing.totals.freight
+    + billing.totals.storage
+    + billing.totals.handling
+    + billing.totals.accessorials
+    + billing.totals.materials
+    - Math.abs(billing.totals.refundsCaptured),
+  );
   const months = Array.from({ length: horizon === '6m' ? 6 : 3 }, (_, i) => {
     const date = new Date();
     date.setMonth(date.getMonth() + i);
     return {
       month: date.toLocaleString('en-US', { month: 'short', year: 'numeric' }),
-      projectedUnits: planSkus.reduce((sum, sku) => sum + Math.round(sku.velocity30d * (1 + i * 0.08)), 0),
-      proposedReplenishment: planSkus.reduce((sum, sku) => sum + Math.round(sku.proposedUnits * (i % 2 === 0 ? 0.42 : 0.25)), 0),
-      savings: money(planSkus.length ? i * 180 + planSkus.length * 18 : 0),
+      projectedUnits: observedMonthlyUnits,
+      proposedReplenishment: i === 0 ? initialReplenishment : 0,
+      savings: 0,
     };
   });
 
   const localPlan = {
     horizon,
+    modelStatus: 'not_modeled',
     generatedAt: new Date().toISOString(),
     current: {
       skuCount: items.length,
       warehouseCount: facilities.length,
       stockoutRiskSkus: planSkus.filter((s) => s.risk === 'high').length,
-      estimatedMonthlyCost: money(planSkus.length * 32),
+      estimatedMonthlyCost: observedMonthlyCost,
     },
     proposed: {
-      warehouseCount: facilities.length ? Math.max(2, facilities.length) : 0,
-      stockoutRiskSkus: planSkus.filter((s) => s.risk === 'high').length > 0 ? Math.max(1, Math.floor(planSkus.filter((s) => s.risk === 'high').length / 2)) : 0,
-      estimatedMonthlyCost: money((planSkus.length * 32) * 0.82),
-      sharedPalletCandidates: planSkus.filter((s) => s.fillPercent < 75).length,
+      warehouseCount: null,
+      stockoutRiskSkus: null,
+      estimatedMonthlyCost: null,
+      sharedPalletCandidates: null,
     },
     months,
     skus: planSkus,
@@ -1570,17 +1584,26 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
       state: f.address?.stateOrProvinceCode || f.address?.state,
     })),
   };
+  const snapshotCurrentInventory = snapshot?.inventoryPlan?.current;
+  const snapshotProposedInventory = snapshot?.inventoryPlan?.proposed;
+  const snapshotInventorySavings = {
+    savings: Array.isArray(snapshot?.inventoryPlan?.months)
+      ? snapshot.inventoryPlan.months.reduce((sum: number, month: any) => sum + number(month?.savings), 0)
+      : 0,
+  };
+  const snapshotInventoryIsModeled = hasMaterialOptimizedPlan(snapshotCurrentInventory, snapshotProposedInventory, snapshotInventorySavings);
   const cortexInventoryPlan = hasPlanPayload(snapshot?.inventoryPlan)
     ? {
         ...localPlan,
         ...snapshot?.inventoryPlan,
         horizon: snapshot?.inventoryPlan?.horizon || horizon,
         generatedAt: snapshot?.updatedAt || snapshot?.createdAt || localPlan.generatedAt,
-        current: snapshot?.inventoryPlan?.current || localPlan.current,
-        proposed: snapshot?.inventoryPlan?.proposed || localPlan.proposed,
-        months: Array.isArray(snapshot?.inventoryPlan?.months) ? snapshot?.inventoryPlan?.months : localPlan.months,
+        current: snapshotInventoryIsModeled ? (snapshotCurrentInventory || localPlan.current) : localPlan.current,
+        proposed: snapshotInventoryIsModeled ? snapshotProposedInventory : localPlan.proposed,
+        months: snapshotInventoryIsModeled && Array.isArray(snapshot?.inventoryPlan?.months) ? snapshot?.inventoryPlan?.months : localPlan.months,
         skus: Array.isArray(snapshot?.inventoryPlan?.skus) && snapshot?.inventoryPlan?.skus.length ? snapshot?.inventoryPlan?.skus : localPlan.skus,
         warehouses: Array.isArray(snapshot?.inventoryPlan?.warehouses) ? snapshot?.inventoryPlan?.warehouses : localPlan.warehouses,
+        modelStatus: snapshotInventoryIsModeled ? 'modeled' : 'not_modeled',
       }
     : null;
   return attachCortexSource(cortexInventoryPlan || localPlan, snapshot, cortexInventoryPlan ? 'cortex_seller_optimization' : 'local_fallback_inventory_plan');
