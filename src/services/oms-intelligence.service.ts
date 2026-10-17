@@ -3490,7 +3490,11 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
         },
         confidence,
         cortexStatus: 'ok',
-        cortexResponse: { schema_version: (result as any)?.schema_version, engagement_id: engagementId },
+        cortexResponse: {
+          schema_version: (result as any)?.schema_version,
+          engagement_id: engagementId,
+          execution_id: (result as any)?.execution_id || null,
+        },
       });
     }
     return { ok: true, runId: run?.id || null, cortexRunId, recommendationCount: 0, skipped: 'empty_bundle' };
@@ -3630,6 +3634,7 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
       cortexResponse: {
         schema_version: (result as any)?.schema_version,
         engagement_id: engagementId,
+        execution_id: (result as any)?.execution_id || null,
         recommendation_count: created,
       },
     });
