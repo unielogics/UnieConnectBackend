@@ -1798,6 +1798,7 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
       ? snapshot.inventoryPlan.months.reduce((sum: number, month: any) => sum + number(month?.savings), 0)
       : 0,
   };
+  const snapshotInventoryHasScenario = hasPlanPayload(snapshot?.inventoryPlan);
   const snapshotInventoryIsModeled = hasMaterialOptimizedPlan(snapshotCurrentInventory, snapshotProposedInventory, snapshotInventorySavings);
   const modelBaselineMonthlyCost = money(snapshotCurrentInventory?.estimatedMonthlyCost ?? snapshotCurrentInventory?.monthlyCost);
   const modelBaselineWarehouseNodes = number(snapshotCurrentInventory?.warehouseCount ?? snapshotCurrentInventory?.warehouseNodes);
@@ -1828,9 +1829,9 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
         months: decisionReady && Array.isArray(snapshot?.inventoryPlan?.months) ? snapshot?.inventoryPlan?.months : localPlan.months,
         skus: decisionReady && Array.isArray(snapshot?.inventoryPlan?.skus) && snapshot?.inventoryPlan?.skus.length ? snapshot?.inventoryPlan?.skus : localPlan.skus,
         warehouses: decisionReady && Array.isArray(snapshot?.inventoryPlan?.warehouses) ? snapshot?.inventoryPlan?.warehouses : localPlan.warehouses,
-        modelStatus: snapshotInventoryIsModeled ? 'modeled' : 'not_modeled',
+        modelStatus: snapshotInventoryHasScenario ? 'modeled' : 'not_modeled',
         decisionReady,
-        impactStatus: decisionReady ? 'traceable' : snapshotInventoryIsModeled ? 'scenario_only' : 'needs_model',
+        impactStatus: decisionReady ? 'traceable' : snapshotInventoryHasScenario ? 'scenario_only' : 'needs_model',
         grounding: {
           observedMonthlyCost,
           modelBaselineMonthlyCost,
