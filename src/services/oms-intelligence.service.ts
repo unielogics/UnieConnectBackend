@@ -1002,7 +1002,7 @@ async function buildSellerOptimizationContext(
   readiness: any,
   networkPolicy: any,
 ) {
-  const [warehouseRows, supplierRows, channelRows] = await Promise.all([
+  const [warehouseRows, supplierRows, channelRows, orderRows] = await Promise.all([
     rows(
       `SELECT DISTINCT ON (l.warehouse_code)
               l.warehouse_code, l.metadata AS link_metadata,
@@ -1022,6 +1022,33 @@ async function buildSellerOptimizationContext(
          FROM marketplace_connections
         WHERE user_id = $1 AND status IN ('connected','active','synced')
         ORDER BY updated_at DESC`,
+      [userId],
+    ).catch(() => []),
+    rows(
+      `SELECT COALESCE(o.external_order_id, o.order_number, o.id) AS order_external_id,
+              COALESCE(o.placed_at, o.created_at) AS order_date,
+              o.channel,
+              o.shipping_address,
+              ol.sku,
+              ol.quantity,
+              ol.unit_price,
+              ol.total_price,
+              ci.asin,
+              ci.weight,
+              ci.dimensions,
+              ci.attributes,
+              ci.metadata
+         FROM orders o
+         INNER JOIN order_lines ol
+           ON ol.order_id = o.id AND ol.user_id = o.user_id
+         LEFT JOIN catalog_items ci
+           ON ci.id = ol.item_id AND ci.user_id = o.user_id
+        WHERE o.user_id = $1
+          AND COALESCE(o.status, '') <> 'cancelled'
+          AND COALESCE(o.placed_at, o.created_at) >= now() - interval '365 days'
+          AND COALESCE(ol.quantity, 0) > 0
+        ORDER BY COALESCE(o.placed_at, o.created_at) DESC, ol.id
+        LIMIT 5000`,
       [userId],
     ).catch(() => []),
   ]);
@@ -1065,6 +1092,30 @@ async function buildSellerOptimizationContext(
 
   const primaryChannel = String(channelRows[0]?.channel || '').toLowerCase();
   const marketplaceCode = primaryChannel ? `${primaryChannel}_us` : undefined;
+  const omsOrderFinancialRows = orderRows.map((order: any) => {
+    const quantity = Math.max(0, number(order.quantity));
+    const dimensions = json(order.dimensions, {});
+    const attributes = json(order.attributes, {});
+    const metadata = json(order.metadata, {});
+    const shippingAddress = json(order.shipping_address, {});
+    const unitCost = number(attributes.cost ?? metadata.cost ?? metadata.unitCost);
+    const lineRevenue = Math.max(0, number(order.total_price) || (number(order.unit_price) * quantity));
+    const row: Record<string, any> = {
+      order_external_id: String(order.order_external_id || '').slice(0, 160),
+      order_date_iso: iso(order.order_date),
+      sku: String(order.sku || '').slice(0, 160) || undefined,
+      asin: String(order.asin || '').trim().toUpperCase().slice(0, 16) || undefined,
+      quantity,
+      revenue_usd: lineRevenue,
+      product_cogs_usd: unitCost > 0 ? Math.round(unitCost * quantity * 100) / 100 : undefined,
+      ship_to_postal: addressPart(shippingAddress, 'zip', 'zipCode', 'postalCode', 'postal_code', 'postal').slice(0, 20) || undefined,
+      package_weight_lb: number(order.weight) > 0 ? number(order.weight) : undefined,
+      package_length_in: number(dimensions.length ?? dimensions.l) > 0 ? number(dimensions.length ?? dimensions.l) : undefined,
+      package_width_in: number(dimensions.width ?? dimensions.w) > 0 ? number(dimensions.width ?? dimensions.w) : undefined,
+      package_height_in: number(dimensions.height ?? dimensions.h) > 0 ? number(dimensions.height ?? dimensions.h) : undefined,
+    };
+    return Object.fromEntries(Object.entries(row).filter(([, value]) => value !== undefined && value !== null && value !== ''));
+  });
   const topSkus = [...skus]
     .sort((left: any, right: any) => number(right?.velocity30d) - number(left?.velocity30d))
     .slice(0, 50)
@@ -1093,7 +1144,10 @@ async function buildSellerOptimizationContext(
   if (marketplaceCode) networkContextPatch.marketplace_code = marketplaceCode;
 
   const anchorWarehouseCode = String(networkPolicy?.activePolicy?.anchorWarehouseCode || '').trim();
-  const planningBody: Record<string, any> = { fulfillment_modes: ['fbm'] };
+  const planningBody: Record<string, any> = {
+    fulfillment_modes: ['fbm'],
+    oms_order_financial_rows: omsOrderFinancialRows,
+  };
   if (anchorWarehouseCode) {
     planningBody.primary_warehouse_id = anchorWarehouseCode;
     planningBody.must_include_primary_warehouse = networkPolicy?.multiWarehouseExecutable === false;
@@ -1129,6 +1183,11 @@ async function buildSellerOptimizationContext(
       skuCount: skus.length,
       skuCostCount: Object.keys(supplierCostBySku).length,
       supplierOriginCount: Object.keys(productOriginsBySku).length,
+      orderFinancialRowCount: omsOrderFinancialRows.length,
+      orderFinancialFirstAt: omsOrderFinancialRows.length
+        ? omsOrderFinancialRows[omsOrderFinancialRows.length - 1]?.order_date_iso || null
+        : null,
+      orderFinancialLastAt: omsOrderFinancialRows[0]?.order_date_iso || null,
     },
   };
 }
