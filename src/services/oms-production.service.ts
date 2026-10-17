@@ -691,7 +691,11 @@ async function baseCounts(userId: string) {
       (SELECT COUNT(*) FROM suppliers WHERE user_id = $1)::int AS suppliers,
       (SELECT COUNT(*) FROM marketplace_connections WHERE user_id = $1)::int AS channels,
       (SELECT COUNT(*) FROM shipment_plans WHERE user_id = $1)::int AS shipment_plans,
-      (SELECT COUNT(*) FROM facilities WHERE user_id = $1 OR user_id IS NULL)::int AS facilities`,
+      (SELECT COUNT(DISTINCT warehouse_code)
+         FROM oms_warehouse_links
+        WHERE user_id = $1
+          AND status = 'connected'
+          AND COALESCE(metadata->>'source', '') <> 'demo')::int AS facilities`,
     [userId],
   );
   const first = data[0] || {};
@@ -746,10 +750,16 @@ async function getItems(userId: string, limit = 200, filter: MarketplaceFilter =
 
 async function getFacilities(userId: string) {
   const data = await rows(
-    `SELECT * FROM facilities
-     WHERE (user_id = $1 OR user_id IS NULL)
-       AND COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo')
-     ORDER BY code ASC LIMIT 200`,
+    `SELECT DISTINCT ON (f.id) f.*
+       FROM facilities f
+       INNER JOIN oms_warehouse_links l
+         ON l.facility_id = f.id OR (l.facility_id IS NULL AND upper(l.warehouse_code) = upper(f.code))
+      WHERE l.user_id = $1
+        AND l.status = 'connected'
+        AND COALESCE(l.metadata->>'source', '') <> 'demo'
+        AND COALESCE(f.metadata->>'source', '') NOT IN ('sql_default','demo')
+      ORDER BY f.id, f.code ASC
+      LIMIT 200`,
     [userId],
   );
   return data;

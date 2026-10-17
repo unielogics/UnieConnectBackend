@@ -249,7 +249,7 @@ export async function getDataReadiness(userId: string) {
        (SELECT COUNT(*) FROM orders WHERE user_id = $1)::int AS orders,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1 AND channel_connection_id IS NOT NULL)::int AS marketplace_orders,
        (SELECT COUNT(*) FROM orders WHERE user_id = $1 AND LOWER(COALESCE(metadata->>'source', '')) LIKE '%csv%')::int AS csv_orders,
-       (SELECT COUNT(*) FROM facilities WHERE (user_id = $1 OR user_id IS NULL) AND COALESCE(metadata->>'source', '') NOT IN ('sql_default','demo'))::int AS facilities,
+       (SELECT COUNT(DISTINCT warehouse_code) FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected' AND COALESCE(metadata->>'source', '') <> 'demo')::int AS facilities,
        (SELECT COUNT(*) FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected')::int AS wms_links,
        (SELECT COUNT(*) FROM suppliers WHERE user_id = $1)::int AS suppliers,
        (SELECT COUNT(*) FROM suppliers WHERE user_id = $1 AND COALESCE(metadata->'pickupProfile'->>'hoursOfOperation', metadata->>'hoursOfOperation', '') <> '')::int AS suppliers_with_pickup,
