@@ -1374,21 +1374,44 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
       ...(unmapped ? [{ severity: 'medium', title: 'Supplier mapping gap', detail: `${unmapped} SKUs are missing supplier assignment for shipment planning.` }] : []),
       ...(counts.channels === 0 ? [{ severity: 'high', title: 'No marketplace connection', detail: 'Connect Amazon, Shopify, or eBay to keep OMS forecasts live.' }] : []),
     ],
-    autonomousActivity: activityLedger.map((event) => {
-      const payload = json(event.payload, {});
-      const rawImpact = payload.impact ?? payload.savings ?? payload.outcome;
-      return {
-        id: event.id,
-        entityType: event.entity_type,
-        entityId: event.entity_id || null,
-        system: event.source_system || 'OMS',
-        action: event.summary || String(event.event_type || 'System event').replace(/[._-]+/g, ' '),
-        status: payload.status || payload.result || 'recorded',
-        confidence: event.confidence == null ? null : number(event.confidence),
-        impact: typeof rawImpact === 'string' || typeof rawImpact === 'number' ? rawImpact : null,
-        at: iso(event.created_at),
-      };
-    }),
+    autonomousActivity: (() => {
+      const collapsed: any[] = [];
+      const bySignature = new Map<string, any>();
+      activityLedger.forEach((event) => {
+        const payload = json(event.payload, {});
+        const rawImpact = payload.impact ?? payload.savings ?? payload.outcome;
+        const item = {
+          id: event.id,
+          entityType: event.entity_type,
+          entityId: event.entity_id || null,
+          system: event.source_system || 'OMS',
+          action: event.summary || String(event.event_type || 'System event').replace(/[._-]+/g, ' '),
+          status: payload.status || payload.result || 'recorded',
+          confidence: event.confidence == null ? null : number(event.confidence),
+          impact: typeof rawImpact === 'string' || typeof rawImpact === 'number' ? rawImpact : null,
+          at: iso(event.created_at),
+          firstAt: iso(event.created_at),
+          occurrences: 1,
+        };
+        const signature = [
+          item.entityType,
+          item.entityId,
+          event.event_type,
+          item.system,
+          item.action,
+          item.status,
+        ].map((value) => String(value || '').trim().toLowerCase()).join('|');
+        const existing = bySignature.get(signature);
+        if (existing) {
+          existing.occurrences += 1;
+          existing.firstAt = item.at;
+          return;
+        }
+        bySignature.set(signature, item);
+        collapsed.push(item);
+      });
+      return collapsed;
+    })(),
     counts,
   };
 }

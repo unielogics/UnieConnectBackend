@@ -1836,7 +1836,7 @@ export async function refreshCortexTasks(userId: string) {
           ? `Authorize ${channel.charAt(0).toUpperCase()}${channel.slice(1)} marketplace connection`
           : `Repair ${displayName} ${degradedNames.join(' and ')} sync`,
       detail: missingShopifyLocations
-        ? 'Shopify products and orders are connected, but location inventory is using variant-level fallback quantities because read_locations is not authorized.'
+        ? 'Shopify products and orders are connected, but warehouse-level inventory is using fallback quantities because Shopify location inventory access has not been approved.'
         : disconnected
           ? `The ${channel} connection is ${connectionState === 'needs authorization' ? 'waiting for authorization' : connectionState}.`
           : `${degradedNames.join(', ')} data is degraded or reporting an error. Open Connections to review the provider evidence and repair the feed.`,
