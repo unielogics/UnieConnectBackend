@@ -13,7 +13,7 @@ Check the response:
 
 - `shopifyConfig.appBaseUrl` → `https://api.unieconnect.com`
 - `shopifyConfig.webhookAddress` → `https://api.unieconnect.com/api/v1/webhooks/shopify`
-- `shopifyConfig.apiVersion` → valid (e.g. `2024-01`). If `2026-01` or other future/unsupported version, change to `2024-01`.
+- `shopifyConfig.apiVersion` -> a currently supported stable version (for example, `2026-10`).
 - `shopifyConfig.hasWebhookSecret` → `true`
 - `shopifyConfig.redirectUri` → `https://api.unieconnect.com/api/v1/auth/shopify/callback`
 
@@ -40,7 +40,7 @@ Use **Client credentials** to confirm `client_id` and `client_secret` match your
 | `SHOPIFY_CLIENT_ID` | Matches Partners app |
 | `SHOPIFY_CLIENT_SECRET` | Matches Partners app |
 | `SHOPIFY_WEBHOOK_SECRET` | Must match the **Webhook subscription API** signing secret in Partners app settings |
-| `SHOPIFY_API_VERSION` | Use `2024-01` or `2024-10` (avoid unsupported versions) |
+| `SHOPIFY_API_VERSION` | Use a currently supported stable Shopify Admin API version (currently `2026-10`) |
 
 **Webhook secret:** In Partners app settings, under **Webhooks**, check for a signing secret. If shown, it must equal `SHOPIFY_WEBHOOK_SECRET`. Many apps reuse `SHOPIFY_CLIENT_SECRET` as the webhook signing secret; confirm this matches your setup.
 
@@ -131,7 +131,7 @@ If you see **"Locations fetch failed"** or **"Locations access denied"** in the 
 
 ## Quick Actions
 
-1. Set `SHOPIFY_API_VERSION=2024-01` in production env (or use the 2026→2024 fallback in config).
+1. Set `SHOPIFY_API_VERSION=2026-10` in production and review it quarterly against Shopify's supported versions.
 2. Redeploy.
 3. Disconnect and reconnect the store.
 4. Watch logs during reconnect.

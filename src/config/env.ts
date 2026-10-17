@@ -32,8 +32,9 @@ export const config = {
       'customers/delete',
     ].join(',')).split(',').map((s) => s.trim()).filter(Boolean),
     appBaseUrl: process.env.APP_BASE_URL || '', // e.g., https://api.unieconnect.com
-    // 2026-01 may not be released; webhook registration fails. Use 2024-01 for compatibility.
-    apiVersion: (process.env.SHOPIFY_API_VERSION || '2024-01').replace(/^2026-/, '2024-'),
+    // Keep this on a supported stable Shopify API version. Unsupported versions only work via
+    // Shopify's fall-forward behavior and can change underneath a production integration.
+    apiVersion: process.env.SHOPIFY_API_VERSION || '2026-10',
   },
   /**
    * Base URL of the frontend app for post-OAuth redirects and invite links (e.g.
