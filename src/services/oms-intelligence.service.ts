@@ -1652,9 +1652,23 @@ async function upsertCortexTask(userId: string, task: any) {
 
 export async function refreshCortexTasks(userId: string) {
   await ensureCortexWorkspaceTables();
-  const [readiness, recs] = await Promise.all([
+  const [readiness, recs, marketplaceConnections] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { status: 'open', limit: 100 }),
+    rows(
+      `SELECT m.id, m.channel, m.status, m.display_name, m.shop_domain, m.scopes,
+              COALESCE((
+                SELECT jsonb_object_agg(s.entity_type, jsonb_build_object(
+                  'status', s.status, 'count', s.count, 'error', s.error,
+                  'metadata', s.metadata, 'lastSyncedAt', s.last_synced_at
+                ))
+                  FROM channel_sync_status s
+                 WHERE s.channel_account_id = m.id
+              ), '{}'::jsonb) AS sync
+         FROM marketplace_connections m
+        WHERE m.user_id = $1 AND COALESCE(m.metadata->>'source', '') <> 'demo'`,
+      [userId],
+    ).catch(() => []),
   ]);
   const activeKeys = new Set<string>();
 
@@ -1703,11 +1717,61 @@ export async function refreshCortexTasks(userId: string) {
     });
   }
 
+  for (const connection of marketplaceConnections as any[]) {
+    const channel = String(connection.channel || 'marketplace').toLowerCase();
+    const displayName = String(connection.display_name || connection.shop_domain || channel);
+    const scopes = Array.isArray(connection.scopes) ? connection.scopes.map(String) : [];
+    const sync = json(connection.sync, {});
+    const syncEntries = Object.entries(sync) as Array<[string, any]>;
+    const degradedEntries = syncEntries.filter(([, state]) => Boolean(
+      state?.error || state?.metadata?.degraded || state?.status === 'error',
+    ));
+    const missingShopifyLocations = channel === 'shopify'
+      && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations');
+    const disconnected = !['connected', 'active', 'synced'].includes(String(connection.status || '').toLowerCase());
+    if (!missingShopifyLocations && !degradedEntries.length && !disconnected) continue;
+
+    const issueKind = missingShopifyLocations ? 'location-inventory-access' : disconnected ? 'authorization' : 'sync-health';
+    const dedupeKey = `connection:${connection.id}:${issueKind}`;
+    activeKeys.add(dedupeKey);
+    const degradedNames = degradedEntries.map(([entity]) => entity.replace(/_/g, ' '));
+    await upsertCortexTask(userId, {
+      dedupeKey,
+      source: 'connection_health',
+      screen: 'connections',
+      entityType: 'marketplace_connection',
+      entityId: connection.id,
+      title: missingShopifyLocations
+        ? `Reconnect ${displayName} for warehouse-level inventory`
+        : disconnected
+          ? `Finish ${displayName} marketplace authorization`
+          : `Repair ${displayName} ${degradedNames.join(' and ')} sync`,
+      detail: missingShopifyLocations
+        ? 'Shopify products and orders are connected, but location inventory is using variant-level fallback quantities because read_locations is not authorized.'
+        : disconnected
+          ? `The ${channel} connection is ${String(connection.status || 'not connected').replace(/_/g, ' ')}.`
+          : `${degradedNames.join(', ')} data is degraded or reporting an error. Open Connections to review the provider evidence and repair the feed.`,
+      priority: 'high',
+      actionLabel: missingShopifyLocations ? 'Repair Shopify access' : 'Open Connections',
+      actionTarget: 'connections',
+      evidence: {
+        channel,
+        connectionStatus: connection.status,
+        missingScopes: missingShopifyLocations ? ['read_locations'] : [],
+        degradedEntities: degradedEntries.map(([entity, state]) => ({
+          entity,
+          status: state?.status,
+          error: state?.error || state?.metadata?.warning || null,
+        })),
+      },
+    });
+  }
+
   await pgQuery(
     `UPDATE oms_cortex_tasks
      SET status = 'done', completed_at = COALESCE(completed_at, now()), auto_completed_at = COALESCE(auto_completed_at, now()), updated_at = now()
      WHERE user_id = $1 AND status = 'open' AND dedupe_key LIKE ANY($2::text[]) AND NOT (dedupe_key = ANY($3::text[]))`,
-    [userId, ['readiness:%', 'recommendation:%', 'work:%'], Array.from(activeKeys)],
+    [userId, ['readiness:%', 'recommendation:%', 'work:%', 'connection:%'], Array.from(activeKeys)],
   ).catch(() => null);
 
   const tasks = await rows(
