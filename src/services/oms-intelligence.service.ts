@@ -2568,6 +2568,14 @@ export async function getCortexChatThreads(userId: string, query: any = {}) {
     values.push(String(query.screen));
     filters.push(`screen = $${values.length}`);
   }
+  if (query.entityType) {
+    values.push(String(query.entityType));
+    filters.push(`entity_type = $${values.length}`);
+  }
+  if (query.entityId) {
+    values.push(String(query.entityId));
+    filters.push(`entity_id = $${values.length}`);
+  }
   values.push(Math.min(50, Math.max(1, number(query.limit, 20))));
   const data = await rows(
     `SELECT * FROM oms_cortex_chat_threads WHERE ${filters.join(' AND ')}
