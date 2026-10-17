@@ -2532,7 +2532,7 @@ function normalizeChatSource(value: any) {
 
 function normalizeChatAction(value: any) {
   if (!value || typeof value !== 'object') return null;
-  const title = String(value.title || value.actionLabel || value.label || '').trim().slice(0, 180);
+  const title = humanizeInternalLanguage(value.title || value.actionLabel || value.label || '').trim().slice(0, 180);
   if (!title) return null;
   const requestedTarget = String(value.actionTarget || value.screen || '').trim();
   const inferred = taskTargetFromText(`${title} ${value.detail || value.summary || ''}`);
@@ -2545,7 +2545,7 @@ function normalizeChatAction(value: any) {
       : 'normal',
     screen: actionTarget,
     actionTarget,
-    actionLabel: String(value.actionLabel || value.label || title).slice(0, 120),
+    actionLabel: humanizeInternalLanguage(value.actionLabel || value.label || title).trim().slice(0, 120),
     entityId: value.entityId ? String(value.entityId).slice(0, 160) : undefined,
   };
 }
@@ -3136,18 +3136,33 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         .filter(Boolean);
     }
     normalized.tasks = normalized.tasks.map((action: any) => {
-      if (action.entityId) return action;
       const actionTarget = String(action.actionTarget || action.screen || '');
-      const matchingTask = contextTasks.find((task: any) => {
+      const matchingTask = contextTasks.find((task: any) => String(task.id || '') === String(action.id || ''))
+        || contextTasks.find((task: any) => {
         if (String(task.actionTarget || task.screen || '') !== actionTarget) return false;
         if (actionTarget !== 'connections' || !requestedChannel) return true;
         const text = `${task.dedupeKey || ''} ${task.title || ''} ${task.detail || ''}`.toLowerCase();
         return String(task.source || '') === 'connection_health' && text.includes(requestedChannel);
       });
       return matchingTask
-        ? { ...action, id: action.id || matchingTask.id, entityId: matchingTask.entityId || undefined }
+        ? normalizeChatAction({
+            id: matchingTask.id,
+            title: matchingTask.title,
+            priority: matchingTask.priority,
+            screen: matchingTask.screen,
+            actionTarget: matchingTask.actionTarget || matchingTask.screen,
+            actionLabel: matchingTask.actionLabel,
+            entityId: matchingTask.entityId,
+          })
         : action;
-    });
+    }).filter(Boolean);
+    const seenActions = new Set<string>();
+    normalized.tasks = normalized.tasks.filter((action: any) => {
+      const key = action.id || `${String(action.title || '').toLowerCase()}|${action.actionTarget || action.screen || ''}`;
+      if (seenActions.has(key)) return false;
+      seenActions.add(key);
+      return true;
+    }).slice(0, 3);
   }
   if (actionIntent && normalized.tasks.length) {
     const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
@@ -3155,7 +3170,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       const first = normalized.tasks[0];
       const actionLabel = String(first.actionLabel || 'Open the related screen').replace(/[.!]+$/, '');
       const taskTitle = String(first.title || '').replace(/[.!]+$/, '');
-      normalized.answer = polishCortexChatText(`${normalized.answer}\n\nFirst action: ${actionLabel}${taskTitle ? ` and complete “${taskTitle}.”` : '.'}`);
+      const sameLabel = actionLabel.localeCompare(taskTitle, undefined, { sensitivity: 'base' }) === 0;
+      normalized.answer = polishCortexChatText(`${normalized.answer}\n\nFirst action: ${actionLabel}${taskTitle && !sameLabel ? ` to complete “${taskTitle}.”` : '.'}`);
     }
   }
   const marketplaceAnswerHasCoverage = /(products?|orders?)/i.test(normalized.answer)
@@ -3169,6 +3185,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     const focusedSources = normalized.sources.filter((source: any) => source?.source === requiredFocusSource.source);
     normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
+  normalized.sources = normalized.sources.slice(0, 5);
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = !accountGroundedFastPath && Boolean(cortex?.ok);
   const cortexHealth = {
