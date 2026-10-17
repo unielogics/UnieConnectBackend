@@ -2442,7 +2442,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
             ? `${entity.replace(/_/g, ' ')}: ${item.error || item.metadata.warning}`
             : null)
           .filter(Boolean);
-        if (issues.length) lines.push(`Attention required: ${issues.join('; ')}.`);
+        if (issues.length) lines.push(`Attention required: ${issues.join('; ').replace(/[.\s]+$/, '')}.`);
         const scopes = Array.isArray(connection.scopes) ? connection.scopes.map((scope: any) => String(scope)) : [];
         if (channel === 'shopify' && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations')) {
           lines.push('Next step: reconnect Shopify with location access so inventory can synchronize by warehouse instead of using product-variant fallback quantities.');
@@ -2592,6 +2592,23 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
+  if (normalized.tasks.length) {
+    const contextTasks = Array.isArray(context?.tasks) ? context.tasks : [];
+    const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => message.toLowerCase().includes(channel));
+    normalized.tasks = normalized.tasks.map((action: any) => {
+      if (action.entityId) return action;
+      const actionTarget = String(action.actionTarget || action.screen || '');
+      const matchingTask = contextTasks.find((task: any) => {
+        if (String(task.actionTarget || task.screen || '') !== actionTarget) return false;
+        if (actionTarget !== 'connections' || !requestedChannel) return true;
+        const text = `${task.dedupeKey || ''} ${task.title || ''} ${task.detail || ''}`.toLowerCase();
+        return String(task.source || '') === 'connection_health' && text.includes(requestedChannel);
+      });
+      return matchingTask
+        ? { ...action, id: action.id || matchingTask.id, entityId: matchingTask.entityId || undefined }
+        : action;
+    });
+  }
   const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
     && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
   const marketplaceAnswerHasCoverage = /(products?|orders?)/i.test(normalized.answer)
