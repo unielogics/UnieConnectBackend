@@ -1589,6 +1589,10 @@ function recommendationBelongsInTaskInbox(rec: any) {
     rec?.requiredAction,
   ].filter(Boolean).join(' ').toLowerCase();
 
+  const isReadySignal = /\bready\b/.test(text)
+    && !/(not ready|incomplete|missing|blocked|requires? action|needs? (?:data|work|attention|cleanup))/.test(text);
+  if (isReadySignal) return false;
+
   // The task inbox is for prerequisite work. Concrete current-vs-suggested
   // decisions remain in the decision surface where approve/deny has meaning.
   return state.includes('blocked') ||
