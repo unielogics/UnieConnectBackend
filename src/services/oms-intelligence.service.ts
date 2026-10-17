@@ -101,17 +101,6 @@ const SELLER_OPTIMIZATION_RECOMMENDATION_TYPES = [
   'data_readiness',
 ];
 
-// Proposed per-category cost-reduction percentages for the advisory "AI billing plan". These are
-// ADVISORY projections (the WMS does not actually re-rate today), capped conservatively so the hero
-// can never imply near-free operations. Each carries the itemized action shown to the seller.
-const BILLING_PLAN_CATEGORY_ACTIONS: Record<string, { pct: number; action: string }> = {
-  freight: { pct: 0.16, action: 'Carrier/lane re-rate + shared-pallet consolidation on top outbound lanes.' },
-  storage: { pct: 0.1, action: 'Storage tier downgrade + pre-positioning of slow-movers to cheaper zones.' },
-  handling: { pct: 0.12, action: 'Split-node fulfillment to shorten pick paths and cut per-order handling.' },
-  accessorials: { pct: 0.24, action: 'Dim-weight reclass + automated accessorial disputes on flagged charges.' },
-  materials: { pct: 0.05, action: 'Right-sized packaging substitution to reduce material spend per order.' },
-};
-
 const CORTEX_TASK_STATUS = new Set(['open', 'done', 'dismissed']);
 
 async function rows<T extends Row = Row>(sql: string, values: unknown[] = []): Promise<T[]> {
@@ -710,8 +699,9 @@ export async function generateBillingPlanRecommendations(
   const { totals, hasReal } = await getBillingCategoryTotals(userId, start);
   if (!hasReal) return []; // No real spend yet → no plan to propose (avoids empty/zero-impact recs).
 
-  // Storage has a REAL per-account signal (unlike the other categories, which are still sized from
-  // the fixed menu until their own real signals are wired — see the P1-P5 punch list in memory):
+  // Storage currently has the only real per-account optimization signal. Other categories must not
+  // inherit fixed percentage assumptions: they stay visible as observed costs until a provider,
+  // lane, rate-card, or operating baseline can support a traceable alternative.
   // computeStorageCharge already bills the CHEAPEST of bin/cuft/item by default. If an account's
   // storage lines show billByCheapest=true, the WMS has no cheaper alternative left to switch to —
   // proposing a flat 10% would be a fabricated number. Only surface (and size) a storage suggestion
@@ -745,12 +735,7 @@ export async function generateBillingPlanRecommendations(
       confidence = 0.75; // higher: backed by a real observed billing-rule gap, not a guess
       dataDriven = true;
     } else {
-      const cfg = BILLING_PLAN_CATEGORY_ACTIONS[category] || { pct: 0.1, action: 'Cost review.' };
-      pct = cfg.pct;
-      action = cfg.action;
-      // Honest confidence: categories still sized from the fixed menu (no real signal wired yet)
-      // are capped lower than a data-backed suggestion, and scale up slightly with sample size.
-      confidence = category === 'storage' ? 0.3 : 0.45;
+      continue;
     }
     pct = Math.min(0.25, Math.max(0, pct)); // hard cap 25%
     const optimized = Math.round(current * (1 - pct) * 100) / 100;
@@ -795,9 +780,9 @@ export async function generateBillingPlanRecommendations(
     estimatedImpact: { monthlySavings: planSavings, annualizedSavings: Math.round(planSavings * 12 * 100) / 100 },
     requiredAction: 'review_billing_savings',
     approvalState: 'waiting_approval',
-    wmsTruthState: 'forecast_only',
-    confidence: 0.6,
-    sourceSummary: { primarySource: 'wms_invoices', basis: 'trailing_30d' },
+    wmsTruthState: 'wms_confirmed',
+    confidence: 0.75,
+    sourceSummary: { primarySource: 'wms_invoices', basis: 'trailing_30d', dataDriven: true },
   }));
 
   return created;
@@ -811,6 +796,19 @@ export async function generateBillingPlanRecommendations(
  */
 export async function ensureBillingPlanRecommendations(userId: string, staleHours = 12) {
   try {
+    // Retire legacy fixed-percentage billing suggestions before deciding whether a fresh plan is
+    // needed. They were scenarios, not account-grounded decisions, and must never remain approvable.
+    await pgQuery(
+      `UPDATE oms_recommendations
+       SET status = 'superseded',
+           approval_state = CASE WHEN approval_state IN ('approved', 'rejected') THEN approval_state ELSE 'superseded' END,
+           updated_at = now()
+       WHERE user_id = $1
+         AND recommendation_type = ANY($2::text[])
+         AND status = 'open'
+         AND COALESCE(source_summary->>'dataDriven', 'false') <> 'true'`,
+      [userId, ['billing_plan', 'billing_category', 'billing_profit']],
+    ).catch(() => null);
     const existing = await one(
       `SELECT created_at FROM oms_recommendations
        WHERE user_id = $1 AND recommendation_type = 'billing_plan' AND status = 'open'
