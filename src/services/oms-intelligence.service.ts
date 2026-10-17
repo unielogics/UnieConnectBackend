@@ -1721,8 +1721,10 @@ function taskTargetFromText(text: string) {
 function recommendationTaskTarget(rec: any) {
   const type = String(rec?.recommendationType || '').toLowerCase();
   const entityType = String(rec?.entityType || '').toLowerCase();
+  const title = String(rec?.title || '').toLowerCase();
   const text = `${type} ${entityType} ${rec?.title || ''} ${rec?.summary || ''}`.toLowerCase();
   if (type.includes('data_enrichment') || type.includes('data_readiness')) {
+    if (title.includes('feed completeness')) return { screen: 'connections', actionLabel: 'Improve data sources' };
     const target = taskTargetFromText(`${text} ${rec?.requiredAction || ''}`);
     return { screen: target.screen, actionLabel: target.actionLabel };
   }
