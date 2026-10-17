@@ -1766,7 +1766,21 @@ export async function dismissCortexTask(userId: string, taskId: string) {
 }
 
 async function getAccountOmsContextBundle(userId: string, screen: string, options: { refreshTasks?: boolean } = {}) {
-  const [readiness, recommendations, tasksRes, ledger, skus, orders, warehouses, suppliers, labelRuns] = await Promise.all([
+  const [
+    readiness,
+    recommendations,
+    tasksRes,
+    ledger,
+    skus,
+    orders,
+    warehouses,
+    suppliers,
+    labelRuns,
+    marketplaces,
+    shipmentPlans,
+    asns,
+    billing,
+  ] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { screen, status: 'open', limit: 10 }),
     getCortexTasks(userId, { status: 'open', limit: 20, refresh: options.refreshTasks }),
@@ -1776,6 +1790,44 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     rows(`SELECT warehouse_code, status, facility_id, metadata, connected_at FROM oms_warehouse_links WHERE user_id = $1 ORDER BY connected_at DESC NULLS LAST LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, name, status, email, metadata, updated_at FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, filename, status, row_count, findings_count, estimated_refunds, optimized_service_savings, created_at FROM oms_label_audit_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10`, [userId]).catch(() => []),
+    rows(
+      `SELECT m.id, m.channel, m.status, m.display_name, m.shop_domain, m.marketplace_id,
+              m.scopes, m.last_sync_at,
+              COALESCE((
+                SELECT jsonb_object_agg(s.entity_type, jsonb_build_object(
+                  'status', s.status, 'count', s.count, 'error', s.error,
+                  'metadata', s.metadata, 'lastSyncedAt', s.last_synced_at
+                ))
+                FROM channel_sync_status s WHERE s.channel_account_id = m.id
+              ), '{}'::jsonb) AS sync
+         FROM marketplace_connections m
+        WHERE m.user_id = $1 AND COALESCE(m.metadata->>'source', '') <> 'demo'
+        ORDER BY m.updated_at DESC LIMIT 25`,
+      [userId],
+    ).catch(() => []),
+    rows(
+      `SELECT sp.id, sp.shipment_title, sp.status, sp.marketplace_type, sp.estimated_arrival_date,
+              jsonb_array_length(sp.items) AS item_count,
+              s.name AS supplier_name, f.code AS facility_code, f.name AS facility_name
+         FROM shipment_plans sp
+         LEFT JOIN suppliers s ON s.id = sp.supplier_id AND s.user_id = sp.user_id
+         LEFT JOIN facilities f ON f.id = sp.facility_id
+        WHERE sp.user_id = $1 ORDER BY sp.updated_at DESC LIMIT 20`,
+      [userId],
+    ).catch(() => []),
+    rows(
+      `SELECT a.id, a.asn_number, a.status, a.shipment_plan_id, a.created_at, a.updated_at
+         FROM asns a WHERE a.user_id = $1 ORDER BY a.updated_at DESC LIMIT 20`,
+      [userId],
+    ).catch(() => []),
+    one(
+      `SELECT count(*)::int AS line_count,
+              count(*) FILTER (WHERE status = 'open')::int AS open_count,
+              COALESCE(sum(amount), 0)::numeric AS total_amount,
+              COALESCE(sum(amount) FILTER (WHERE status = 'open'), 0)::numeric AS open_amount
+         FROM invoice_lines WHERE user_id = $1`,
+      [userId],
+    ).catch(() => null),
   ]);
   return {
     tenant: { userId, accountScope: 'authenticated_oms_account' },
@@ -1791,7 +1843,34 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       warehouses,
       suppliers,
       labelAuditRuns: labelRuns,
+      marketplaceConnections: marketplaces,
+      shipmentPlans: shipmentPlans.map((row: any) => ({
+        ...row,
+        item_count: number(row.item_count),
+      })),
+      asns,
+      billing: billing ? {
+        lineCount: number(billing.line_count),
+        openCount: number(billing.open_count),
+        totalAmount: money(billing.total_amount),
+        openAmount: money(billing.open_amount),
+      } : { lineCount: 0, openCount: 0, totalAmount: 0, openAmount: 0 },
     },
+    sourceCatalog: [
+      { source: 'oms_data_readiness', screen: 'command', label: 'Account readiness' },
+      { source: 'oms_cortex_tasks', screen: 'command', label: 'Cortex tasks' },
+      { source: 'oms_recommendations', screen: 'double', label: 'Cortex decisions' },
+      { source: 'oms_skus', screen: 'skus', label: 'SKU catalog' },
+      { source: 'oms_orders', screen: 'orders', label: 'Orders' },
+      { source: 'oms_warehouses', screen: 'warehouses', label: 'Warehouses' },
+      { source: 'oms_suppliers', screen: 'suppliers', label: 'Suppliers' },
+      { source: 'oms_marketplace_connections', screen: 'connections', label: 'Marketplace connections' },
+      { source: 'oms_shipment_plans', screen: 'shipments', label: 'Shipment plans' },
+      { source: 'oms_asns', screen: 'shipments', label: 'ASNs' },
+      { source: 'oms_label_audits', screen: 'labels', label: 'Label audits' },
+      { source: 'oms_billing', screen: 'billing', label: 'Billing' },
+      { source: 'oms_execution_ledger', screen: 'ledger', label: 'Execution ledger' },
+    ],
   };
 }
 
@@ -1815,6 +1894,62 @@ function scrubVendorLanguage(text: string) {
     .replace(/\bNIM\b/g, 'Cortex')
     .replace(/\bNVIDIA\b/gi, 'Cortex')
     .replace(/\bdrivers?\b/gi, 'runtime');
+}
+
+const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
+  oms_data_readiness: { screen: 'command', label: 'Account readiness' },
+  oms_cortex_tasks: { screen: 'command', label: 'Cortex tasks' },
+  oms_recommendations: { screen: 'double', label: 'Cortex decisions' },
+  oms_context_samples: { screen: 'command', label: 'OMS account context' },
+  oms_skus: { screen: 'skus', label: 'SKU catalog' },
+  oms_orders: { screen: 'orders', label: 'Orders' },
+  oms_warehouses: { screen: 'warehouses', label: 'Warehouses' },
+  oms_suppliers: { screen: 'suppliers', label: 'Suppliers' },
+  oms_marketplace_connections: { screen: 'connections', label: 'Marketplace connections' },
+  oms_shipment_plans: { screen: 'shipments', label: 'Shipment plans' },
+  oms_asns: { screen: 'shipments', label: 'ASNs' },
+  oms_label_audits: { screen: 'labels', label: 'Label audits' },
+  oms_billing: { screen: 'billing', label: 'Billing' },
+  oms_execution_ledger: { screen: 'ledger', label: 'Execution ledger' },
+};
+
+const CORTEX_CHAT_SCREENS = new Set([
+  'command', 'double', 'plan', 'product-research', 'skus', 'warehouses', 'sku-detail',
+  'orders', 'returns', 'customers', 'suppliers', 'shipments', 'heatmap', 'labels',
+  'billing', 'audits', 'marketplace', 'support', 'inbox', 'connections', 'ledger', 'profile',
+]);
+
+function normalizeChatSource(value: any) {
+  const raw = typeof value === 'string' ? { source: value } : value && typeof value === 'object' ? value : {};
+  const source = String(raw.source || raw.name || '').toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+  const canonical = CORTEX_CHAT_SOURCES[source];
+  if (!canonical) return null;
+  return {
+    ...raw,
+    source,
+    label: canonical.label,
+    screen: canonical.screen,
+  };
+}
+
+function normalizeChatAction(value: any) {
+  if (!value || typeof value !== 'object') return null;
+  const title = String(value.title || value.actionLabel || value.label || '').trim().slice(0, 180);
+  if (!title) return null;
+  const requestedTarget = String(value.actionTarget || value.screen || '').trim();
+  const inferred = taskTargetFromText(`${title} ${value.detail || value.summary || ''}`);
+  const actionTarget = CORTEX_CHAT_SCREENS.has(requestedTarget) ? requestedTarget : inferred.screen;
+  return {
+    id: value.id ? String(value.id).slice(0, 160) : undefined,
+    title,
+    priority: ['high', 'normal', 'low'].includes(String(value.priority || '').toLowerCase())
+      ? String(value.priority).toLowerCase()
+      : 'normal',
+    screen: actionTarget,
+    actionTarget,
+    actionLabel: String(value.actionLabel || value.label || title).slice(0, 120),
+    entityId: value.entityId ? String(value.entityId).slice(0, 160) : undefined,
+  };
 }
 
 function readablePosture(value: any) {
@@ -1913,14 +2048,16 @@ function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof bu
   const data = cortex?.data || {};
   if (!cortex?.ok) return fallback;
   const answer = data.answer || data.text || data.message || data.response?.answer || data.result?.answer || data.result?.text || fallback.answer;
-  const sources = data.sources || data.citations || data.response?.sources || data.result?.sources || [];
-  const tasks = data.suggested_actions || data.suggestedActions || data.tasks || data.response?.tasks || [];
+  const rawSources = data.sources || data.citations || data.response?.sources || data.result?.sources || [];
+  const rawTasks = data.suggested_actions || data.suggestedActions || data.tasks || data.response?.tasks || [];
+  const sources = (Array.isArray(rawSources) ? rawSources : []).map(normalizeChatSource).filter(Boolean);
+  const tasks = (Array.isArray(rawTasks) ? rawTasks : []).map(normalizeChatAction).filter(Boolean);
   const confidence = closedLoopNumber(data.confidence, data.response?.confidence, data.result?.confidence);
   const readinessNotes = data.readiness_notes || data.readinessNotes || data.blocked_reason || data.missing_data || null;
   return {
     answer: scrubVendorLanguage(String(answer || fallback.answer)),
-    sources: Array.isArray(sources) && sources.length ? sources : fallback.sources,
-    tasks: Array.isArray(tasks) && tasks.length ? tasks : fallback.tasks,
+    sources: sources.length ? sources : fallback.sources.map(normalizeChatSource).filter(Boolean),
+    tasks: tasks.length ? tasks : fallback.tasks.map(normalizeChatAction).filter(Boolean),
     confidence: confidence ?? fallback.confidence,
     readinessNotes: readinessNotes ? scrubVendorLanguage(String(readinessNotes)) : readinessNotes,
   };
