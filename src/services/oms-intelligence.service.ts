@@ -2456,6 +2456,24 @@ function chatRequestsActions(message: string) {
   return /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
 }
 
+function conversationAwareChatQuery(message: string, history: Array<{ role?: string; content?: string }>) {
+  const current = String(message || '').trim();
+  if (!current) return current;
+  const words = current.split(/\s+/).filter(Boolean);
+  const standaloneTopic = /\b(shopify|amazon|ebay|marketplace|connection|sync|inventory|sku|product|listing|order|shipment|asn|warehouse|wms|supplier|billing|invoice|cost|margin|profit|label|audit|return|customer|task|readiness|decision|optimization|plan)\b/i.test(current);
+  const contextualFollowup = words.length <= 16 && (
+    /^(why|how|what about|and what|then what|what next|where|when|which one|can you explain|explain that|tell me more)\b/i.test(current)
+    || /\b(this|that|it|those|these|them|they|same issue|about that|about it)\b/i.test(current)
+  );
+  if (standaloneTopic || !contextualFollowup) return current;
+
+  const previousUserMessage = [...history]
+    .reverse()
+    .find((entry) => entry?.role === 'user' && String(entry?.content || '').trim());
+  if (!previousUserMessage) return current;
+  return `${String(previousUserMessage.content).trim()}\nFollow-up: ${current}`;
+}
+
 function chatRequestsDecision(message: string) {
   return /\b(current\s+(?:vs\.?|versus)\s+(?:suggested|optimized)|decision|approval|approve|accept|deny|decline)\b/i.test(message);
 }
@@ -2934,7 +2952,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
 
   const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
-  const focusContext = await buildChatFocusContext(userId, message, screen, context, entityType, entityId);
+  const focusQuery = conversationAwareChatQuery(message, threadHistory);
+  const focusContext = await buildChatFocusContext(userId, focusQuery, screen, context, entityType, entityId);
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
@@ -2943,7 +2962,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         confidence: 0.35,
         readinessNotes: 'Cortex is not configured for this account.',
       }
-    : buildLocalCortexChatFallback(message, context);
+    : buildLocalCortexChatFallback(focusQuery, context);
   const cortex = await postCortex('/v1/orchestration/oms/chat', {
     tenant_id: userId,
     userId,
