@@ -2058,8 +2058,47 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   const gapLine = gaps.length ? `What is holding it back: ${gaps.join('; ')}.` : 'Nothing major is blocking the core intelligence path right now.';
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
   const actionIntent = q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
+  const marketplaceIntent = /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q);
 
-  if (q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next')) {
+  if (marketplaceIntent) {
+    const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
+    const connections = (Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections : [])
+      .filter((connection: any) => !requestedChannel || String(connection?.channel || '').toLowerCase() === requestedChannel);
+    if (!connections.length) {
+      lines.push(requestedChannel
+        ? `There is no ${requestedChannel.charAt(0).toUpperCase()}${requestedChannel.slice(1)} connection on this account.`
+        : 'There are no marketplace connections on this account.');
+      lines.push('Open Connections to authorize the marketplace before expecting products, orders, or inventory to synchronize.');
+    } else {
+      for (const connection of connections.slice(0, 4)) {
+        const channel = String(connection.channel || 'marketplace');
+        const label = channel === 'shopify' && connection.shop_domain
+          ? `Shopify store ${connection.shop_domain}`
+          : String(connection.display_name || channel.charAt(0).toUpperCase() + channel.slice(1));
+        const syncEntries = Object.entries(connection.sync || {}) as Array<[string, any]>;
+        const degraded = syncEntries.some(([, state]) => Boolean(state?.error || state?.metadata?.degraded));
+        const state = String(connection.status || 'unknown').replace(/_/g, ' ');
+        lines.push(`${label} is ${degraded && state === 'connected' ? 'connected, with a degraded data area' : state}.`);
+        if (connection.last_sync_at) lines.push(`Last synchronization: ${new Date(connection.last_sync_at).toISOString()}.`);
+        if (syncEntries.length) {
+          lines.push(`Synchronized data: ${syncEntries.map(([entity, item]) => {
+            const count = chatCount(item?.count);
+            return `${entity.replace(/_/g, ' ')} ${count} (${String(item?.status || 'unknown').replace(/_/g, ' ')})`;
+          }).join('; ')}.`);
+        }
+        const issues = syncEntries
+          .map(([entity, item]) => item?.error || item?.metadata?.warning
+            ? `${entity.replace(/_/g, ' ')}: ${item.error || item.metadata.warning}`
+            : null)
+          .filter(Boolean);
+        if (issues.length) lines.push(`Attention required: ${issues.join('; ')}.`);
+        const scopes = Array.isArray(connection.scopes) ? connection.scopes.map((scope: any) => String(scope)) : [];
+        if (channel === 'shopify' && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations')) {
+          lines.push('Next step: reconnect Shopify with location access so inventory can synchronize by warehouse instead of using product-variant fallback quantities.');
+        }
+      }
+    }
+  } else if (q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next')) {
     lines.push('The fastest path is to improve the data that controls execution quality, then run optimization again.');
     if (nextSteps.length) lines.push(`Do these next:\n${nextSteps.join('\n')}`);
     else lines.push('Do this next:\n1. Connect a marketplace or upload product/order CSV data.\n2. Enrich SKU weight, dimensions, cost, and selling price.\n3. Connect warehouse/WMS truth before physical execution.');
@@ -2202,10 +2241,11 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = Boolean(cortex?.ok);
   const cortexHealth = {
-    available: liveRouteAvailable,
+    available: accountScopedChatAvailable,
     chatIntegrated: accountScopedChatAvailable,
-    status: liveRouteAvailable ? 200 : 503,
-    reason: liveRouteAvailable ? 'live_chat_available' : accountScopedChatAvailable ? 'local_account_fallback' : 'cortex_not_configured',
+    status: accountScopedChatAvailable ? 200 : 503,
+    reason: liveRouteAvailable ? 'live_chat_available' : accountScopedChatAvailable ? 'account_chat_available' : 'cortex_not_configured',
+    mode: liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'account_scoped' : 'unavailable',
     liveRouteAvailable,
     liveRouteStatus: cortex?.status || 503,
     liveRouteReason: cortex?.ok
@@ -2244,7 +2284,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     thread: mapCortexThread(thread),
     message: mapCortexMessage(saved),
     context: { screen, readiness: context.readiness, tasks: context.tasks.slice(0, 8), recommendations: context.recommendations.slice(0, 5) },
-    cortex: { ok: liveRouteAvailable, status: cortexHealth.status, health: cortexHealth },
+    cortex: { ok: accountScopedChatAvailable, status: cortexHealth.status, health: cortexHealth },
   };
 }
 
@@ -2281,20 +2321,24 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
     userId,
     idempotencyKey: `oms-cortex-chat-health-${userId}-${Math.floor(Date.now() / 60_000)}`,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex health check failed' } }));
-  const available = Boolean(live?.ok && live?.data?.available !== false);
+  const liveRouteAvailable = Boolean(live?.ok && live?.data?.available !== false);
   const health = {
-    available,
+    available: true,
     chatIntegrated: true,
-    status: available ? 200 : Number(live?.status || 503),
-    reason: available
+    status: 200,
+    reason: liveRouteAvailable
+      ? 'live_chat_available'
+      : 'account_chat_available',
+    mode: liveRouteAvailable ? 'live' : 'account_scoped',
+    liveRouteAvailable,
+    liveRouteStatus: Number(live?.status || 503),
+    liveRouteReason: liveRouteAvailable
       ? 'live_chat_available'
       : live?.status === 404
         ? 'cortex_chat_route_not_available'
         : live?.data?.error || live?.data?.detail || 'cortex_chat_unavailable',
-    liveRouteAvailable: available,
-    liveRouteStatus: Number(live?.status || 503),
   };
-  return { ok: available, status: health.status, health };
+  return { ok: true, status: health.status, health };
 }
 
 export async function getCortexChatThreads(userId: string, query: any = {}) {
