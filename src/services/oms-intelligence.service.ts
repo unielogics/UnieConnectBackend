@@ -1952,6 +1952,65 @@ function normalizeChatAction(value: any) {
   };
 }
 
+function chatRequestsActions(message: string) {
+  return /(what should|what can|how (?:do|can|should)|next step|action|recommend|help me|fix|improve|resolve|set up|get started)/i.test(message);
+}
+
+function buildChatFocusContext(message: string, screen: string, context: any) {
+  const q = String(message || '').toLowerCase();
+  const samples = context?.samples || {};
+  if (screen === 'connections' || /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q)) {
+    const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
+    const connections = (samples.marketplaceConnections || [])
+      .filter((connection: any) => !requestedChannel || String(connection.channel).toLowerCase() === requestedChannel)
+      .map((connection: any) => ({
+        id: connection.id,
+        channel: connection.channel,
+        status: connection.status,
+        displayName: connection.display_name,
+        shopDomain: connection.shop_domain,
+        marketplaceId: connection.marketplace_id,
+        scopes: connection.scopes,
+        lastSyncAt: connection.last_sync_at,
+        sync: connection.sync,
+      }));
+    return {
+      topic: requestedChannel ? `${requestedChannel}_connection_health` : 'marketplace_connection_health',
+      instruction: 'Answer the marketplace connection and sync-health question directly from these records before discussing unrelated readiness gaps.',
+      connections,
+    };
+  }
+  if (screen === 'shipments' || /(shipment|asn|inbound)/.test(q)) {
+    return {
+      topic: 'shipments_and_asns',
+      instruction: 'Answer from shipment plans and ASNs first.',
+      shipmentPlans: samples.shipmentPlans || [],
+      asns: samples.asns || [],
+    };
+  }
+  if (screen === 'billing' || /(billing|invoice|cost|margin|profit)/.test(q)) {
+    return {
+      topic: 'billing',
+      instruction: 'Answer from billing evidence first and state when cost evidence is incomplete.',
+      billing: samples.billing || {},
+    };
+  }
+  if (screen === 'orders' || /\border(s)?\b/.test(q)) {
+    return { topic: 'orders', instruction: 'Answer from the account order sample and readiness counts first.', orders: samples.orders || [] };
+  }
+  if (screen === 'skus' || screen === 'sku-detail' || /\b(sku|product|listing|inventory)\b/.test(q)) {
+    return { topic: 'catalog', instruction: 'Answer from the SKU and inventory evidence first.', skus: samples.skus || [] };
+  }
+  if (screen === 'warehouses' || /\b(warehouse|wms|facility)\b/.test(q)) {
+    return { topic: 'warehouses', instruction: 'Answer from connected warehouse evidence first.', warehouses: samples.warehouses || [] };
+  }
+  return {
+    topic: 'account_summary',
+    instruction: 'Answer the user question directly; use readiness tasks only when they are relevant to the question.',
+    readiness: context?.readiness,
+  };
+}
+
 function readablePosture(value: any) {
   const posture = String(value || '').replace(/_/g, ' ').toLowerCase();
   if (posture === 'ready') return 'ready';
@@ -2044,20 +2103,22 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   };
 }
 
-function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof buildLocalCortexChatFallback>) {
+function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof buildLocalCortexChatFallback>, allowActions: boolean) {
   const data = cortex?.data || {};
   if (!cortex?.ok) return fallback;
   const answer = data.answer || data.text || data.message || data.response?.answer || data.result?.answer || data.result?.text || fallback.answer;
   const rawSources = data.sources || data.citations || data.response?.sources || data.result?.sources || [];
   const rawTasks = data.suggested_actions || data.suggestedActions || data.tasks || data.response?.tasks || [];
   const sources = (Array.isArray(rawSources) ? rawSources : []).map(normalizeChatSource).filter(Boolean);
-  const tasks = (Array.isArray(rawTasks) ? rawTasks : []).map(normalizeChatAction).filter(Boolean);
+  const tasks = allowActions
+    ? (Array.isArray(rawTasks) ? rawTasks : []).map(normalizeChatAction).filter(Boolean)
+    : [];
   const confidence = closedLoopNumber(data.confidence, data.response?.confidence, data.result?.confidence);
   const readinessNotes = data.readiness_notes || data.readinessNotes || data.blocked_reason || data.missing_data || null;
   return {
     answer: scrubVendorLanguage(String(answer || fallback.answer)),
     sources: sources.length ? sources : fallback.sources.map(normalizeChatSource).filter(Boolean),
-    tasks: tasks.length ? tasks : fallback.tasks.map(normalizeChatAction).filter(Boolean),
+    tasks: allowActions && tasks.length ? tasks : allowActions ? fallback.tasks.map(normalizeChatAction).filter(Boolean) : [],
     confidence: confidence ?? fallback.confidence,
     readinessNotes: readinessNotes ? scrubVendorLanguage(String(readinessNotes)) : readinessNotes,
   };
@@ -2103,6 +2164,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
 
   const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
+  const focusContext = buildChatFocusContext(message, screen, context);
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
@@ -2121,6 +2183,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     thread_id: thread?.id,
     message,
     history: threadHistory,
+    focus_context: focusContext,
     context,
     response_contract: {
       answer: 'string',
@@ -2130,7 +2193,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       readiness_notes: 'blocked or missing data notes',
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
-  const normalized = normalizeCortexChatResponse(cortex, fallback);
+  const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = Boolean(cortex?.ok);
   const cortexHealth = {
