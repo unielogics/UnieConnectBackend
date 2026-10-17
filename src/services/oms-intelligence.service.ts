@@ -2096,13 +2096,14 @@ function humanizeCortexTimestamp(value: string) {
 }
 
 function polishCortexChatText(text: string) {
-  const proseOnly = String(text || '').split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence):/i, 1)[0] || '';
+  const proseOnly = String(text || '').split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence|The readiness notes are|The confidence(?: in [^\n]+)? is):?/i, 1)[0] || '';
   return scrubVendorLanguage(proseOnly)
     .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/Cortex response unavailable; used scoped OMS fallback\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/\bread_locations\s+scope\b/gi, 'Shopify location inventory permission')
     .replace(/\bproduct-variant fallback quantities\b/gi, 'store-level inventory totals')
     .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, humanizeCortexTimestamp)
+    .replace(/\b(confidence(?: score| level)?\s*(?:is|:)?\s*)(0(?:\.\d+))\b/gi, (_match, prefix, value) => `${prefix}${Math.round(Number(value) * 100)}%`)
     .replace(/[ \t]+([,.;!?])/g, '$1')
     .replace(/([.!?])(?:\s*\1)+/g, '$1')
     .replace(/\n{3,}/g, '\n\n')
@@ -2167,6 +2168,45 @@ function normalizeChatAction(value: any) {
 
 function chatRequestsActions(message: string) {
   return /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
+}
+
+function chatRequestsDecision(message: string) {
+  return /\b(current\s+(?:vs\.?|versus)\s+(?:suggested|optimized)|decision|approval|approve|accept|deny|decline)\b/i.test(message);
+}
+
+function chatRecommendationIsDecision(rec: any) {
+  const state = String(rec?.approvalState || '').toLowerCase();
+  const type = String(rec?.recommendationType || '').toLowerCase();
+  const action = String(rec?.requiredAction || '').toLowerCase();
+  const title = String(rec?.title || '').toLowerCase();
+  const summary = String(rec?.summary || '').toLowerCase();
+  const current = rec?.currentValue || {};
+  const suggested = rec?.optimizedValue || {};
+  const impact = rec?.estimatedImpact || {};
+
+  if (['blocked', 'not_required', 'not required'].includes(state) || type.includes('data_readiness')) return false;
+  const text = `${type} ${action} ${title} ${summary}`;
+  if (/(upload|connect|complete|missing|readiness|evidence|feed completeness|data source|baseline incomplete|enrichment baseline)/.test(text)) return false;
+  if (!Object.keys(current).length || !Object.keys(suggested).length) return false;
+  const meaningfulImpact = Object.entries(impact).some(([key, value]) => {
+    const normalized = key.toLowerCase();
+    if (/^(confidence|palletunits|priority|severity)$/.test(normalized)) return false;
+    if (value == null || value === '') return false;
+    if (typeof value === 'number') return value !== 0;
+    return true;
+  });
+  const concreteDomain = /(cost|saving|margin|refund|carrier|label|shipment|supplier|inventory|order|warehouse|routing|placement|price|revenue|billing|fulfillment|business_double)/.test(text);
+  return concreteDomain && meaningfulImpact;
+}
+
+function chatDecisionImpact(impact: Record<string, any>) {
+  const moneyValue = (value: any) => `$${number(value).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+  if (number(impact.monthlySavings)) return `${moneyValue(impact.monthlySavings)} estimated monthly savings`;
+  if (number(impact.annualizedSavings)) return `${moneyValue(impact.annualizedSavings)} estimated annual savings`;
+  if (number(impact.revenueUpside)) return `${moneyValue(impact.revenueUpside)} estimated revenue upside`;
+  if (number(impact.refundAmount)) return `${moneyValue(impact.refundAmount)} estimated refund`;
+  if (number(impact.fillPercent)) return `${Math.round(number(impact.fillPercent))}% projected pallet fill`;
+  return 'a measurable operational improvement recorded in the decision';
 }
 
 function chatEntityLookupTerms(message: string) {
@@ -2308,6 +2348,16 @@ async function buildChatFocusContext(
   const q = String(message || '').toLowerCase();
   const samples = context?.samples || {};
   const resolvedEntities = await resolveChatEntities(userId, [message, entityId].filter(Boolean).join(' '));
+  if (chatRequestsDecision(message)) {
+    const decisions = (Array.isArray(context?.recommendations) ? context.recommendations : [])
+      .filter(chatRecommendationIsDecision);
+    return {
+      topic: 'current_decisions',
+      instruction: 'Answer only from measurable current-versus-suggested decisions. Readiness gaps and connection repairs are tasks, never approvals. Ignore the prior thread topic when it conflicts with this decision question.',
+      requiredSource: 'oms_recommendations',
+      decisions,
+    };
+  }
   if (screen === 'connections' || /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q)) {
     const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
     const connections = (samples.marketplaceConnections || [])
@@ -2411,6 +2461,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   const highTasks = sortedTasks.filter((task: any) => String(task?.priority || '').toLowerCase() === 'high');
   const missingSkuTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('missing dimensions') || String(task?.title || '').toLowerCase().includes('missing cost'));
   const wmsTask = tasks.find((task: any) => String(task?.title || '').toLowerCase().includes('wms'));
+  const decisionRecommendations = recommendations.filter(chatRecommendationIsDecision);
   const topRecommendation = recommendations[0];
   const lines: string[] = [];
   const readinessLine = `Readiness: ${readiness.score || 0}% (${readablePosture(readiness.posture)}).`;
@@ -2435,7 +2486,18 @@ function buildLocalCortexChatFallback(message: string, context: any): {
     : [];
   const responseTasks = marketplaceIntent ? marketplaceTasks : sortedTasks;
 
-  if (marketplaceIntent) {
+  if (chatRequestsDecision(message)) {
+    const decision = decisionRecommendations[0];
+    if (!decision) {
+      lines.push('There is no measurable current-versus-suggested decision ready for approval right now.');
+      lines.push('The open items are readiness tasks, not approvals. Complete the task-inbox work and run optimization again before accepting or denying a change.');
+    } else {
+      lines.push(`${decision.title} is ready for review.`);
+      if (decision.summary) lines.push(String(decision.summary));
+      lines.push(`Expected impact: ${chatDecisionImpact(decision.estimatedImpact || {})}.`);
+      lines.push('Open Current vs Suggested Decisions to compare the recorded current state, proposed change, and impact before accepting or denying it.');
+    }
+  } else if (marketplaceIntent) {
     const requestedChannel = requestedMarketplaceChannel;
     const connections = (Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections : [])
       .filter((connection: any) => !requestedChannel || String(connection?.channel || '').toLowerCase() === requestedChannel);
@@ -2628,9 +2690,35 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
+  const decisionIntent = chatRequestsDecision(message);
+  if (decisionIntent) {
+    normalized.answer = fallback.answer;
+    normalized.sources = fallback.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = [];
+    normalized.confidence = fallback.confidence;
+    normalized.readinessNotes = null;
+  }
   if (normalized.tasks.length) {
     const contextTasks = Array.isArray(context?.tasks) ? context.tasks : [];
     const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => message.toLowerCase().includes(channel));
+    if (requestedChannel) {
+      normalized.tasks = contextTasks
+        .filter((task: any) => {
+          const text = `${task.dedupeKey || ''} ${task.title || ''} ${task.detail || ''}`.toLowerCase();
+          return String(task.source || '') === 'connection_health' && text.includes(requestedChannel);
+        })
+        .slice(0, 3)
+        .map((task: any) => normalizeChatAction({
+          id: task.id,
+          title: task.title,
+          priority: task.priority,
+          screen: task.screen,
+          actionTarget: task.actionTarget,
+          actionLabel: task.actionLabel,
+          entityId: task.entityId,
+        }))
+        .filter(Boolean);
+    }
     normalized.tasks = normalized.tasks.map((action: any) => {
       if (action.entityId) return action;
       const actionTarget = String(action.actionTarget || action.screen || '');
