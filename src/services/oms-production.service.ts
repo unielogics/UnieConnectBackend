@@ -4147,7 +4147,53 @@ export async function getOmsOrder(userId: string, orderId: string) {
     [userId, orderId],
   );
   if (!order) return null;
+  const identities = [order.id, order.external_order_id, order.order_number].filter(Boolean).map(String);
+  const eventPattern = `%${String(order.external_order_id || order.order_number || order.id)}%`;
+  const hasWmsEvents = await tableExists('oms_wms_events');
+  const [lineRows, eventRows] = await Promise.all([
+    rows(
+      `SELECT id, item_id, sku, title, quantity, unit_price, total_price, metadata, created_at
+         FROM order_lines
+        WHERE user_id = $1 AND order_id = $2
+        ORDER BY created_at, id`,
+      [userId, order.id],
+    ),
+    hasWmsEvents
+      ? rows(
+          `SELECT id, warehouse_code, event_type, entity_type, entity_id, status, payload, received_at
+             FROM oms_wms_events
+            WHERE user_id = $1
+              AND (entity_id = ANY($2::text[]) OR payload::text ILIKE $3)
+            ORDER BY received_at ASC
+            LIMIT 100`,
+          [userId, identities, eventPattern],
+        )
+      : Promise.resolve([]),
+  ]);
   const totals = json(order.totals, {});
+  const channel = order.channel || order.account_channel || 'manual';
+  const metadata = json(order.metadata, {});
+  const timeline = [
+    {
+      ts: iso(order.placed_at || order.created_at),
+      title: `Order received from ${channel}`,
+      source: channel,
+      status: 'complete',
+    },
+    ...eventRows.map((event) => {
+      const payload = json(event.payload, {});
+      const body = json(payload.payload, payload);
+      const eventLabel = String(event.event_type || 'warehouse_event')
+        .replace(/[._-]+/g, ' ')
+        .replace(/\b\w/g, (letter) => letter.toUpperCase());
+      return {
+        ts: iso(event.received_at),
+        title: body.summary || body.message || body.action || eventLabel,
+        source: event.warehouse_code ? `WMS ${event.warehouse_code}` : 'WMS',
+        status: event.status || 'accepted',
+      };
+    }),
+  ].filter((event) => event.ts);
   return {
     ...order,
     id: order.id,
@@ -4155,10 +4201,24 @@ export async function getOmsOrder(userId: string, orderId: string) {
     displayId: publicEntityId('OR', order.id),
     customerDisplayId: order.customer_id ? publicEntityId('CU', order.customer_id) : null,
     customer: order.customer_name || order.customer_email || undefined,
-    ch: order.channel || order.account_channel || 'manual',
+    ch: channel,
     channelAccountId: order.channel_connection_id || null,
     channelDisplay: order.display_name || order.shop_domain || order.selling_partner_id || order.channel || order.account_channel || 'manual',
     total: money(totals.total || totals.subtotal || 0),
+    items: lineRows.length,
+    qty: lineRows.reduce((sum, line) => sum + number(line.quantity), 0),
+    lines: lineRows.map((line) => ({
+      id: line.id,
+      itemId: line.item_id || null,
+      sku: line.sku || null,
+      title: line.title || line.sku || 'Order item',
+      quantity: number(line.quantity),
+      unitPrice: money(line.unit_price),
+      totalPrice: money(line.total_price),
+      metadata: json(line.metadata, {}),
+    })),
+    timeline,
+    metadata,
     placedAt: iso(order.placed_at),
     createdAt: iso(order.created_at),
     updatedAt: iso(order.updated_at),
