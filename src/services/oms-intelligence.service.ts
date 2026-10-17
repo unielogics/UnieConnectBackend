@@ -983,6 +983,153 @@ async function getConnectedNetworkPolicy(userId: string) {
   };
 }
 
+function addressPart(address: any, ...keys: string[]) {
+  const value = json(address, {});
+  for (const key of keys) {
+    const candidate = value?.[key];
+    if (candidate != null && String(candidate).trim()) return String(candidate).trim();
+  }
+  return '';
+}
+
+async function buildSellerOptimizationContext(
+  userId: string,
+  business: any,
+  inventory: any,
+  readiness: any,
+  networkPolicy: any,
+) {
+  const [warehouseRows, supplierRows, channelRows] = await Promise.all([
+    rows(
+      `SELECT DISTINCT ON (l.warehouse_code)
+              l.warehouse_code, l.metadata AS link_metadata,
+              f.id AS facility_id, f.code, f.name, f.address, f.latitude, f.longitude, f.metadata AS facility_metadata
+         FROM oms_warehouse_links l
+         LEFT JOIN facilities f
+           ON f.id = l.facility_id OR (l.facility_id IS NULL AND upper(f.code) = upper(l.warehouse_code))
+        WHERE l.user_id = $1
+          AND l.status = 'connected'
+          AND COALESCE(l.metadata->>'source', '') <> 'demo'
+        ORDER BY l.warehouse_code, l.connected_at DESC NULLS LAST`,
+      [userId],
+    ).catch(() => []),
+    rows('SELECT id, name, address, metadata FROM suppliers WHERE user_id = $1 AND status <> \'archived\'', [userId]).catch(() => []),
+    rows(
+      `SELECT channel, marketplace_id, external_account_id
+         FROM marketplace_connections
+        WHERE user_id = $1 AND status IN ('connected','active','synced')
+        ORDER BY updated_at DESC`,
+      [userId],
+    ).catch(() => []),
+  ]);
+
+  const candidateWarehouses = warehouseRows
+    .map((warehouse) => {
+      const address = json(warehouse.address, {});
+      const postal = addressPart(address, 'zip', 'zipCode', 'postalCode', 'postal');
+      if (!postal) return null;
+      return {
+        id: String(warehouse.warehouse_code || warehouse.code || warehouse.facility_id),
+        label: String(warehouse.name || warehouse.warehouse_code || warehouse.code || 'Warehouse'),
+        postal,
+        state: addressPart(address, 'state', 'stateOrProvinceCode', 'region', 'province') || undefined,
+        lat: warehouse.latitude == null ? undefined : number(warehouse.latitude),
+        lon: warehouse.longitude == null ? undefined : number(warehouse.longitude),
+      };
+    })
+    .filter(Boolean);
+
+  const supplierById = new Map(supplierRows.map((supplier) => [String(supplier.id), supplier]));
+  const skus = Array.isArray(inventory?.skus) ? inventory.skus : [];
+  const supplierCostBySku: Record<string, any> = {};
+  const productOriginsBySku: Record<string, any> = {};
+  skus.forEach((sku: any) => {
+    const skuCode = String(sku?.sku || '').trim();
+    if (!skuCode) return;
+    const unitCost = number(sku?.cost);
+    if (unitCost > 0) supplierCostBySku[skuCode] = { product_cogs_usd_total: unitCost, cogs_input_mode: 'per_unit' };
+    const supplier = supplierById.get(String(sku?.supplierId || ''));
+    const address = json(supplier?.address, {});
+    const sourcePostal = addressPart(address, 'zip', 'zipCode', 'postalCode', 'postal');
+    if (sourcePostal) {
+      productOriginsBySku[skuCode] = {
+        source_postal: sourcePostal,
+        source_city: addressPart(address, 'city') || undefined,
+        source_region: addressPart(address, 'state', 'stateOrProvinceCode', 'region', 'province') || undefined,
+      };
+    }
+  });
+
+  const primaryChannel = String(channelRows[0]?.channel || '').toLowerCase();
+  const marketplaceCode = primaryChannel ? `${primaryChannel}_us` : undefined;
+  const topSkus = [...skus]
+    .sort((left: any, right: any) => number(right?.velocity30d) - number(left?.velocity30d))
+    .slice(0, 50)
+    .map((sku: any) => ({
+      id: sku?.id,
+      sku: sku?.sku,
+      title: sku?.title,
+      available: number(sku?.available),
+      networkOnHand: sku?.networkOnHand == null ? null : number(sku.networkOnHand),
+      inbound: number(sku?.inbound),
+      velocity30d: number(sku?.velocity30d),
+      daysOfCover: number(sku?.daysOfCover),
+      unitCost: sku?.cost == null ? null : number(sku.cost),
+      sellingPrice: sku?.price == null ? null : number(sku.price),
+      weightLb: sku?.weight == null ? null : number(sku.weight),
+      dimensions: sku?.dimensions || {},
+      supplierId: sku?.supplierId || null,
+      risk: sku?.risk || 'unknown',
+      enrichmentPercent: number(sku?.enrichmentPercent),
+    }));
+
+  const networkContextPatch: Record<string, any> = {};
+  if (candidateWarehouses.length) networkContextPatch.candidate_warehouses = candidateWarehouses;
+  if (Object.keys(productOriginsBySku).length) networkContextPatch.product_origins_by_sku = productOriginsBySku;
+  if (Object.keys(supplierCostBySku).length) networkContextPatch.supplier_cost_by_sku = supplierCostBySku;
+  if (marketplaceCode) networkContextPatch.marketplace_code = marketplaceCode;
+
+  const anchorWarehouseCode = String(networkPolicy?.activePolicy?.anchorWarehouseCode || '').trim();
+  const planningBody: Record<string, any> = { fulfillment_modes: ['fbm'] };
+  if (anchorWarehouseCode) {
+    planningBody.primary_warehouse_id = anchorWarehouseCode;
+    planningBody.must_include_primary_warehouse = networkPolicy?.multiWarehouseExecutable === false;
+  }
+
+  return {
+    marketplaceCode,
+    networkContextPatch,
+    planningBody,
+    sellerContext: {
+      schemaVersion: 'unieconnect_oms_v1',
+      source: 'unieconnect_oms',
+      generatedAt: new Date().toISOString(),
+      accountScope: { userId, tenantIsolated: true },
+      readiness: {
+        score: readiness?.score,
+        posture: readiness?.posture,
+        blockers: readiness?.blockers || [],
+        counts: readiness?.counts || {},
+      },
+      currentBusiness: business?.plan?.currentMetrics || {},
+      currentInventory: inventory?.current || {},
+      warehouses: candidateWarehouses,
+      connectedChannels: channelRows.map((channel) => ({ channel: channel.channel, marketplaceId: channel.marketplace_id || null })),
+      suppliers: supplierRows.map((supplier) => ({ id: supplier.id, name: supplier.name })),
+      topSkus,
+      networkPolicy: networkPolicy?.activePolicy || null,
+    },
+    evidence: {
+      warehouseCount: candidateWarehouses.length,
+      channelCount: channelRows.length,
+      supplierCount: supplierRows.length,
+      skuCount: skus.length,
+      skuCostCount: Object.keys(supplierCostBySku).length,
+      supplierOriginCount: Object.keys(productOriginsBySku).length,
+    },
+  };
+}
+
 export async function createSellerOptimizationRun(userId: string, input: any = {}) {
   const readiness = await getDataReadiness(userId);
   const [business, inventory, networkPolicy] = await Promise.all([
@@ -1001,14 +1148,20 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
   );
   const engagementId = (credRow as any)?.cortex_engagement_id || null;
 
-  // Send the minimal body Cortex's pydantic model accepts. The scheduler uses
-  // this exact shape and gets 200; richer fields (seller_context, etc.) caused
-  // 422 in earlier attempts.
+  const cortexContext = await buildSellerOptimizationContext(userId, business, inventory, readiness, networkPolicy);
+
+  // Cortex accepts a bounded account snapshot alongside the engagement id. This keeps
+  // optimization tenant-scoped and gives planning traceable OMS evidence instead of a
+  // generic readiness sentence.
   const cortex = engagementId
     ? await postCortex('/v1/assessment/seller-optimization/runs', {
         engagement_id: engagementId,
         with_ai_recommendations: true,
-        input_summary: `OMS user-triggered run (readiness ${readiness.score}, ${readiness.posture}).`,
+        input_summary: `UnieConnect OMS run: readiness ${readiness.score}% (${readiness.posture}); ${readiness.counts.catalogItems} SKUs; ${readiness.counts.orders} orders; ${cortexContext.evidence.warehouseCount} connected warehouses.`,
+        marketplace_code: cortexContext.marketplaceCode,
+        network_context_patch: cortexContext.networkContextPatch,
+        planning_body: cortexContext.planningBody,
+        seller_context: cortexContext.sellerContext,
       }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }))
     : ({ ok: false, status: 412, data: { error: 'Cortex engagement not yet provisioned for this user' } } as const);
 
@@ -1041,6 +1194,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
     sharedPalletCandidates: inventory.proposed?.sharedPalletCandidates || 0,
     blockers: readiness.blockers,
     networkPolicy,
+    cortexContextEvidence: cortexContext.evidence,
   };
 
   const stored = await one(
