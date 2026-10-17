@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import { registerRoutes } from './routes';
 import { startDemandPushScheduler } from './services/demand-push.scheduler';
 import { startDirectOptimizeScheduler } from './services/direct-optimize.scheduler';
+import { startMarketplaceSyncScheduler } from './services/marketplace-sync.scheduler';
 import { authRoutes } from './routes/auth.routes';
 import { config } from './config/env';
 
@@ -94,6 +95,7 @@ async function start() {
   app.log.info(`UnieConnect listening on ${config.port}`);
   try { startDemandPushScheduler(); } catch (e) { app.log.error(e, 'demand-push scheduler failed to start'); }
   try { startDirectOptimizeScheduler(); } catch (e) { app.log.error(e, 'direct-optimize scheduler failed to start'); }
+  try { startMarketplaceSyncScheduler(); } catch (e) { app.log.error(e, 'marketplace-sync scheduler failed to start'); }
 }
 
 start().catch((err) => {

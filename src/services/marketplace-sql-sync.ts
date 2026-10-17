@@ -484,7 +484,10 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
 
   try {
     await setSyncStatus(ctx.channelAccountId, 'orders', 'syncing');
-    const since = new Date(Date.now() - (initialSync ? 90 : 7) * MS_PER_DAY).toISOString();
+    const configuredBackfillDays = Number(process.env.SHOPIFY_INITIAL_ORDER_BACKFILL_DAYS || 730);
+    const backfillDays = Math.min(3650, Math.max(90, Number.isFinite(configuredBackfillDays) ? configuredBackfillDays : 730));
+    const windowDays = initialSync ? backfillDays : 7;
+    const since = new Date(Date.now() - windowDays * MS_PER_DAY).toISOString();
     let count = 0;
     let pageInfo: string | null = null;
     do {
@@ -501,7 +504,14 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
       pageInfo = parseNextPageInfo(res.headers.get('link'));
     } while (pageInfo);
     result.orders = count;
-    await setSyncStatus(ctx.channelAccountId, 'orders', 'synced', { count });
+    await setSyncStatus(ctx.channelAccountId, 'orders', 'synced', {
+      count,
+      metadata: {
+        windowDays,
+        historicalBackfill: Boolean(initialSync),
+        ...(initialSync ? { historicalBackfillCompletedAt: new Date().toISOString() } : {}),
+      },
+    });
   } catch (err: any) {
     const error = err?.message || 'Orders sync failed';
     result.errors!.orders = error;
