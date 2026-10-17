@@ -61,10 +61,14 @@ export async function getSyncStatus(channelAccountId: string) {
   }, {});
   const values = Object.values(entities);
   const anySyncing = values.some((entity: any) => entity.status === 'syncing' || entity.status === 'pending');
+  const degradedEntities = values
+    .filter((entity: any) => entity?.metadata?.degraded === true)
+    .map((entity: any) => entity);
   const allSynced = ['products', 'orders', 'inventory'].every((key) => entities[key]?.status === 'synced');
   return {
     channelAccountId,
     entities,
-    fullSync: allSynced && !anySyncing,
+    degraded: degradedEntities.length > 0,
+    fullSync: allSynced && !anySyncing && degradedEntities.length === 0,
   };
 }

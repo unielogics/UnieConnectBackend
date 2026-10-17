@@ -2441,7 +2441,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       accountId: account.id,
       channel: account.channel,
       status: account.status,
-      syncStatus: sync.fullSync ? 'complete' : 'pending',
+      syncStatus: sync.fullSync ? 'complete' : sync.degraded ? 'partial' : 'pending',
       lastSyncAt: iso(account.last_sync_at),
       ...sync,
       source: 'aurora_postgres',
