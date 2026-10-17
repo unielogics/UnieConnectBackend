@@ -1067,6 +1067,17 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
   const dim = itemDimensions(item);
   const cube = (number(dim.length) * number(dim.width) * number(dim.height)) / 1728;
   const weight = number(item.weight);
+  const cost = itemCost(item);
+  const price = itemPrice(item);
+  const missingFields = [
+    !cost ? 'cost' : null,
+    !price ? 'price' : null,
+    !weight ? 'weight' : null,
+    !number(dim.length) ? 'length' : null,
+    !number(dim.width) ? 'width' : null,
+    !number(dim.height) ? 'height' : null,
+  ].filter(Boolean) as string[];
+  const enrichmentPercent = Math.round(((6 - missingFields.length) / 6) * 100);
   const risk = velocity === 0 ? 'needs_sales_data' : daysOfCover < 14 ? 'high' : daysOfCover < 30 ? 'medium' : 'low';
 
   // ---- Reorder-needed (external supply loop) ------------------------------------------------
@@ -1120,6 +1131,12 @@ function mapSkuPlan(item: Row, index: number, velocityBySku: Map<string, number>
     image: item.image || (Array.isArray(item.images) ? item.images[0] : json(item.images, [])[0]) || null,
     supplierId: item.supplier_id || null,
     asin: asin || null,
+    cost: cost || null,
+    price: price || null,
+    weight: weight || null,
+    dimensions: dim,
+    missingFields,
+    enrichmentPercent,
     enrichmentState: keepaEnrichmentState,
     keepaUnavailable,
     enrichmentMarker: keepaMarker,
