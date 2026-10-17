@@ -2457,6 +2457,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: 'Marketplace connection is not connected', status: account.status });
     }
     let syncResult: any = null;
+    let webhookResult: any = null;
     try {
       if (account.channel === 'shopify') {
         if (!account.shop_domain || !account.access_token_enc) {
@@ -2470,6 +2471,19 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           initialSync: !account.last_sync_at,
           log: req.log,
         });
+        const webhookAddress = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/shopify`;
+        try {
+          webhookResult = await registerShopifyWebhooks({
+            shop: account.shop_domain,
+            accessToken: account.access_token_enc,
+            address: webhookAddress,
+            topics: config.shopify.webhookTopics,
+            log: req.log,
+          });
+        } catch (webhookError: any) {
+          webhookResult = { error: webhookError?.message || 'Shopify webhook reconciliation failed' };
+          req.log.warn({ err: webhookError, accountId: account.id }, 'shopify webhook reconciliation failed during refresh');
+        }
       } else if (account.channel === 'ebay') {
         let accessToken = account.access_token_enc;
         if ((!accessToken || (account.token_expires_at && new Date(account.token_expires_at).getTime() < Date.now() + 60_000)) && account.refresh_token_enc) {
@@ -2516,10 +2530,10 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         entityId: account.id,
         eventType: 'refresh_completed',
         summary: `Refresh completed for ${account.channel} marketplace connection.`,
-        payload: { accountId: account.id, syncResult },
+        payload: { accountId: account.id, syncResult, ...(webhookResult ? { webhookResult } : {}) },
       });
       const sync = await getSyncStatus(account.id);
-      return { success: true, account: mapChannel(updated || account), syncStatus: sync.fullSync ? 'complete' : 'partial', syncResult, ...sync };
+      return { success: true, account: mapChannel(updated || account), syncStatus: sync.fullSync ? 'complete' : 'partial', syncResult, webhookResult, ...sync };
     } catch (err: any) {
       req.log.error({ err, accountId: account.id, channel: account.channel }, 'marketplace refresh failed');
       await writeLedger(userId, {
