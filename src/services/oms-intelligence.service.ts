@@ -3186,6 +3186,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
   normalized.sources = normalized.sources.slice(0, 5);
+  normalized.answer = polishCortexChatText(normalized.answer);
+  if (normalized.readinessNotes) normalized.readinessNotes = polishCortexChatText(normalized.readinessNotes);
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = !accountGroundedFastPath && Boolean(cortex?.ok);
   const cortexHealth = {
