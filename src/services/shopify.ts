@@ -64,6 +64,29 @@ export async function registerWebhooks(params: {
   );
   log?.info?.({ shop, existingCount: existing.length }, '[Shopify] registerWebhooks existing count');
 
+  // Remove callbacks left behind by older UnieConnect deployments. Limit cleanup to the
+  // UnieConnect webhook path and configured topics so unrelated merchant webhooks are untouched.
+  const desiredTopics = new Set(topics);
+  const stale = existing.filter((webhook: any) => {
+    const topic = String(webhook?.topic || '');
+    const existingAddress = String(webhook?.address || '');
+    return Boolean(
+      webhook?.id
+      && desiredTopics.has(topic)
+      && existingAddress !== address
+      && existingAddress.includes('/api/v1/webhooks/shopify'),
+    );
+  });
+  let removed = 0;
+  for (const webhook of stale) {
+    const res = await fetch(`https://${shop}/admin/api/${version}/webhooks/${encodeURIComponent(String(webhook.id))}.json`, {
+      method: 'DELETE',
+      headers: { 'X-Shopify-Access-Token': accessToken },
+    });
+    if (res.ok || res.status === 404) removed++;
+    else log?.warn?.({ webhookId: webhook.id, topic: webhook.topic, status: res.status }, '[Shopify] stale webhook removal failed');
+  }
+
   let created = 0;
   for (const topic of topics) {
     if (existingSet.has(`${topic}|${address}`)) {
@@ -87,7 +110,8 @@ export async function registerWebhooks(params: {
     }
     created++;
   }
-  log?.info?.({ shop, created, totalTopics: topics.length }, '[Shopify] registerWebhooks done');
+  log?.info?.({ shop, created, removed, totalTopics: topics.length }, '[Shopify] registerWebhooks done');
+  return { created, removed, existingCount: existing.length };
 }
 
 function topicToEnum(topic: string) {

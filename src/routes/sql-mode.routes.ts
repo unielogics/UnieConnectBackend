@@ -199,6 +199,7 @@ function mapChannel(row: AnyRow) {
     externalAccountId: row.external_account_id,
     scopes: row.scopes || [],
     metadata: json(row.metadata, {}),
+    sync: json(row.sync, {}),
     lastSyncAt: iso(row.last_sync_at),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
@@ -2386,7 +2387,24 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.get('/channel-accounts', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const data = await rows('SELECT * FROM marketplace_connections WHERE user_id = $1 ORDER BY updated_at DESC', [userId]);
+    const data = await rows(
+      `SELECT m.*,
+              COALESCE((
+                SELECT jsonb_object_agg(s.entity_type, jsonb_build_object(
+                  'status', s.status,
+                  'count', s.count,
+                  'error', s.error,
+                  'metadata', s.metadata,
+                  'lastSyncedAt', s.last_synced_at
+                ))
+                  FROM channel_sync_status s
+                 WHERE s.channel_account_id = m.id
+              ), '{}'::jsonb) AS sync
+         FROM marketplace_connections m
+        WHERE m.user_id = $1
+        ORDER BY m.updated_at DESC`,
+      [userId],
+    );
     return data.map(mapChannel);
   });
 
@@ -2520,10 +2538,18 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!userId) return;
     const shop = trim(req.query?.shop).replace(/^https?:\/\//, '').replace(/\/+$/, '');
     if (!shop) return reply.code(400).send({ error: 'shop is required' });
+    const frontendBase = new URL(config.frontendOrigin);
+    let redirectTo = new URL('/oms?view=connections', frontendBase).toString();
+    try {
+      const requested = new URL(trim(req.query?.redirectTo) || redirectTo, frontendBase);
+      if (requested.origin === frontendBase.origin) redirectTo = requested.toString();
+    } catch {
+      // Keep the account-scoped OMS Connections destination.
+    }
     const state = randomBytes(18).toString('hex');
     await pgQuery(
       'INSERT INTO oauth_states (user_id, channel, state, payload) VALUES ($1, $2, $3, $4::jsonb)',
-      [userId, 'shopify', state, JSON.stringify({ shop })],
+      [userId, 'shopify', state, JSON.stringify({ shop, redirectTo })],
     );
     if (!config.shopify.clientId || !config.shopify.clientSecret || !config.shopify.appBaseUrl) {
       await one(
@@ -2643,7 +2669,18 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     }
     await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
     await writeLedger(saved.user_id, { entityType: 'marketplace_connection', entityId: account?.id, eventType: 'connected', summary: `Shopify marketplace connected for ${shop}.` });
-    return reply.redirect(`${config.frontendOrigin.replace(/\/+$/, '')}/dashboard?connected=shopify`);
+    const savedPayload = json(saved.payload, {});
+    const frontendBase = new URL(config.frontendOrigin);
+    let destination = new URL('/oms?view=connections', frontendBase);
+    try {
+      const requested = new URL(String(savedPayload.redirectTo || destination.toString()), frontendBase);
+      if (requested.origin === frontendBase.origin) destination = requested;
+    } catch {
+      // Keep the OMS Connections destination.
+    }
+    destination.searchParams.set('view', 'connections');
+    destination.searchParams.set('connected', 'shopify');
+    return reply.redirect(destination.toString());
   });
 
   for (const channel of ['amazon', 'ebay']) {
