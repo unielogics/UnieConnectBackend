@@ -2459,9 +2459,12 @@ function humanizeInternalLanguage(text: unknown) {
     .replace(/\bmissing backbone feeds?\b/gi, 'missing source data')
     .replace(/\bbackbone feeds?\b/gi, 'source data')
     .replace(/\breconciling key fields\s*\(SKU, order id, timestamps, fee code\)/gi, 'matching SKU, order, timing, and charge details across connected sources')
+    .replace(/\breconcile key fields\b/gi, 'match SKU, order, timing, and charge details across connected sources')
     .replace(/\bfee codes?\b/gi, 'charge details')
     .replace(/\bfeed completeness\b/gi, 'data completeness')
     .replace(/\breadiness score(?: of)?\s+(\d{1,3})\b(?!\s*%)/gi, 'readiness score of $1%')
+    .replace(/\b(?:low|limited) readiness score of (\d{1,3})%/gi, (value, score) => Number(score) >= 70 ? `readiness score of ${score}%` : value)
+    .replace(/\bmay carry assumptions from sparse source fields\b/gi, 'some guidance may be less reliable until the missing data is added')
     .replace(/\bstronger cost\s*\/\s*tax\s*\/\s*operations inference\b/gi, 'more reliable cost, tax, and operations analysis')
     .replace(/\bupload billing\s*\/\s*invoice line CSV\b/gi, 'upload a billing or invoice-line CSV')
     .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
@@ -3145,7 +3148,6 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             .split(/[^a-z0-9]+/)
             .filter((token) => token.length > 3 && !['open', 'review', 'complete', 'related', 'screen'].includes(token)));
           const candidates = contextTasks
-            .filter((task: any) => String(task.actionTarget || task.screen || '') === actionTarget)
             .filter((task: any) => {
               if (actionTarget !== 'connections' || !requestedChannel) return true;
               const text = `${task.dedupeKey || ''} ${task.title || ''} ${task.detail || ''}`.toLowerCase();
@@ -3153,12 +3155,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             })
             .map((task: any) => {
               const text = `${task.title || ''} ${task.actionLabel || ''} ${task.detail || ''}`.toLowerCase();
-              const score = Array.from(actionTokens).filter((token) => text.includes(token)).length;
+              const tokenScore = Array.from(actionTokens).filter((token) => text.includes(token)).length;
+              const targetScore = String(task.actionTarget || task.screen || '') === actionTarget ? 1 : 0;
+              const score = tokenScore + targetScore;
               return { task, score };
             })
             .sort((a: any, b: any) => b.score - a.score);
           const best = candidates[0];
-          return best && best.score > 0 ? best.task : null;
+          return best && best.score >= 2 ? best.task : null;
         })();
       return matchingTask
         ? normalizeChatAction({
