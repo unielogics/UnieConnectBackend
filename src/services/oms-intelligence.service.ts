@@ -1976,7 +1976,8 @@ function buildChatFocusContext(message: string, screen: string, context: any) {
       }));
     return {
       topic: requestedChannel ? `${requestedChannel}_connection_health` : 'marketplace_connection_health',
-      instruction: 'Answer the marketplace connection and sync-health question directly from these records before discussing unrelated readiness gaps.',
+      instruction: 'Answer the marketplace connection and sync-health question directly from these records before discussing unrelated readiness gaps. State connection status, last sync time, entity counts, and any degraded or error state present in sync metadata.',
+      requiredSource: 'oms_marketplace_connections',
       connections,
     };
   }
@@ -2194,6 +2195,10 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
+  const requiredFocusSource = normalizeChatSource({ source: focusContext?.requiredSource });
+  if (requiredFocusSource && !normalized.sources.some((source: any) => source?.source === requiredFocusSource.source)) {
+    normalized.sources.unshift(requiredFocusSource);
+  }
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = Boolean(cortex?.ok);
   const cortexHealth = {
