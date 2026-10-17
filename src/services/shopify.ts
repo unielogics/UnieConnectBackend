@@ -64,15 +64,14 @@ export async function registerWebhooks(params: {
   );
   log?.info?.({ shop, existingCount: existing.length }, '[Shopify] registerWebhooks existing count');
 
-  // Remove callbacks left behind by older UnieConnect deployments. Limit cleanup to the
-  // UnieConnect webhook path and configured topics so unrelated merchant webhooks are untouched.
-  const desiredTopics = new Set(topics);
+  // Remove callbacks left behind by older UnieConnect deployments. The exact UnieConnect
+  // webhook path identifies callbacks owned by this app; topic filtering would leave obsolete
+  // fulfillment subscriptions pointing at dead preview/ngrok hosts. Unrelated merchant webhook
+  // paths remain untouched.
   const stale = existing.filter((webhook: any) => {
-    const topic = String(webhook?.topic || '');
     const existingAddress = String(webhook?.address || '');
     return Boolean(
       webhook?.id
-      && desiredTopics.has(topic)
       && existingAddress !== address
       && existingAddress.includes('/api/v1/webhooks/shopify'),
     );
