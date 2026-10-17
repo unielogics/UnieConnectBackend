@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import {
   archiveOmsSkus,
   approveBusinessDouble,
+  rejectBusinessDouble,
   confirmShipmentWizardDraft,
   createLabelAuditRun,
   createShipmentWizardDraft,
@@ -73,6 +74,14 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     const planId = String(req.params?.planId || 'generated');
     return approveBusinessDouble(userId, planId, req.user?.email || userId, req.log);
+  });
+
+  fastify.post('/oms/business-double/:planId/reject', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const planId = String(req.params?.planId || 'generated');
+    const reason = String(req.body?.reason || 'Denied from Business Double');
+    return rejectBusinessDouble(userId, planId, req.user?.email || userId, reason, req.log);
   });
 
   fastify.get('/oms/inventory-plan', async (req: any, reply) => {

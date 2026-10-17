@@ -1453,15 +1453,54 @@ export async function getBusinessDouble(userId: string) {
     : null;
   const plan = attachCortexSource(cortexBusinessDouble || localPlan, snapshot, cortexBusinessDouble ? 'cortex_seller_optimization' : 'local_fallback_business_double');
 
-  const approved = await rows(
-    'SELECT id, title, approved_at, approved_by, current_metrics, optimized_metrics, savings FROM oms_business_plans WHERE user_id = $1 AND status = $2 ORDER BY approved_at DESC LIMIT 1',
-    [userId, 'approved'],
+  const decisions = await rows(
+    `SELECT bp.id, bp.status, bp.title, bp.approved_at, bp.approved_by, bp.created_at,
+            bp.current_metrics, bp.optimized_metrics, bp.savings,
+            version.snapshot
+       FROM oms_business_plans bp
+       LEFT JOIN LATERAL (
+         SELECT snapshot
+           FROM oms_business_plan_versions
+          WHERE plan_id = bp.id AND user_id = bp.user_id
+          ORDER BY version DESC
+          LIMIT 1
+       ) version ON true
+      WHERE bp.user_id = $1 AND bp.status IN ('approved', 'rejected')
+      ORDER BY COALESCE(bp.approved_at, bp.created_at) DESC
+      LIMIT 20`,
+    [userId],
   );
-  return { plan, latestApproved: approved[0] || null, persistence: isPostgresConfigured() ? 'aurora_postgres' : 'aurora_postgres_unconfigured' };
+  const mapDecision = (row: any) => {
+    if (!row) return null;
+    const snapshot = json(row.snapshot, {});
+    return {
+      id: row.id,
+      status: row.status,
+      title: row.title,
+      sourcePlanId: snapshot?.id || snapshot?.decision?.sourcePlanId || null,
+      decidedAt: iso(row.approved_at || row.created_at),
+      decidedBy: row.approved_by || snapshot?.decision?.actor || null,
+      reason: snapshot?.decision?.reason || null,
+      currentMetrics: json(row.current_metrics, {}),
+      optimizedMetrics: json(row.optimized_metrics, {}),
+      savings: json(row.savings, {}),
+    };
+  };
+  return {
+    plan,
+    latestApproved: mapDecision(decisions.find((decision: any) => decision.status === 'approved')),
+    latestRejected: mapDecision(decisions.find((decision: any) => decision.status === 'rejected')),
+    persistence: isPostgresConfigured() ? 'aurora_postgres' : 'aurora_postgres_unconfigured',
+  };
 }
 
 export async function approveBusinessDouble(userId: string, planId: string, approvedBy?: string, log?: FastifyBaseLogger) {
   const { plan } = await getBusinessDouble(userId);
+  if (plan.id !== planId) {
+    const error: any = new Error('This plan is no longer current. Refresh Business Double before approving it.');
+    error.statusCode = 409;
+    throw error;
+  }
   if (plan.modelStatus !== 'modeled' || !hasPlanPayload(plan.optimizedMetrics)) {
     const error: any = new Error('Cortex has not produced an executable optimized plan yet. Run Seller Optimization after completing readiness tasks.');
     error.statusCode = 409;
@@ -1521,6 +1560,78 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
 
   return { approved: true, planId: stored?.id || planId, stored, cortex };
+}
+
+export async function rejectBusinessDouble(userId: string, planId: string, rejectedBy?: string, reason = 'Denied by user', log?: FastifyBaseLogger) {
+  const { plan } = await getBusinessDouble(userId);
+  if (plan.id !== planId) {
+    const error: any = new Error('This plan is no longer current. Refresh Business Double before denying it.');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (plan.modelStatus !== 'modeled' || !hasPlanPayload(plan.optimizedMetrics)) {
+    const error: any = new Error('There is no executable optimized plan to deny yet.');
+    error.statusCode = 409;
+    throw error;
+  }
+  const rejectedAt = new Date().toISOString();
+  const rejectionReason = String(reason || 'Denied by user').trim().slice(0, 500);
+  let stored: any = null;
+  try {
+    const res = await pgQuery(
+      `INSERT INTO oms_business_plans
+        (user_id, status, title, summary, forecast_horizon_months, current_metrics, optimized_metrics, savings, risks, approved_by)
+       VALUES ($1, 'rejected', $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9)
+       RETURNING id, status, created_at`,
+      [
+        userId,
+        plan.title,
+        plan.summary,
+        plan.forecastHorizonMonths,
+        JSON.stringify(plan.currentMetrics),
+        JSON.stringify(plan.optimizedMetrics),
+        JSON.stringify(plan.savings),
+        JSON.stringify([]),
+        rejectedBy || userId,
+      ],
+    );
+    stored = res?.rows[0] || null;
+    if (stored?.id) {
+      await pgQuery(
+        'INSERT INTO oms_business_plan_versions (plan_id, user_id, version, snapshot) VALUES ($1, $2, 1, $3::jsonb)',
+        [stored.id, userId, JSON.stringify({ ...plan, decision: { state: 'rejected', sourcePlanId: plan.id, reason: rejectionReason, actor: rejectedBy || userId, at: rejectedAt } })],
+      );
+    }
+  } catch (err) {
+    log?.warn({ err }, 'failed to persist OMS business double rejection');
+    throw err;
+  }
+
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'business_double',
+    entityId: stored?.id || planId,
+    eventType: 'rejected',
+    sourceSystem: 'oms',
+    summary: 'Business Double operating model denied by the account user.',
+    payload: { planId, storedPlanId: stored?.id || null, reason: rejectionReason, plan },
+    confidence: 1,
+  });
+
+  const decisionContext = buildOmsDecisionContext(plan);
+  const cortex = await postCortex('/v1/oms/business-double/rejected', {
+    userId,
+    recommendationId: planId,
+    planId: stored?.id || planId,
+    plan,
+    ...decisionContext,
+    rejectionActor: rejectedBy || userId,
+    rejectionReason,
+    decisionLifecycle: 'rejected',
+    rejectedAt,
+  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+
+  return { rejected: true, planId: stored?.id || planId, sourcePlanId: plan.id, stored, cortex };
 }
 
 export async function getInventoryPlan(userId: string, horizon = '6m', filter: MarketplaceFilter = {}) {
