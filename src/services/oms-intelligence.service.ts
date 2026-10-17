@@ -2433,9 +2433,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
           && (!requestedMarketplaceChannel || text.includes(requestedMarketplaceChannel));
       })
     : [];
-  const responseTasks = marketplaceTasks.length
-    ? [...marketplaceTasks, ...sortedTasks.filter((task: any) => !marketplaceTasks.some((match: any) => match.id === task.id))]
-    : sortedTasks;
+  const responseTasks = marketplaceIntent ? marketplaceTasks : sortedTasks;
 
   if (marketplaceIntent) {
     const requestedChannel = requestedMarketplaceChannel;
