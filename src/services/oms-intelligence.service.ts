@@ -2447,6 +2447,21 @@ function scrubVendorLanguage(text: string) {
     .replace(/\bdrivers?\b/gi, 'runtime');
 }
 
+function humanizeInternalLanguage(text: unknown) {
+  return scrubVendorLanguage(String(text || ''))
+    .replace(/\bnetwork[-_ ]context\s+facility[-_ ]profile\b/gi, 'warehouse profile')
+    .replace(/\bfacility[_ ]sqft\b/gi, 'warehouse square footage')
+    .replace(/\bheadcount[_ ]reported\b/gi, 'team size')
+    .replace(/\bemployee roster\b/gi, 'staff roster')
+    .replace(/\bmissing datasets?\b/gi, 'missing account data')
+    .replace(/\bstronger cost\s*\/\s*tax\s*\/\s*operations inference\b/gi, 'more reliable cost, tax, and operations analysis')
+    .replace(/\bupload billing\s*\/\s*invoice line CSV\b/gi, 'upload a billing or invoice-line CSV')
+    .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
+    .replace(/\bprovide team size or staff roster\b/gi, 'add your team size or upload a staff roster')
+    .replace(/\bprioritize:\s*/gi, 'Start with: ')
+    .replace(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/gi, (value) => value.replace(/_/g, ' '));
+}
+
 function humanizeCortexTimestamp(value: string) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
@@ -2459,7 +2474,7 @@ function humanizeCortexTimestamp(value: string) {
 
 function polishCortexChatText(text: string) {
   const proseOnly = String(text || '').split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence|The readiness notes are|The confidence(?: in [^\n]+)? is):?/i, 1)[0] || '';
-  return scrubVendorLanguage(proseOnly)
+  return humanizeInternalLanguage(proseOnly)
     .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/Cortex response unavailable; used scoped OMS fallback\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/\bread_locations\s+scope\b/gi, 'Shopify location inventory permission')
@@ -3388,8 +3403,8 @@ function mapRecommendation(row: any) {
     recommendationType: row.recommendation_type,
     entityType: row.entity_type,
     entityId: row.entity_id,
-    title: row.title,
-    summary: row.summary,
+    title: humanizeInternalLanguage(row.title),
+    summary: humanizeInternalLanguage(row.summary),
     currentValue: json(row.current_value, {}),
     optimizedValue: json(row.optimized_value, {}),
     estimatedImpact: json(row.estimated_impact, {}),
@@ -3417,8 +3432,8 @@ function mapCortexTask(row: any) {
     screen: row.screen,
     entityType: row.entity_type,
     entityId: row.entity_id,
-    title: row.title,
-    detail: row.detail,
+    title: humanizeInternalLanguage(row.title),
+    detail: humanizeInternalLanguage(row.detail),
     priority: row.priority,
     status: row.status,
     actionLabel: row.action_label,
