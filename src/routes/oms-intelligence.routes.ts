@@ -180,7 +180,6 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     const result = await completeCortexTask(userId, String(req.params?.id || ''));
     if (!result) return reply.code(404).send({ error: 'Cortex task not found' });
-    if (!result.verified) return reply.code(409).send({ error: result.message, ...result });
     return result;
   });
 
