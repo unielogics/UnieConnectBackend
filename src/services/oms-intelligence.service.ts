@@ -2140,7 +2140,7 @@ function normalizeChatAction(value: any) {
 }
 
 function chatRequestsActions(message: string) {
-  return /(what should|what can|how (?:do|can|should)|next step|action|recommend|help me|fix|improve|resolve|set up|get started)/i.test(message);
+  return /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|improve|resolve|set up|get started)/i.test(message);
 }
 
 function chatEntityLookupTerms(message: string) {
@@ -2299,7 +2299,7 @@ async function buildChatFocusContext(
       }));
     return {
       topic: requestedChannel ? `${requestedChannel}_connection_health` : 'marketplace_connection_health',
-      instruction: 'Answer the marketplace connection and sync-health question directly from these records before discussing unrelated readiness gaps. State connection status, last sync time, entity counts, and any degraded or error state present in sync metadata.',
+      instruction: 'Answer the marketplace connection and sync-health question directly from these records before discussing unrelated readiness gaps. State connection status, last sync time, entity counts, every degraded or error state present in sync metadata, and the concrete next repair step when action is required.',
       requiredSource: 'oms_marketplace_connections',
       connections,
     };
@@ -2397,11 +2397,22 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   ].filter(Boolean);
   const gapLine = gaps.length ? `What is holding it back: ${gaps.join('; ')}.` : 'Nothing major is blocking the core intelligence path right now.';
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
-  const actionIntent = q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
+  const actionIntent = chatRequestsActions(message) || q.includes('get the account going') || q.includes('start') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
   const marketplaceIntent = /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q);
+  const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
+  const marketplaceTasks = marketplaceIntent
+    ? sortedTasks.filter((task: any) => {
+        const text = `${task?.stableKey || ''} ${task?.title || ''} ${task?.detail || ''}`.toLowerCase();
+        return String(task?.source || '') === 'connection_health'
+          && (!requestedMarketplaceChannel || text.includes(requestedMarketplaceChannel));
+      })
+    : [];
+  const responseTasks = marketplaceTasks.length
+    ? [...marketplaceTasks, ...sortedTasks.filter((task: any) => !marketplaceTasks.some((match: any) => match.id === task.id))]
+    : sortedTasks;
 
   if (marketplaceIntent) {
-    const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
+    const requestedChannel = requestedMarketplaceChannel;
     const connections = (Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections : [])
       .filter((connection: any) => !requestedChannel || String(connection?.channel || '').toLowerCase() === requestedChannel);
     if (!connections.length) {
@@ -2477,7 +2488,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
     ],
-    tasks: actionIntent ? sortedTasks.slice(0, 3).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel })) : [],
+    tasks: actionIntent ? responseTasks.slice(0, 3).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel, entityId: task.entityId })) : [],
     confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
     readinessNotes: null,
   };
@@ -2581,6 +2592,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
+  const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
+    && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
+  const marketplaceAnswerHasCoverage = /(products?|orders?)/i.test(normalized.answer)
+    && /inventory/i.test(normalized.answer)
+    && /(next|repair|reconnect|authoriz)/i.test(normalized.answer);
+  if (marketplaceHealthQuestion && !marketplaceAnswerHasCoverage) {
+    normalized.answer = fallback.answer;
+  }
   const requiredFocusSource = normalizeChatSource({ source: focusContext?.requiredSource });
   if (requiredFocusSource && !normalized.sources.some((source: any) => source?.source === requiredFocusSource.source)) {
     normalized.sources.unshift(requiredFocusSource);
