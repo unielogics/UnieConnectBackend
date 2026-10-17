@@ -492,7 +492,7 @@ export async function createProductResearchRun(userId: string, input: any) {
     [userId, result.sku, item?.id || input?.itemId || null, JSON.stringify({ source: 'product_research', runId: run?.id, ...result })],
   ).catch(() => null);
 
-  const rec = await createRecommendation(userId, {
+  const rec = result.missingData.length ? await createRecommendation(userId, {
     runId: run?.id || null,
     recommendationType: result.missingData.length ? 'data_readiness' : 'product_research',
     entityType: 'sku',
@@ -524,7 +524,7 @@ export async function createProductResearchRun(userId: string, input: any) {
     wmsTruthState: readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only',
     confidence,
     sourceSummary: readiness,
-  });
+  }) : null;
 
   await writeOmsLedgerEvent({
     userId,
@@ -1462,6 +1462,17 @@ async function reconcileRecommendationIntegrity(userId: string) {
     [userId],
   ).catch(() => null);
 
+  await pgQuery(
+    `UPDATE oms_recommendations
+        SET status = 'superseded', approval_state = 'superseded', updated_at = now()
+      WHERE user_id = $1
+        AND status = 'open'
+        AND recommendation_type = 'product_research'
+        AND approval_state = 'not_required'
+        AND required_action = 'feed_optimize_suite'`,
+    [userId],
+  ).catch(() => null);
+
   const openBusinessDecision = await one(
     `SELECT id
        FROM oms_recommendations
@@ -1564,6 +1575,16 @@ async function reconcileRecommendationWithCurrentItem(userId: string, rec: any) 
   if (!hasDimsWeight) missing.push('dimensions weight');
   if (!hasCost) missing.push('cost');
   if (!hasPrice) missing.push('selling price');
+
+  if (!missing.length && (recType.includes('data_readiness') || action.includes('missing'))) {
+    await pgQuery(
+      `UPDATE oms_recommendations
+          SET status = 'completed', approval_state = 'not_required', updated_at = now()
+        WHERE user_id = $1 AND id = $2 AND status = 'open'`,
+      [userId, rec.id],
+    ).catch(() => null);
+    return null;
+  }
 
   const dataCompleteness = Math.max(0, 100 - missing.length * 20);
   const marketplaceReadiness = (rec.currentValue || {}).marketplaceReadiness || (rec as any).marketplaceReadiness || 'marketplace enriched';
