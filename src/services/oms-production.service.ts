@@ -2311,6 +2311,7 @@ export async function getOmsOrders(userId: string, filter: MarketplaceFilter = {
         id: order.id,
         publicId: publicEntityId('OR', order.id),
         displayId: publicEntityId('OR', order.id),
+        customerId: order.customer_id || null,
         customerDisplayId: order.customer_id ? publicEntityId('CU', order.customer_id) : null,
         customer: order.customer_name || order.customer_email || undefined,
         ch: order.channel || order.account_channel || 'manual',
@@ -2391,16 +2392,94 @@ export async function getOmsAsns(userId: string) {
 }
 
 export async function getOmsCustomers(userId: string) {
-  const customers = await rows('SELECT * FROM customers WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200', [userId]);
+  const [customers, orderStats] = await Promise.all([
+    rows('SELECT * FROM customers WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200', [userId]),
+    rows(
+      `SELECT customer_id,
+              COUNT(*)::int AS order_count,
+              MIN(COALESCE(placed_at, created_at)) AS first_order_at,
+              MAX(COALESCE(placed_at, created_at)) AS last_order_at,
+              ARRAY_AGG(DISTINCT status) FILTER (WHERE status IS NOT NULL) AS order_statuses,
+              (ARRAY_AGG(channel ORDER BY COALESCE(placed_at, created_at) DESC)
+                FILTER (WHERE channel IS NOT NULL))[1] AS primary_channel,
+              COALESCE(SUM(
+                CASE
+                  WHEN COALESCE(totals->>'total', totals->>'subtotal', '') ~ '^-?[0-9]+([.][0-9]+)?$'
+                    THEN COALESCE(totals->>'total', totals->>'subtotal')::numeric
+                  ELSE 0
+                END
+              ), 0) AS lifetime_value
+         FROM orders
+        WHERE user_id = $1 AND customer_id IS NOT NULL
+        GROUP BY customer_id`,
+      [userId],
+    ),
+  ]);
+  const statsByCustomer = new Map(orderStats.map((row) => [String(row.customer_id), row]));
   return {
-    customers: customers.map((customer) => ({
-      ...customer,
-      id: customer.id,
-      publicId: publicEntityId('CU', customer.id),
-      displayId: publicEntityId('CU', customer.id),
-      createdAt: iso(customer.created_at),
-      updatedAt: iso(customer.updated_at),
-    })),
+    customers: customers.map((customer) => {
+      const metadata = json(customer.metadata, {});
+      const addresses = json(customer.addresses, []);
+      const address = Array.isArray(addresses) ? addresses[0] || {} : {};
+      const stats = statsByCustomer.get(String(customer.id)) || {};
+      const orderCount = number(stats.order_count);
+      const lifetimeValue = money(stats.lifetime_value);
+      const derivedSegment = lifetimeValue >= 1000 || orderCount >= 10
+        ? 'VIP'
+        : orderCount >= 3
+          ? 'Repeat'
+          : orderCount >= 2
+            ? 'Returning'
+            : 'New';
+      return {
+        id: customer.id,
+        publicId: publicEntityId('CU', customer.id),
+        displayId: publicEntityId('CU', customer.id),
+        name: customer.name || customer.email || 'Unnamed customer',
+        email: customer.email || undefined,
+        phone: customer.phone || undefined,
+        company: customer.company || undefined,
+        addresses,
+        city: address.city || undefined,
+        state: address.state || address.region || address.stateOrProvinceCode || undefined,
+        primaryChannel: customer.channel || stats.primary_channel || 'manual',
+        orders: orderCount,
+        ltv: lifetimeValue,
+        aov: orderCount ? money(lifetimeValue / orderCount) : 0,
+        firstOrder: iso(stats.first_order_at),
+        lastOrder: iso(stats.last_order_at),
+        orderStatuses: stats.order_statuses || [],
+        segment: metadata.segment || derivedSegment,
+        tags: Array.isArray(metadata.tags) ? metadata.tags : [],
+        metadata,
+        createdAt: iso(customer.created_at),
+        updatedAt: iso(customer.updated_at),
+      };
+    }),
+  };
+}
+
+export async function getOmsCustomerDetail(userId: string, customerId: string) {
+  const customerResult = await getOmsCustomers(userId);
+  const customer = customerResult.customers.find((item) => String(item.id) === String(customerId));
+  if (!customer) return null;
+
+  const ordersResult = await getOmsOrders(userId);
+  const customerOrders = (ordersResult.orders as Row[]).filter((order) => String(order.customerId || '') === String(customerId));
+  const ordersByStatus = customerOrders.reduce<Record<string, number>>((summary, order) => {
+    const status = String(order.status || 'unknown');
+    summary[status] = (summary[status] || 0) + 1;
+    return summary;
+  }, {});
+
+  return {
+    customer,
+    orders: customerOrders,
+    summary: {
+      totalOrders: customerOrders.length,
+      totalValue: money(customerOrders.reduce((sum, order) => sum + number(order.total), 0)),
+      ordersByStatus: Object.entries(ordersByStatus).map(([status, count]) => ({ status, count })),
+    },
   };
 }
 

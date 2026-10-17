@@ -21,6 +21,7 @@ import {
   getLedger,
   getOmsAsn,
   getOmsAsns,
+  getOmsCustomerDetail,
   getOmsCustomers,
   getOmsOrder,
   getOmsOrders,
@@ -177,6 +178,14 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getOmsCustomers(userId);
+  });
+
+  fastify.get('/oms/customers/:customerId', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const detail = await getOmsCustomerDetail(userId, String(req.params?.customerId || ''));
+    if (!detail) return reply.code(404).send({ error: 'Customer not found' });
+    return detail;
   });
 
   fastify.get('/oms/suppliers', async (req: any, reply) => {
