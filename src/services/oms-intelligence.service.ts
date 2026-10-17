@@ -1908,7 +1908,9 @@ function recommendationTaskTarget(rec: any) {
   const title = String(rec?.title || '').toLowerCase();
   const text = `${type} ${entityType} ${rec?.title || ''} ${rec?.summary || ''}`.toLowerCase();
   if (type.includes('data_enrichment') || type.includes('data_readiness')) {
-    if (title.includes('feed completeness')) return { screen: 'connections', actionLabel: 'Improve data sources' };
+    if (title.includes('feed completeness') || title.includes('data completeness')) {
+      return { screen: 'connections', actionLabel: 'Improve data sources' };
+    }
     const target = taskTargetFromText(`${text} ${rec?.requiredAction || ''}`);
     return { screen: target.screen, actionLabel: target.actionLabel };
   }
@@ -3100,9 +3102,10 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       unsupported_claim_behavior: 'state what evidence is missing instead of estimating',
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+  const actionIntent = chatRequestsActions(message);
   const normalized = accountGroundedFastPath
     ? fallback
-    : normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
+    : normalizeCortexChatResponse(cortex, fallback, actionIntent);
   const decisionIntent = chatRequestsDecision(message);
   if (decisionIntent) {
     normalized.answer = fallback.answer;
@@ -3145,6 +3148,15 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         ? { ...action, id: action.id || matchingTask.id, entityId: matchingTask.entityId || undefined }
         : action;
     });
+  }
+  if (actionIntent && normalized.tasks.length) {
+    const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
+    if (!alreadyActionable) {
+      const first = normalized.tasks[0];
+      const actionLabel = String(first.actionLabel || 'Open the related screen').replace(/[.!]+$/, '');
+      const taskTitle = String(first.title || '').replace(/[.!]+$/, '');
+      normalized.answer = polishCortexChatText(`${normalized.answer}\n\nFirst action: ${actionLabel}${taskTitle ? ` and complete “${taskTitle}.”` : '.'}`);
+    }
   }
   const marketplaceAnswerHasCoverage = /(products?|orders?)/i.test(normalized.answer)
     && /inventory/i.test(normalized.answer)
