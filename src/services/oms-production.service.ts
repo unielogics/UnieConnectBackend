@@ -1080,6 +1080,69 @@ function itemCost(item: Row | null) {
   return number(attributes.cost ?? metadata.cost ?? metadata.unitCost);
 }
 
+async function skuStorageBillingAllocation(
+  userId: string,
+  warehouses: Array<{ code: string; available: number }>,
+) {
+  if (!warehouses.length || !(await tableExists('invoice_lines'))) return null;
+  const availableByWarehouse = new Map(
+    warehouses.map((warehouse) => [String(warehouse.code || '').toUpperCase(), Math.max(0, number(warehouse.available))]),
+  );
+  const billingRows = await rows<{ amount: string; payload: Row }>(
+    `SELECT amount::text, payload
+       FROM invoice_lines
+      WHERE user_id = $1
+        AND COALESCE(payload->>'category', '') = 'storage'
+        AND ${BILLING_ACTIVITY_AT} >= now() - interval '30 days'
+      ORDER BY ${BILLING_ACTIVITY_AT} DESC`,
+    [userId],
+  );
+  if (!billingRows.length) return null;
+
+  const overrides = await loadActiveBillingOverrides(userId);
+  const driverMap = new Map<string, { wh: string; storage: number; handling: number; accessorial: number; freight: number; materials: number; optimized: number }>();
+  let currentMonthly = 0;
+  let optimizedMonthly = 0;
+
+  billingRows.forEach((line) => {
+    const payload = json(line.payload, {});
+    const warehouseCode = String(payload.warehouseCode || '').toUpperCase();
+    const skuUnits = availableByWarehouse.get(warehouseCode) || 0;
+    const warehouseItemCount = Math.max(0, number(payload.lineMetadata?.itemCount));
+    if (!warehouseCode || skuUnits <= 0 || warehouseItemCount <= 0) return;
+
+    const allocated = money(number(line.amount) * Math.min(1, skuUnits / warehouseItemCount));
+    if (allocated <= 0) return;
+    const pct = overrides.byWarehouseCategory[`${warehouseCode}::storage`] ?? overrides.byCategory.storage ?? 0;
+    const optimized = money(allocated * (1 - pct));
+    const driver = driverMap.get(warehouseCode) || {
+      wh: warehouseCode,
+      storage: 0,
+      handling: 0,
+      accessorial: 0,
+      freight: 0,
+      materials: 0,
+      optimized: 0,
+    };
+    driver.storage = money(driver.storage + allocated);
+    driver.optimized = money(driver.optimized + optimized);
+    driverMap.set(warehouseCode, driver);
+    currentMonthly = money(currentMonthly + allocated);
+    optimizedMonthly = money(optimizedMonthly + optimized);
+  });
+
+  const drivers = Array.from(driverMap.values());
+  if (!drivers.length) return null;
+  return {
+    currentMonthly,
+    optimizedMonthly,
+    drivers,
+    source: 'wms_invoice_allocation',
+    periodDays: 30,
+    method: 'SKU on-hand share of real warehouse storage invoices',
+  };
+}
+
 function skuHistoryTimeline(item: Row, shipmentPlans: Row[], asns: Row[], activityLogs: Row[], ledgerRows: Row[]) {
   const records: Array<{ ts: string; type: string; actor: string; subject: string; impact?: number | null }> = [];
 
@@ -1620,6 +1683,12 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
       };
     })
     .sort((a, b) => b.available - a.available);
+  const skuBilling = await skuStorageBillingAllocation(userId, skuWarehouses);
+  const storageByWarehouse = new Map((skuBilling?.drivers || []).map((driver) => [driver.wh, driver.storage]));
+  const skuWarehousesWithBilling = skuWarehouses.map((warehouse) => ({
+    ...warehouse,
+    storageCost: storageByWarehouse.get(warehouse.code) || 0,
+  }));
 
   const amazonProfile = (await tableExists('amazon_item_profiles'))
     ? await one(
@@ -1756,13 +1825,9 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     // Real per-warehouse inventory for this SKU (from WMS snapshots). Empty until the WMS has
     // pushed an inventory_snapshot for this SKU — the UI shows an honest "no WMS inventory yet"
     // state rather than a row of placeholder zeros for every facility.
-    warehouses: skuWarehouses,
+    warehouses: skuWarehousesWithBilling,
     history: skuHistoryTimeline(item, activityPlans, asnRows, activityLogs, ledgerRows),
-    billing: {
-      currentMonthly: 120,
-      optimizedMonthly: 98.4,
-      drivers: ['storage', 'handling', 'freight allocation', 'label service'],
-    },
+    billing: skuBilling,
   };
 }
 
