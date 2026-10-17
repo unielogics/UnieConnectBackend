@@ -1722,6 +1722,10 @@ function recommendationTaskTarget(rec: any) {
   const type = String(rec?.recommendationType || '').toLowerCase();
   const entityType = String(rec?.entityType || '').toLowerCase();
   const text = `${type} ${entityType} ${rec?.title || ''} ${rec?.summary || ''}`.toLowerCase();
+  if (type.includes('data_enrichment') || type.includes('data_readiness')) {
+    const target = taskTargetFromText(`${text} ${rec?.requiredAction || ''}`);
+    return { screen: target.screen, actionLabel: target.actionLabel };
+  }
   if (entityType === 'sku' || text.includes('sku') || text.includes('listing')) {
     return rec?.entityId
       ? { screen: 'sku-detail', actionLabel: 'Open SKU details' }
@@ -1900,6 +1904,18 @@ async function upsertCortexTask(userId: string, task: any) {
 
 export async function refreshCortexTasks(userId: string) {
   await ensureCortexWorkspaceTables();
+  // Data-enrichment/readiness recommendations are prerequisite work, not
+  // approve/deny decisions. Normalize historical rows created before this
+  // distinction so every surface presents the same lifecycle.
+  await pgQuery(
+    `UPDATE oms_recommendations
+        SET approval_state = 'not_required', updated_at = now()
+      WHERE user_id = $1
+        AND status = 'open'
+        AND approval_state = 'waiting_approval'
+        AND recommendation_type IN ('data_enrichment', 'data_readiness')`,
+    [userId],
+  ).catch(() => null);
   const [readiness, recs, marketplaceConnections] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { status: 'open', limit: 100 }),
