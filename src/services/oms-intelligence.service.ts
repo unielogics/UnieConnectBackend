@@ -73,6 +73,21 @@ const number = (value: unknown, fallback = 0) => {
 
 const json = (value: unknown, fallback: any = {}) => (value == null ? fallback : value);
 const iso = (value: unknown) => (value ? new Date(value as any).toISOString() : undefined);
+
+export function matchesCortexExecution(expectedResponse: any, remote: any): boolean {
+  const expected = String(expectedResponse?.execution_id || expectedResponse?.executionId || '').trim();
+  if (!expected) return true;
+  const received = String(
+    remote?.execution_id ||
+      remote?.executionId ||
+      remote?.request?.execution_id ||
+      remote?.request?.executionId ||
+      remote?.result?.execution_id ||
+      remote?.result?.executionId ||
+      '',
+  ).trim();
+  return Boolean(received && received === expected);
+}
 const SELLER_OPTIMIZATION_RECOMMENDATION_TYPES = [
   'business_double',
   'sku_placement',
@@ -3395,6 +3410,16 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
     );
   }
 
+  if (run && !matchesCortexExecution(json(run.cortex_response, {}), result)) {
+    return {
+      ok: true,
+      ignored: true,
+      reason: 'stale_execution',
+      runId: run.id,
+      cortexRunId,
+    };
+  }
+
   const existingSnapshot = run?.id
     ? await one(
         `SELECT id
@@ -3644,7 +3669,7 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
 
 async function reconcileLatestCortexOptimization(userId: string) {
   const localRun = await one(
-    `SELECT id, cortex_run_id, output
+    `SELECT id, cortex_run_id, output, cortex_response
        FROM oms_intelligence_runs
       WHERE user_id = $1
         AND run_type = 'seller_optimization'
@@ -3678,6 +3703,7 @@ async function reconcileLatestCortexOptimization(userId: string) {
     if (!response.ok) return null;
     const remote: any = await response.json().catch(() => ({}));
     if (!['complete', 'completed'].includes(String(remote?.status || '').toLowerCase()) || !remote?.result) return null;
+    if (!matchesCortexExecution(json(localRun.cortex_response, {}), remote)) return null;
     return ingestCortexResult({
       tenant_id: userId,
       run_id: cortexRunId,
