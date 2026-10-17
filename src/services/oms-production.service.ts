@@ -632,6 +632,53 @@ async function getUnitsSold(userId: string, start: Date, end?: Date) {
   return number(data[0]?.units);
 }
 
+async function getProductGrossProfit(userId: string, start: Date, end?: Date) {
+  const data = await rows<{ revenue: string; cogs: string; missing_cost_lines: string }>(
+    `WITH priced_lines AS (
+       SELECT ol.quantity,
+              ol.total_price,
+              CASE
+                WHEN COALESCE(i.metadata->>'cost', i.metadata->>'unitCost', i.attributes->>'cost', '')
+                     ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                  THEN COALESCE(i.metadata->>'cost', i.metadata->>'unitCost', i.attributes->>'cost')::numeric
+                ELSE NULL
+              END AS unit_cost
+         FROM order_lines ol
+         INNER JOIN orders o ON o.id = ol.order_id
+         LEFT JOIN catalog_items i ON i.id = ol.item_id AND i.user_id = ol.user_id
+        WHERE ol.user_id = $1
+          AND COALESCE(o.placed_at, o.created_at) >= $2
+          AND ($3::timestamptz IS NULL OR COALESCE(o.placed_at, o.created_at) < $3)
+     )
+     SELECT COALESCE(SUM(total_price), 0)::text AS revenue,
+            COALESCE(SUM(quantity * unit_cost) FILTER (WHERE unit_cost IS NOT NULL), 0)::text AS cogs,
+            COUNT(*) FILTER (WHERE quantity > 0 AND unit_cost IS NULL)::text AS missing_cost_lines
+       FROM priced_lines`,
+    [userId, start, end || null],
+  );
+  const row = data[0] || { revenue: '0', cogs: '0', missing_cost_lines: '0' };
+  const missingCostLines = number(row.missing_cost_lines);
+  return {
+    available: missingCostLines === 0 && number(row.revenue) > 0,
+    grossProfit: missingCostLines === 0 ? money(number(row.revenue) - number(row.cogs)) : 0,
+    missingCostLines,
+  };
+}
+
+async function getRevenueSeries(userId: string, range: RangeKey, start: Date) {
+  const bucket = range === 'today' ? 'hour' : range === '7d' ? 'day' : 'week';
+  const data = await rows<{ at: Date | string; revenue: string }>(
+    `SELECT date_trunc('${bucket}', COALESCE(placed_at, created_at)) AS at,
+            COALESCE(SUM(COALESCE((totals->>'total')::numeric, 0)), 0)::text AS revenue
+       FROM orders
+      WHERE user_id = $1 AND COALESCE(placed_at, created_at) >= $2
+      GROUP BY 1
+      ORDER BY 1`,
+    [userId, start],
+  );
+  return data.map((row) => ({ at: iso(row.at), revenue: money(row.revenue) }));
+}
+
 async function baseCounts(userId: string) {
   const data = await rows(
     `SELECT
@@ -1206,11 +1253,14 @@ function skuHistoryTimeline(item: Row, shipmentPlans: Row[], asns: Row[], activi
 export async function getCommandCenter(userId: string, range: RangeKey) {
   const start = rangeStart(range);
   const prevStart = previousRangeStart(range, start);
-  const [current, previous, units, previousUnits, counts, items, plan, activityLedger] = await Promise.all([
+  const [current, previous, units, previousUnits, currentMargin, previousMargin, revenueSeries, counts, items, plan, activityLedger] = await Promise.all([
     orderSummary(userId, start),
     orderSummary(userId, prevStart, start),
     getUnitsSold(userId, start),
     getUnitsSold(userId, prevStart, start),
+    getProductGrossProfit(userId, start),
+    getProductGrossProfit(userId, prevStart, start),
+    getRevenueSeries(userId, range, start),
     baseCounts(userId),
     getItems(userId),
     getInventoryPlan(userId).catch(() => ({ skus: [] as any[] })),
@@ -1224,7 +1274,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
     ).catch(() => []),
   ]);
   const aov = current.orders > 0 ? money(current.revenue / current.orders) : 0;
-  const grossProfit = money(current.revenue * 0.36);
+  const previousAov = previous.orders > 0 ? money(previous.revenue / previous.orders) : 0;
   const lowStock = items.filter((i) => number(itemInventory(i).available) <= 10).length;
   const unmapped = items.filter((i) => !i.supplier_id).length;
   // Reorder-needed rollup (external supply loop): count SKUs the client enabled auto-replenish
@@ -1245,10 +1295,17 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
       orders: current.orders,
       ordersDeltaPct: pctDelta(current.orders, previous.orders),
       aov,
-      grossProfit,
+      aovDeltaPct: pctDelta(aov, previousAov),
+      grossProfit: currentMargin.grossProfit,
+      grossProfitAvailable: currentMargin.available,
+      grossProfitDeltaPct: currentMargin.available && previousMargin.available
+        ? pctDelta(currentMargin.grossProfit, previousMargin.grossProfit)
+        : null,
+      grossProfitMissingCostLines: currentMargin.missingCostLines,
       refunds: current.refunds,
       units,
       unitsDeltaPct: pctDelta(units, previousUnits),
+      revenueSeries,
     },
     warnings: [
       ...(reorderCount ? [{ severity: 'high', title: 'Reorder needed', detail: `${reorderCount} product${reorderCount === 1 ? '' : 's'} will stock out within supplier lead time — review reorder suggestions.` }] : []),
@@ -1276,43 +1333,45 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
 }
 
 export async function getBusinessDouble(userId: string) {
-  const [counts, thirty, snapshot] = await Promise.all([
+  const thirtyDayStart = rangeStart('30d');
+  const [counts, thirty, snapshot, billing] = await Promise.all([
     baseCounts(userId),
-    orderSummary(userId, rangeStart('30d')),
+    orderSummary(userId, thirtyDayStart),
     latestSellerOptimizationSnapshot(userId),
+    getBillingCategoryTotals(userId, thirtyDayStart),
   ]);
-  const currentMonthlyCost = money(counts.items * 2.75 + counts.orders * 1.35 + counts.shipmentPlans * 42);
-  const optimizedMonthlyCost = money(currentMonthlyCost * 0.82);
+  const currentMonthlyCost = money(
+    billing.totals.freight
+    + billing.totals.storage
+    + billing.totals.handling
+    + billing.totals.accessorials
+    + billing.totals.materials
+    - Math.abs(billing.totals.refundsCaptured),
+  );
   const localPlan = {
     id: `generated-${userId}`,
-    status: 'draft',
+    status: 'needs_model',
+    modelStatus: 'not_modeled',
     title: 'Six-month multi-warehouse operating plan',
     summary: 'Cortex models seller demand, WMS truth, pallet economics, and transport consolidation to lower cost while improving delivery speed.',
     forecastHorizonMonths: 6,
     currentMetrics: {
       monthlyRevenue: thirty.revenue,
       monthlyCost: currentMonthlyCost,
-      averageDeliveryDays: counts.facilities > 1 ? 3.8 : counts.facilities === 1 ? 5.2 : 0,
       warehouseNodes: counts.facilities,
-      stockoutRiskPct: counts.items ? 18 : 0,
+      freight: billing.totals.freight,
+      storage: billing.totals.storage,
+      handling: billing.totals.handling,
+      accessorials: billing.totals.accessorials,
+      materials: billing.totals.materials,
+      refundsCaptured: billing.totals.refundsCaptured,
     },
-    optimizedMetrics: {
-      monthlyRevenue: money(thirty.revenue * 1.08),
-      monthlyCost: optimizedMonthlyCost,
-      averageDeliveryDays: counts.facilities > 1 ? 2.5 : counts.facilities === 1 ? 3.9 : 0,
-      warehouseNodes: counts.facilities ? Math.max(2, counts.facilities) : 0,
-      stockoutRiskPct: counts.items ? 9 : 0,
-    },
-    savings: {
-      monthly: money(currentMonthlyCost - optimizedMonthlyCost),
-      annualized: money((currentMonthlyCost - optimizedMonthlyCost) * 12),
-      freightPct: 14,
-      storagePct: 7,
-      handlingPct: 5,
-    },
-    autonomousAfterApproval: ['WMS work prioritization', 'ASN routing', 'TMS consolidation', 'label audit claims', 'seller inventory nudges'],
-    approvalRequiredFor: ['Business Double operating model changes', 'low-confidence cross-system dispatch', 'policy/compliance exceptions'],
+    optimizedMetrics: {},
+    savings: {},
+    autonomousAfterApproval: [],
+    approvalRequiredFor: [],
   };
+  const snapshotOptimized = snapshot?.businessDouble?.optimizedMetrics || snapshot?.businessDouble?.optimized_metrics;
   const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
     ? {
         ...localPlan,
@@ -1323,8 +1382,9 @@ export async function getBusinessDouble(userId: string) {
         summary: snapshot?.businessDouble?.summary || localPlan.summary,
         forecastHorizonMonths: snapshot?.businessDouble?.forecastHorizonMonths || snapshot?.businessDouble?.forecast_horizon_months || localPlan.forecastHorizonMonths,
         currentMetrics: snapshot?.businessDouble?.currentMetrics || snapshot?.businessDouble?.current_metrics || localPlan.currentMetrics,
-        optimizedMetrics: snapshot?.businessDouble?.optimizedMetrics || snapshot?.businessDouble?.optimized_metrics || localPlan.optimizedMetrics,
+        optimizedMetrics: snapshotOptimized || localPlan.optimizedMetrics,
         savings: snapshot?.businessDouble?.savings || localPlan.savings,
+        modelStatus: hasPlanPayload(snapshotOptimized) ? 'modeled' : 'not_modeled',
       }
     : null;
   const plan = attachCortexSource(cortexBusinessDouble || localPlan, snapshot, cortexBusinessDouble ? 'cortex_seller_optimization' : 'local_fallback_business_double');
@@ -1338,6 +1398,11 @@ export async function getBusinessDouble(userId: string) {
 
 export async function approveBusinessDouble(userId: string, planId: string, approvedBy?: string, log?: FastifyBaseLogger) {
   const { plan } = await getBusinessDouble(userId);
+  if (plan.modelStatus !== 'modeled' || !hasPlanPayload(plan.optimizedMetrics)) {
+    const error: any = new Error('Cortex has not produced an executable optimized plan yet. Run Seller Optimization after completing readiness tasks.');
+    error.statusCode = 409;
+    throw error;
+  }
   let stored: any = null;
   try {
     const res = await pgQuery(
