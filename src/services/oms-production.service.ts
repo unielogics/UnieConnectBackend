@@ -1206,7 +1206,7 @@ function skuHistoryTimeline(item: Row, shipmentPlans: Row[], asns: Row[], activi
 export async function getCommandCenter(userId: string, range: RangeKey) {
   const start = rangeStart(range);
   const prevStart = previousRangeStart(range, start);
-  const [current, previous, units, previousUnits, counts, items, plan] = await Promise.all([
+  const [current, previous, units, previousUnits, counts, items, plan, activityLedger] = await Promise.all([
     orderSummary(userId, start),
     orderSummary(userId, prevStart, start),
     getUnitsSold(userId, start),
@@ -1214,6 +1214,14 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
     baseCounts(userId),
     getItems(userId),
     getInventoryPlan(userId).catch(() => ({ skus: [] as any[] })),
+    rows(
+      `SELECT id, entity_type, entity_id, event_type, source_system, summary, payload, confidence, created_at
+         FROM oms_execution_ledger
+        WHERE user_id = $1 AND created_at >= $2
+        ORDER BY created_at DESC
+        LIMIT 100`,
+      [userId, start],
+    ).catch(() => []),
   ]);
   const aov = current.orders > 0 ? money(current.revenue / current.orders) : 0;
   const grossProfit = money(current.revenue * 0.36);
@@ -1248,11 +1256,21 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
       ...(unmapped ? [{ severity: 'medium', title: 'Supplier mapping gap', detail: `${unmapped} SKUs are missing supplier assignment for shipment planning.` }] : []),
       ...(counts.channels === 0 ? [{ severity: 'high', title: 'No marketplace connection', detail: 'Connect Amazon, Shopify, or eBay to keep OMS forecasts live.' }] : []),
     ],
-    autonomousActivity: [
-      { system: 'OMS', action: 'Demand forecast refreshed', status: 'complete', confidence: 0.91, at: new Date().toISOString() },
-      { system: 'WMS', action: 'Inventory truth projection checked', status: counts.facilities ? 'complete' : 'pending_connection', confidence: counts.facilities ? 0.86 : 0.42, at: new Date().toISOString() },
-      { system: 'Cortex', action: 'Dispatch orchestration readiness scored', status: cortexConfigStatus().configured ? 'ready' : 'limited', confidence: cortexConfigStatus().configured ? 0.89 : 0.35, at: new Date().toISOString() },
-    ],
+    autonomousActivity: activityLedger.map((event) => {
+      const payload = json(event.payload, {});
+      const rawImpact = payload.impact ?? payload.savings ?? payload.outcome;
+      return {
+        id: event.id,
+        entityType: event.entity_type,
+        entityId: event.entity_id || null,
+        system: event.source_system || 'OMS',
+        action: event.summary || String(event.event_type || 'System event').replace(/[._-]+/g, ' '),
+        status: payload.status || payload.result || 'recorded',
+        confidence: event.confidence == null ? null : number(event.confidence),
+        impact: typeof rawImpact === 'string' || typeof rawImpact === 'number' ? rawImpact : null,
+        at: iso(event.created_at),
+      };
+    }),
     counts,
   };
 }
