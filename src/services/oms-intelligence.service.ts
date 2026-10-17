@@ -3406,7 +3406,14 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
           warehouseNodes:
             number(fbm?.warehouse_network?.network_selection_meta?.selected_warehouse_count) || 2,
         },
-        savings: { perUnit: perUnitSavings, monthly: monthlySavings, annualized: monthlySavings * 12, pct: savingsPct },
+        savings: {
+          perUnit: perUnitSavings,
+          monthly: monthlySavings,
+          total: monthlySavings,
+          annualized: monthlySavings * 12,
+          pct: savingsPct,
+          costReductionPct: savingsPct,
+        },
         recommendationVerdict: fbm?.recommendation || null,
       }),
       JSON.stringify({
