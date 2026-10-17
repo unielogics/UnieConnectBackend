@@ -1269,9 +1269,30 @@ function cortexFeeLineItems(cortexData: AnyRow, units: number) {
   push('storage', 'Estimated storage', breakdown.storage, units, 'unit');
   push('lab', 'Estimated prep/LAB', breakdown.lab, units, 'unit');
   push('materials', 'Estimated packaging materials', breakdown.materials, units, 'unit');
-  push('shipment_label', 'Estimated shipment labels', breakdown.shipmentLabel, 1, 'label');
+  push('outbound_postage', 'Estimated outbound parcel postage', breakdown.shipmentLabel, units, 'unit');
   push('supplier_pickup_due_today', 'Supplier pickup due today', breakdown.supplierPickupDueToday, 1, 'pickup');
   return rows;
+}
+
+function shipmentCostEvidence(data: AnyRow, context: AnyRow, cached = false) {
+  const sourceQuality = trim(data?.warehousePricingSource || data?.sourceQuality || data?.costAuthority || '');
+  const normalizedSource = sourceQuality.toLowerCase();
+  const blockers = Array.isArray(data?.blockers) ? data.blockers.filter(Boolean) : [];
+  const confidence = number(data?.confidence, 0);
+  const modeled = Boolean(data?.fallbackAvailable)
+    || /model|fallback|synthetic|assumption|forecast/.test(normalizedSource)
+    || blockers.some((blocker: unknown) => /pricing_unavailable|rate_evidence_unavailable/.test(String(blocker || '')));
+  const explicit = data?.decisionReady === true || data?.costStatus === 'evidence_backed';
+  const identifiableEvidence = /rate|quote|contract|wms|warehouse|carrier|connected|observed/.test(normalizedSource);
+  const evidenceBacked = !modeled && (explicit || (identifiableEvidence && confidence >= 0.7));
+  return {
+    costStatus: evidenceBacked ? 'evidence_backed' : 'planning_only',
+    costAuthority: sourceQuality || (cached ? 'cached_account_economics' : 'cortex_shipment_pricing'),
+    pricingBasis: context.warehouseCode
+      ? (cached ? 'connected_warehouse_cache' : 'connected_warehouse_cortex')
+      : (cached ? 'network_cache' : 'network_cortex'),
+    excludedCostItems: ['asn_pallet_label_pdf'],
+  };
 }
 
 async function catalogItemsForPricingRefresh(userId: string, explicitItems?: any[]) {
@@ -2180,6 +2201,7 @@ async function shipmentPricingPreview(userId: string, input: AnyRow) {
     warehouseCodes: warehouseCodesForCortexPricing(context),
     warehouses: context.warehouses,
     networkPolicy: context.networkPolicy || undefined,
+    excludedCostItems: ['asn_pallet_label_pdf'],
   }, { userId, idempotencyKey: `oms-pricing-plan-${userId}-${input.shipmentPlanId || randomUUID()}`, allowGlobalApiKey: true });
 }
 
@@ -2195,6 +2217,10 @@ function fallbackPricingPreview(items: AnyRow[]) {
     dueToday: 0,
     feeTimingNotice: 'Warehouse fees are billed when services are performed. Due today is $0.00 unless supplier pickup or paid transportation is selected.',
     confidence: 0.35,
+    costStatus: 'planning_only',
+    costAuthority: 'local_modeled_assumptions',
+    pricingBasis: 'modeled_unverified',
+    excludedCostItems: ['asn_pallet_label_pdf'],
     blockers: ['cortex_pricing_unavailable'],
     feeBreakdown: {
       receiving: { amount: money(receiving) },
@@ -3664,6 +3690,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
       destinationZipDemand: destinationZipDemandFromItems(items),
+      excludedCostItems: ['asn_pallet_label_pdf'],
     }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
@@ -3680,6 +3707,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         dueToday: money(cortex.data?.dueToday || 0),
         warehouseCode: cortex.data?.recommendedWarehouseCode || context.warehouseCode || null,
         source: 'cortex_pricing_authority',
+        ...shipmentCostEvidence(cortex.data || {}, context),
         cortex: cortex.data,
       };
     }
@@ -3695,6 +3723,10 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       dueToday: 0,
       warehouseCode: context.warehouseCode || null,
       source: 'local_fallback_cortex_unavailable',
+      costStatus: 'planning_only',
+      costAuthority: 'local_modeled_assumptions',
+      pricingBasis: 'modeled_unverified',
+      excludedCostItems: ['asn_pallet_label_pdf'],
       cortex: { ok: false, status: cortex.status, error: cortex.data?.error || 'Cortex pricing unavailable' },
 
     };
@@ -3726,6 +3758,11 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       const aggregate = aggregateSkuEconomics(cachedEconomics, workflowType);
       const lineItems = cortexFeeLineItems({ feeBreakdown: aggregate.feeBreakdown }, units);
       const total = money(lineItems.reduce((sum, item) => sum + number(item.amount), 0));
+      const cachedEvidence = shipmentCostEvidence({
+        warehousePricingSource: cachedEconomics.map((row) => row.sourceQuality).filter(Boolean).join(','),
+        confidence: Math.min(...cachedEconomics.map((row) => number(row.confidence, 0.35))),
+        blockers: cachedEconomics.flatMap((row) => Array.isArray(row.blockers) ? row.blockers : []),
+      }, context, true);
       return {
         currency: cachedEconomics[0]?.currency || 'USD',
         workflowType,
@@ -3735,6 +3772,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         dueToday: 0,
         warehouseCode: context.warehouseCode || null,
         source: 'sku_fulfillment_economics_cache',
+        ...cachedEvidence,
         summary: aggregate.summary,
         perSkuEconomics: cachedEconomics,
         missingEconomicsCalculated: [],
@@ -3768,6 +3806,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       networkPolicy: context.networkPolicy || undefined,
       destinationStateWeights: destinationStateWeightsFromItems(items),
       destinationZipDemand: destinationZipDemandFromItems(items),
+      excludedCostItems: ['asn_pallet_label_pdf'],
     }, { userId, idempotencyKey: `oms-pricing-preview-${userId}-${Date.now()}` }).catch((err) => ({
       ok: false,
       status: 503,
@@ -3804,6 +3843,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       dueToday: money(cortex.data?.dueToday || 0),
       warehouseCode: cortex.data?.recommendedWarehouseCode || context.warehouseCode || null,
       source: 'cortex_pricing_authority',
+      ...shipmentCostEvidence(cortex.data || {}, context),
       summary: cortex.data?.summary || aggregateSkuEconomics(storedEconomics, workflowType).summary,
       perSkuEconomics: storedEconomics.length ? storedEconomics : cortex.data?.perSkuEconomics || [],
       missingEconomicsCalculated: storedEconomics,
