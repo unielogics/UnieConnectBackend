@@ -2220,12 +2220,24 @@ export async function refreshCortexTasks(userId: string) {
     });
   }
 
-  await pgQuery(
+  const autoCompleted = await pgQuery(
     `UPDATE oms_cortex_tasks
      SET status = 'done', completed_at = COALESCE(completed_at, now()), auto_completed_at = COALESCE(auto_completed_at, now()), updated_at = now()
-     WHERE user_id = $1 AND status = 'open' AND dedupe_key LIKE ANY($2::text[]) AND NOT (dedupe_key = ANY($3::text[]))`,
+     WHERE user_id = $1 AND status = 'open' AND dedupe_key LIKE ANY($2::text[]) AND NOT (dedupe_key = ANY($3::text[]))
+     RETURNING id, entity_type, entity_id, title, source, dedupe_key`,
     [userId, ['readiness:%', 'recommendation:%', 'work:%', 'connection:%'], Array.from(activeKeys)],
   ).catch(() => null);
+  for (const task of autoCompleted?.rows || []) {
+    await writeOmsLedgerEvent({
+      userId,
+      entityType: task.entity_type || 'cortex_task',
+      entityId: task.entity_id || task.id,
+      eventType: 'cortex_task_auto_completed',
+      sourceSystem: 'cortex',
+      summary: `Cortex verified task completion: ${humanizeInternalLanguage(task.title)}`,
+      payload: { taskId: task.id, dedupeKey: task.dedupe_key, taskSource: task.source, completionMode: 'account_evidence' },
+    }).catch(() => null);
+  }
 
   const tasks = await rows(
     `SELECT * FROM oms_cortex_tasks WHERE user_id = $1 ORDER BY
@@ -2275,6 +2287,17 @@ export async function completeCortexTask(userId: string, taskId: string) {
       [userId, taskId],
     );
     const complete = verified?.status === 'done';
+    if (!complete) {
+      await writeOmsLedgerEvent({
+        userId,
+        entityType: existing.entity_type || 'cortex_task',
+        entityId: existing.entity_id || existing.id,
+        eventType: 'cortex_task_verification_pending',
+        sourceSystem: 'cortex',
+        summary: `Cortex checked the task and still found the blocker: ${humanizeInternalLanguage(existing.title)}`,
+        payload: { taskId: existing.id, dedupeKey: existing.dedupe_key, verified: false },
+      }).catch(() => null);
+    }
     return {
       task: verified ? mapCortexTask(verified) : mapCortexTask(existing),
       verified: complete,
@@ -2290,6 +2313,17 @@ export async function completeCortexTask(userId: string, taskId: string) {
      WHERE user_id = $1 AND id = $2 RETURNING *`,
     [userId, taskId],
   );
+  if (row) {
+    await writeOmsLedgerEvent({
+      userId,
+      entityType: row.entity_type || 'cortex_task',
+      entityId: row.entity_id || row.id,
+      eventType: 'cortex_task_completed',
+      sourceSystem: 'oms',
+      summary: `Completed Cortex task: ${humanizeInternalLanguage(row.title)}`,
+      payload: { taskId: row.id, dedupeKey: row.dedupe_key, completionMode: 'manual' },
+    }).catch(() => null);
+  }
   return row ? {
     task: mapCortexTask(row),
     verified: true,
@@ -2305,6 +2339,17 @@ export async function dismissCortexTask(userId: string, taskId: string) {
      WHERE user_id = $1 AND id = $2 RETURNING *`,
     [userId, taskId],
   );
+  if (row) {
+    await writeOmsLedgerEvent({
+      userId,
+      entityType: row.entity_type || 'cortex_task',
+      entityId: row.entity_id || row.id,
+      eventType: 'cortex_task_dismissed',
+      sourceSystem: 'oms',
+      summary: `Dismissed Cortex task: ${humanizeInternalLanguage(row.title)}`,
+      payload: { taskId: row.id, dedupeKey: row.dedupe_key },
+    }).catch(() => null);
+  }
   return row ? mapCortexTask(row) : null;
 }
 
@@ -2410,7 +2455,7 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     sourceCatalog: [
       { source: 'oms_data_readiness', screen: 'command', label: 'Account readiness' },
       { source: 'oms_cortex_tasks', screen: 'command', label: 'Cortex tasks' },
-      { source: 'oms_recommendations', screen: 'double', label: 'Cortex decisions' },
+      { source: 'oms_recommendations', screen: 'double', label: 'Cortex guidance' },
       { source: 'oms_skus', screen: 'skus', label: 'SKU catalog' },
       { source: 'oms_orders', screen: 'orders', label: 'Orders' },
       { source: 'oms_warehouses', screen: 'warehouses', label: 'Warehouses' },
@@ -3464,7 +3509,7 @@ function mapRecommendation(row: any) {
     currentValue: json(row.current_value, {}),
     optimizedValue: json(row.optimized_value, {}),
     estimatedImpact: json(row.estimated_impact, {}),
-    requiredAction: row.required_action,
+    requiredAction: humanizeInternalLanguage(row.required_action),
     approvalState: row.approval_state,
     wmsTruthState: row.wms_truth_state,
     confidence: row.confidence == null ? null : Number(row.confidence),
@@ -3492,7 +3537,7 @@ function mapCortexTask(row: any) {
     detail: humanizeInternalLanguage(row.detail),
     priority: row.priority,
     status: row.status,
-    actionLabel: row.action_label,
+    actionLabel: humanizeInternalLanguage(row.action_label),
     actionTarget: row.action_target,
     evidence: json(row.evidence, {}),
     recommendationId: row.recommendation_id,
