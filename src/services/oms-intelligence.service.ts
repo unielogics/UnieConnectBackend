@@ -1620,16 +1620,44 @@ async function applyBillingPlanApproval(userId: string, rec: any, sourceActionId
   }
 }
 
+export function recommendationDecisionBlockReason(rec: any): string | null {
+  const mapped = rec?.recommendationType ? rec : mapRecommendation(rec);
+  const state = String(mapped?.approvalState || '').toLowerCase();
+  if (state === 'approved') return 'This Cortex decision has already been approved.';
+  if (['rejected', 'denied', 'declined'].includes(state)) return 'This Cortex decision has already been denied.';
+  if (!['waiting_approval', 'draft'].includes(state)) {
+    return 'This item is readiness work, not an approval decision. Complete it from the Cortex task inbox.';
+  }
+  if (!chatRecommendationIsDecision(mapped)) {
+    return 'This item does not contain a concrete, measurable current-versus-suggested change to approve.';
+  }
+  return null;
+}
+
+function recommendationDecisionConflict(rec: any, reason: string) {
+  return {
+    conflict: true,
+    error: reason,
+    recommendation: mapRecommendation(rec),
+  };
+}
+
 export async function approveRecommendation(userId: string, recommendationId: string, body: any = {}) {
   const rec = await one('SELECT * FROM oms_recommendations WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, recommendationId]);
   if (!rec) return null;
+  const blocked = recommendationDecisionBlockReason(rec);
+  if (blocked) return recommendationDecisionConflict(rec, blocked);
   const updated = await one(
     `UPDATE oms_recommendations
      SET approval_state = 'approved', status = 'approved', approved_at = now(), updated_at = now()
-     WHERE user_id = $1 AND id = $2
+     WHERE user_id = $1 AND id = $2 AND approval_state IN ('waiting_approval', 'draft')
      RETURNING *`,
     [userId, recommendationId],
   );
+  if (!updated) {
+    const current = await one('SELECT * FROM oms_recommendations WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, recommendationId]);
+    return recommendationDecisionConflict(current || rec, recommendationDecisionBlockReason(current || rec) || 'This Cortex decision changed before approval. Refresh and review its current state.');
+  }
   // Billing approvals persist rate overrides that drive the advisory savings projection.
   await applyBillingPlanApproval(userId, updated || rec).catch(() => null);
   await pgQuery(
@@ -1665,13 +1693,19 @@ export async function approveRecommendation(userId: string, recommendationId: st
 export async function rejectRecommendation(userId: string, recommendationId: string, body: any = {}) {
   const rec = await one('SELECT * FROM oms_recommendations WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, recommendationId]);
   if (!rec) return null;
+  const blocked = recommendationDecisionBlockReason(rec);
+  if (blocked) return recommendationDecisionConflict(rec, blocked);
   const updated = await one(
     `UPDATE oms_recommendations
      SET approval_state = 'rejected', status = 'rejected', rejected_at = now(), rejection_reason = $3, updated_at = now()
-     WHERE user_id = $1 AND id = $2
+     WHERE user_id = $1 AND id = $2 AND approval_state IN ('waiting_approval', 'draft')
      RETURNING *`,
     [userId, recommendationId, String(body?.reason || 'Rejected by user')],
   );
+  if (!updated) {
+    const current = await one('SELECT * FROM oms_recommendations WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, recommendationId]);
+    return recommendationDecisionConflict(current || rec, recommendationDecisionBlockReason(current || rec) || 'This Cortex decision changed before denial. Refresh and review its current state.');
+  }
   await writeOmsLedgerEvent({
     userId,
     entityType: rec.entity_type || rec.recommendation_type,

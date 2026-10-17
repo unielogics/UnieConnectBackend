@@ -114,6 +114,7 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     const result = await approveRecommendation(userId, String(req.params?.id || ''), req.body || {});
     if (!result) return reply.code(404).send({ error: 'Recommendation not found' });
+    if ((result as any).conflict) return reply.code(409).send(result);
     return result;
   });
 
@@ -122,6 +123,7 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
     if (!userId) return;
     const result = await rejectRecommendation(userId, String(req.params?.id || ''), req.body || {});
     if (!result) return reply.code(404).send({ error: 'Recommendation not found' });
+    if ((result as any).conflict) return reply.code(409).send(result);
     return result;
   });
 
