@@ -633,7 +633,7 @@ async function getUnitsSold(userId: string, start: Date, end?: Date) {
 }
 
 async function getProductGrossProfit(userId: string, start: Date, end?: Date) {
-  const data = await rows<{ revenue: string; cogs: string; missing_cost_lines: string }>(
+  const data = await rows<{ revenue: string; cogs: string; sold_lines: string; missing_cost_lines: string }>(
     `WITH priced_lines AS (
        SELECT ol.quantity,
               ol.total_price,
@@ -652,15 +652,18 @@ async function getProductGrossProfit(userId: string, start: Date, end?: Date) {
      )
      SELECT COALESCE(SUM(total_price), 0)::text AS revenue,
             COALESCE(SUM(quantity * unit_cost) FILTER (WHERE unit_cost IS NOT NULL), 0)::text AS cogs,
+            COUNT(*) FILTER (WHERE quantity > 0)::text AS sold_lines,
             COUNT(*) FILTER (WHERE quantity > 0 AND unit_cost IS NULL)::text AS missing_cost_lines
        FROM priced_lines`,
     [userId, start, end || null],
   );
-  const row = data[0] || { revenue: '0', cogs: '0', missing_cost_lines: '0' };
+  const row = data[0] || { revenue: '0', cogs: '0', sold_lines: '0', missing_cost_lines: '0' };
+  const soldLines = number(row.sold_lines);
   const missingCostLines = number(row.missing_cost_lines);
   return {
-    available: missingCostLines === 0 && number(row.revenue) > 0,
+    available: soldLines > 0 && missingCostLines === 0 && number(row.revenue) > 0,
     grossProfit: missingCostLines === 0 ? money(number(row.revenue) - number(row.cogs)) : 0,
+    soldLines,
     missingCostLines,
   };
 }
@@ -802,6 +805,34 @@ async function latestSellerOptimizationSnapshot(userId: string) {
 
 function hasPlanPayload(value: any) {
   return value && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
+function hasMaterialOptimizedPlan(current: any, optimized: any, savings: any) {
+  if (!hasPlanPayload(optimized)) return false;
+  const comparableKeys = [
+    'monthlyRevenue',
+    'monthlyCost',
+    'costPerUnit',
+    'freight',
+    'storage',
+    'handling',
+    'accessorials',
+    'lostRevenue',
+    'sla',
+    'slaDays',
+    'averageDeliveryDays',
+  ];
+  const hasMeasuredChange = comparableKeys.some((key) => {
+    const before = Number(current?.[key]);
+    const after = Number(optimized?.[key]);
+    return Number.isFinite(before) && Number.isFinite(after) && before > 0 && Math.abs(before - after) > 0.0001;
+  });
+  const hasMeasuredSavings = Object.entries(savings || {}).some(([key, value]) => {
+    if (!/(saving|revenue|cost|sla|upside|reduction|monthly|annual|perunit|pct)/i.test(key)) return false;
+    const amount = Number(value);
+    return Number.isFinite(amount) && Math.abs(amount) > 0.0001;
+  });
+  return hasMeasuredChange || hasMeasuredSavings;
 }
 
 function attachCortexSource<T extends Row>(payload: T, snapshot: Awaited<ReturnType<typeof latestSellerOptimizationSnapshot>> | null, fallbackSource: string): T {
@@ -1301,6 +1332,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
       grossProfitDeltaPct: currentMargin.available && previousMargin.available
         ? pctDelta(currentMargin.grossProfit, previousMargin.grossProfit)
         : null,
+      grossProfitSoldLines: currentMargin.soldLines,
       grossProfitMissingCostLines: currentMargin.missingCostLines,
       refunds: current.refunds,
       units,
@@ -1371,7 +1403,10 @@ export async function getBusinessDouble(userId: string) {
     autonomousAfterApproval: [],
     approvalRequiredFor: [],
   };
+  const snapshotCurrent = snapshot?.businessDouble?.currentMetrics || snapshot?.businessDouble?.current_metrics;
   const snapshotOptimized = snapshot?.businessDouble?.optimizedMetrics || snapshot?.businessDouble?.optimized_metrics;
+  const snapshotSavings = snapshot?.businessDouble?.savings;
+  const snapshotIsModeled = hasMaterialOptimizedPlan(snapshotCurrent, snapshotOptimized, snapshotSavings);
   const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
     ? {
         ...localPlan,
@@ -1381,10 +1416,10 @@ export async function getBusinessDouble(userId: string) {
         title: snapshot?.businessDouble?.title || localPlan.title,
         summary: snapshot?.businessDouble?.summary || localPlan.summary,
         forecastHorizonMonths: snapshot?.businessDouble?.forecastHorizonMonths || snapshot?.businessDouble?.forecast_horizon_months || localPlan.forecastHorizonMonths,
-        currentMetrics: snapshot?.businessDouble?.currentMetrics || snapshot?.businessDouble?.current_metrics || localPlan.currentMetrics,
-        optimizedMetrics: snapshotOptimized || localPlan.optimizedMetrics,
-        savings: snapshot?.businessDouble?.savings || localPlan.savings,
-        modelStatus: hasPlanPayload(snapshotOptimized) ? 'modeled' : 'not_modeled',
+        currentMetrics: snapshotIsModeled ? (snapshotCurrent || localPlan.currentMetrics) : localPlan.currentMetrics,
+        optimizedMetrics: snapshotIsModeled ? snapshotOptimized : localPlan.optimizedMetrics,
+        savings: snapshotIsModeled ? snapshotSavings : localPlan.savings,
+        modelStatus: snapshotIsModeled ? 'modeled' : 'not_modeled',
       }
     : null;
   const plan = attachCortexSource(cortexBusinessDouble || localPlan, snapshot, cortexBusinessDouble ? 'cortex_seller_optimization' : 'local_fallback_business_double');
