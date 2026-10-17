@@ -1929,6 +1929,21 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     [userId, thread?.id, message],
   );
 
+  const threadHistoryRows = (await rows(
+    `SELECT role, content
+       FROM oms_cortex_chat_messages
+      WHERE user_id = $1 AND thread_id = $2 AND role IN ('user', 'assistant')
+      ORDER BY created_at DESC
+      LIMIT 12`,
+    [userId, thread?.id],
+  ).catch(() => [])).reverse();
+  const lastHistoryItem = threadHistoryRows[threadHistoryRows.length - 1];
+  if (lastHistoryItem?.role === 'user' && String(lastHistoryItem.content || '') === message) {
+    threadHistoryRows.pop();
+  }
+  const threadHistory = threadHistoryRows
+    .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
+
   const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
   const fallback = context.readiness?.cortex?.configured === false
     ? {
@@ -1947,6 +1962,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     entity_id: entityId,
     thread_id: thread?.id,
     message,
+    history: threadHistory,
     context,
     response_contract: {
       answer: 'string',
@@ -1958,14 +1974,13 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback);
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
+  const liveRouteAvailable = Boolean(cortex?.ok);
   const cortexHealth = {
-    available: accountScopedChatAvailable,
+    available: liveRouteAvailable,
     chatIntegrated: accountScopedChatAvailable,
-    status: accountScopedChatAvailable ? 200 : 503,
-    reason: accountScopedChatAvailable
-      ? 'account_scoped_oms_chat_available'
-      : 'cortex_not_configured',
-    liveRouteAvailable: Boolean(cortex?.ok),
+    status: liveRouteAvailable ? 200 : 503,
+    reason: liveRouteAvailable ? 'live_chat_available' : accountScopedChatAvailable ? 'local_account_fallback' : 'cortex_not_configured',
+    liveRouteAvailable,
     liveRouteStatus: cortex?.status || 503,
     liveRouteReason: cortex?.ok
       ? 'live_chat_available'
@@ -1986,7 +2001,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       JSON.stringify(normalized.tasks),
       normalized.confidence,
       normalized.readinessNotes,
-      cortexHealth.chatIntegrated ? 'ok' : 'degraded',
+      liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'fallback' : 'unavailable',
       JSON.stringify(cortex || {}),
     ],
   );
@@ -1997,13 +2012,13 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   await pgQuery(
     `INSERT INTO oms_copilot_events (user_id, screen, prompt, response)
      VALUES ($1, $2, $3, $4::jsonb)`,
-    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: cortexHealth.chatIntegrated ? 'ok' : 'degraded', cortexHealth })],
+    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'fallback' : 'unavailable', cortexHealth })],
   ).catch(() => null);
   return {
     thread: mapCortexThread(thread),
     message: mapCortexMessage(saved),
     context: { screen, readiness: context.readiness, tasks: context.tasks.slice(0, 8), recommendations: context.recommendations.slice(0, 5) },
-    cortex: { ok: cortexHealth.chatIntegrated, status: cortexHealth.status, health: cortexHealth },
+    cortex: { ok: liveRouteAvailable, status: cortexHealth.status, health: cortexHealth },
   };
 }
 
@@ -2033,13 +2048,27 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
       },
     };
   }
+  const live = await postCortex('/v1/orchestration/oms/chat/health', {
+    tenant_id: userId,
+    userId,
+  }, {
+    userId,
+    idempotencyKey: `oms-cortex-chat-health-${userId}-${Math.floor(Date.now() / 60_000)}`,
+  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex health check failed' } }));
+  const available = Boolean(live?.ok && live?.data?.available !== false);
   const health = {
-    available: true,
+    available,
     chatIntegrated: true,
-    status: 200,
-    reason: 'account_scoped_oms_chat_available',
+    status: available ? 200 : Number(live?.status || 503),
+    reason: available
+      ? 'live_chat_available'
+      : live?.status === 404
+        ? 'cortex_chat_route_not_available'
+        : live?.data?.error || live?.data?.detail || 'cortex_chat_unavailable',
+    liveRouteAvailable: available,
+    liveRouteStatus: Number(live?.status || 503),
   };
-  return { ok: health.chatIntegrated, status: health.status, health };
+  return { ok: available, status: health.status, health };
 }
 
 export async function getCortexChatThreads(userId: string, query: any = {}) {
