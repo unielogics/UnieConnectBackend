@@ -3047,8 +3047,9 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.answer = fallback.answer;
   }
   const requiredFocusSource = normalizeChatSource({ source: focusContext?.requiredSource });
-  if (requiredFocusSource && !normalized.sources.some((source: any) => source?.source === requiredFocusSource.source)) {
-    normalized.sources.unshift(requiredFocusSource);
+  if (requiredFocusSource) {
+    const focusedSources = normalized.sources.filter((source: any) => source?.source === requiredFocusSource.source);
+    normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = Boolean(cortex?.ok);
