@@ -2461,7 +2461,7 @@ function humanizeInternalLanguage(text: unknown) {
     .replace(/\breconciling key fields\s*\(SKU, order id, timestamps, fee code\)/gi, 'matching SKU, order, timing, and charge details across connected sources')
     .replace(/\bfee codes?\b/gi, 'charge details')
     .replace(/\bfeed completeness\b/gi, 'data completeness')
-    .replace(/\breadiness score(?: of)?\s+(\d{1,3})(?!\s*%)/gi, 'readiness score of $1%')
+    .replace(/\breadiness score(?: of)?\s+(\d{1,3})\b(?!\s*%)/gi, 'readiness score of $1%')
     .replace(/\bstronger cost\s*\/\s*tax\s*\/\s*operations inference\b/gi, 'more reliable cost, tax, and operations analysis')
     .replace(/\bupload billing\s*\/\s*invoice line CSV\b/gi, 'upload a billing or invoice-line CSV')
     .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
