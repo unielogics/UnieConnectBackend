@@ -1438,7 +1438,57 @@ export async function getLatestOptimization(userId: string) {
   };
 }
 
+async function reconcileRecommendationIntegrity(userId: string) {
+  await pgQuery(
+    `UPDATE oms_recommendations
+        SET status = 'superseded',
+            approval_state = CASE
+              WHEN approval_state IN ('approved', 'rejected') THEN approval_state
+              ELSE 'superseded'
+            END,
+            updated_at = now()
+      WHERE user_id = $1
+        AND status = 'open'
+        AND recommendation_type = 'carrier_audit'
+        AND required_action = 'review_carrier_audit_evidence'
+        AND COALESCE(optimized_value->>'impactStatus', '') = ''
+        AND COALESCE(
+          CASE
+            WHEN estimated_impact->>'monthlySavings' ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (estimated_impact->>'monthlySavings')::numeric
+          END,
+          0
+        ) > 0`,
+    [userId],
+  ).catch(() => null);
+
+  const openBusinessDecision = await one(
+    `SELECT id
+       FROM oms_recommendations
+      WHERE user_id = $1
+        AND status = 'open'
+        AND recommendation_type = 'business_double'
+        AND approval_state IN ('waiting_approval', 'draft')
+      LIMIT 1`,
+    [userId],
+  ).catch(() => null);
+  if (!openBusinessDecision) return;
+
+  const business = await getBusinessDouble(userId).catch(() => null);
+  if (business?.plan?.decisionReady === true) return;
+  await pgQuery(
+    `UPDATE oms_recommendations
+        SET status = 'superseded', approval_state = 'superseded', updated_at = now()
+      WHERE user_id = $1
+        AND status = 'open'
+        AND recommendation_type = 'business_double'
+        AND approval_state IN ('waiting_approval', 'draft')`,
+    [userId],
+  ).catch(() => null);
+}
+
 export async function getRecommendations(userId: string, query: any = {}) {
+  await reconcileRecommendationIntegrity(userId);
   const values: unknown[] = [userId];
   const filters = ['user_id = $1'];
   if (query.status) {
