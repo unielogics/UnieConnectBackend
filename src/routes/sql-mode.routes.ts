@@ -1369,9 +1369,14 @@ function normalizeStoredNetworkComparison(payload: AnyRow, costs: AnyRow) {
   const warehouseCodes = normalizedEconomicsWarehouseCodes(optimized.warehouseCodes);
   const distinctCount = new Set(warehouseCodes.map((code) => code.toLowerCase())).size;
   const duplicateNode = warehouseCodes.length > 1 && distinctCount < 2;
+  const modeledFallback = optimized.modeledOnly === true
+    || payload.sourceQuality === 'modeled_fallback'
+    || payload.mode === 'local_modeled_fallback'
+    || payload.pricingPayload?.mode === 'local_modeled_fallback';
   const alreadyBlocked = optimized.status === 'blocked' || optimized.blockedReason || optimized.distinctSecondNode === false;
-  if (!duplicateNode && !alreadyBlocked) return payload;
-  const blockedReason = optimized.blockedReason || 'no_distinct_second_node_selected';
+  if (!duplicateNode && !alreadyBlocked && !modeledFallback) return payload;
+  const blockedReason = optimized.blockedReason
+    || (modeledFallback ? 'optimization_rate_evidence_unavailable' : 'no_distinct_second_node_selected');
   costs.optimizedPerUnit = undefined;
   costs.optimizedNetworkLabelPerUnit = undefined;
   costs.optimizedNetworkTransferPerUnit = undefined;
@@ -1383,10 +1388,13 @@ function normalizeStoredNetworkComparison(payload: AnyRow, costs: AnyRow) {
         ...optimized,
         status: 'blocked',
         blockedReason,
-        distinctSecondNode: false,
-        selectedWarehouseCount: Math.min(distinctCount || 1, 1),
-        warehouseCodes: warehouseCodes.slice(0, 1),
+        executable: false,
+        modeledOnly: true,
+        distinctSecondNode: distinctCount >= 2,
+        selectedWarehouseCount: distinctCount >= 2 ? 2 : Math.min(distinctCount || 1, 1),
+        warehouseCodes: warehouseCodes.slice(0, distinctCount >= 2 ? 2 : 1),
         labelPerUnit: null,
+        fulfillmentPerUnit: null,
         transferPerUnit: null,
         totalPerUnit: null,
         savingsPerUnit: null,
@@ -1700,77 +1708,61 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
   const manualNodeCodes = uniqueWarehouseCodes([networkPolicy.allowedExpansionWarehouseCodes]);
   const demandHeatmap = item.demandHeatmap || {};
   const enoughDemandForNetwork = Boolean(demandHeatmap.enoughForNetworkOptimization);
-  const optimizedHubCount = !isPrep && multiWarehouseAllowed && (enoughDemandForNetwork || networkPolicy.policySource === 'self_service') ? 2 : 1;
-  const optimizedLabelPerUnit = isPrep
-    ? 0
-    : optimizedHubCount > 1
-      ? money(Math.max(3.95, domesticLabelPerUnit * 0.82))
-      : domesticLabelPerUnit;
-  // LTL inter-warehouse transfer per unit — a weight-scaled estimate (offline model; the live
-  // Cortex path computes a real lane rate). Replaces the old flat $0.06 which made the multi total
-  // look like label-only. Small floor so a routed unit always carries a non-trivial transfer cost.
-  const twoNodeTransferPerUnit = isPrep || optimizedHubCount < 2 ? 0 : money(Math.max(0.35, weight * 0.12));
-  // Optimized/multi reuses the single-node non-label fulfillment stack = "inherit anchor rates"
-  // (receiving/pick/pack/handling/materials/storage). This is intentional: a peer node without its
-  // own pricing profile is priced at the anchor's fulfillment rates, never $0.
   const nonLabelCurrentPerUnit = money(totalPerUnit - domesticLabelPerUnit);
-  const optimizedPerUnit = isPrep
-    ? totalPerUnit
-    : money(nonLabelCurrentPerUnit + optimizedLabelPerUnit + twoNodeTransferPerUnit);
   const anchorWarehouseCode = context.warehouseCode || 'nearest_supplier_warehouse';
+  const configuredSecondNode = manualNodeCodes.find((code) => code !== trim(anchorWarehouseCode).toUpperCase())
+    || trim(networkPolicy.preferredExpansionWarehouseCode)
+    || trim(networkPolicy.secondaryWarehouseCode)
+    || null;
   const comparisonWarehouseCodes = [
     anchorWarehouseCode,
-    optimizedHubCount > 1 ? (manualNodeCodes[0] || networkPolicy.preferredExpansionWarehouseCode || networkPolicy.secondaryWarehouseCode || 'cortex_heatmap_node') : null,
+    configuredSecondNode,
   ].filter(Boolean);
-  const hasDistinctFallbackNode = new Set(comparisonWarehouseCodes).size >= 2;
+  const hasDistinctFallbackNode = new Set(comparisonWarehouseCodes.map((code) => trim(code).toLowerCase())).size >= 2;
   const fallbackOptimizedBlockedReason = !multiWarehouseAllowed
     ? 'network_expansion_not_allowed_by_warehouse'
-    : optimizedHubCount < 2
-      ? 'no_eligible_network_node_available'
-      : !hasDistinctFallbackNode
-        ? 'no_distinct_second_node_selected'
-        : null;
+    : !hasDistinctFallbackNode
+      ? 'no_distinct_second_node_selected'
+      : 'optimization_rate_evidence_unavailable';
   const networkComparison = {
     basis: 'sku_level_48_state_rate_shop',
-    heatmapStrategy: optimizedHubCount > 1 ? 'two_node_sku_order_heatmap' : 'single_node_until_sku_heatmap_threshold',
-    note: optimizedHubCount > 1
-      ? 'Single-warehouse rates model 48-state parcel exposure from the anchor warehouse. Optimized rates model a two-node layout selected from SKU order heatmap density and warehouse policy.'
-      : 'This SKU is rate-shopped from the anchor warehouse. Cortex will model additional hubs after SKU order heatmap density is strong enough and the account policy allows network optimization.',
+    heatmapStrategy: hasDistinctFallbackNode ? 'two_node_candidate_pending_rates' : 'single_node_until_eligible_second_node',
+    note: hasDistinctFallbackNode
+      ? 'A second warehouse candidate exists, but optimized cost and savings remain unavailable until live rates and warehouse fees are verified.'
+      : 'Current cost is a fallback estimate. Cortex needs a distinct eligible second warehouse and live pricing before it can calculate an optimized network.',
     demandHeatmap,
     singleWarehouse: {
       strategy: 'single_warehouse_close_to_supplier',
       warehouseCodes: [anchorWarehouseCode],
-      executable: true,
-      rateShoppingTriggered,
+      executable: false,
+      modeledOnly: true,
+      rateShoppingTriggered: false,
+      rateShoppingEligible: rateShoppingTriggered,
       labelPerUnit: domesticLabelPerUnit,
       fulfillmentPerUnit: money(nonLabelCurrentPerUnit),
       transferPerUnit: 0,
       totalPerUnit,
-      source: context.warehouseCode ? 'anchor_warehouse_rate_shop' : 'modeled_nearest_supplier_warehouse',
+      source: 'modeled_current_cost_estimate',
     },
     optimizedTwoNode: {
       strategy: 'optimized_two_node_heatmap',
-      status: fallbackOptimizedBlockedReason ? 'blocked' : 'available',
+      status: 'blocked',
       blockedReason: fallbackOptimizedBlockedReason,
       warehouseCodes: Array.from(new Set(comparisonWarehouseCodes)).slice(0, 2),
-      executable: multiWarehouseAllowed && optimizedHubCount > 1 && hasDistinctFallbackNode,
-      modeledOnly: !multiWarehouseAllowed || optimizedHubCount < 2 || !hasDistinctFallbackNode,
+      executable: false,
+      modeledOnly: true,
       distinctSecondNode: hasDistinctFallbackNode,
       selectedWarehouseCount: hasDistinctFallbackNode ? 2 : 1,
       demandSource: demandHeatmap.orderCount ? 'sku_order_heatmap' : 'national_demand_prior',
       candidateWarehouseCodes: manualNodeCodes,
       enoughDemandForNetwork,
-      labelPerUnit: fallbackOptimizedBlockedReason ? null : optimizedLabelPerUnit,
-      fulfillmentPerUnit: fallbackOptimizedBlockedReason ? null : money(nonLabelCurrentPerUnit),
-      transferPerUnit: fallbackOptimizedBlockedReason ? null : twoNodeTransferPerUnit,
-      totalPerUnit: fallbackOptimizedBlockedReason ? null : optimizedPerUnit,
-      savingsPerUnit: fallbackOptimizedBlockedReason ? null : money(Math.max(0, totalPerUnit - optimizedPerUnit)),
-      optimizedFulfillmentRatesSource: 'anchor_inherited',
-      source: !multiWarehouseAllowed
-        ? 'modeled_only_network_policy_blocked'
-        : optimizedHubCount > 1
-          ? 'cortex_sku_heatmap_rate_shop'
-          : 'single_node_insufficient_sku_heatmap',
+      labelPerUnit: null,
+      fulfillmentPerUnit: null,
+      transferPerUnit: null,
+      totalPerUnit: null,
+      savingsPerUnit: null,
+      optimizedFulfillmentRatesSource: null,
+      source: 'modeled_only_pricing_unavailable',
     },
   };
   const configuredUnits = quantity;
@@ -1830,9 +1822,9 @@ function fallbackEconomicsForItem(item: AnyRow, workflowType: string, context: A
       materialsTotal,
       transferLtlPerUnit,
       currentPerUnit: totalPerUnit,
-      optimizedPerUnit,
-      optimizedNetworkLabelPerUnit: optimizedLabelPerUnit,
-      optimizedNetworkTransferPerUnit: twoNodeTransferPerUnit,
+      optimizedPerUnit: undefined,
+      optimizedNetworkLabelPerUnit: undefined,
+      optimizedNetworkTransferPerUnit: undefined,
       totalPerUnit,
       total,
     },
