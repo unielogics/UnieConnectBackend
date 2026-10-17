@@ -1564,7 +1564,11 @@ function recommendationTaskTarget(rec: any) {
   const type = String(rec?.recommendationType || '').toLowerCase();
   const entityType = String(rec?.entityType || '').toLowerCase();
   const text = `${type} ${entityType} ${rec?.title || ''} ${rec?.summary || ''}`.toLowerCase();
-  if (entityType === 'sku' || text.includes('sku') || text.includes('listing')) return { screen: 'skus', actionLabel: 'Review SKU decision' };
+  if (entityType === 'sku' || text.includes('sku') || text.includes('listing')) {
+    return rec?.entityId
+      ? { screen: 'sku-detail', actionLabel: 'Open SKU details' }
+      : { screen: 'skus', actionLabel: 'Review SKUs' };
+  }
   if (entityType === 'supplier' || text.includes('supplier')) return { screen: 'suppliers', actionLabel: 'Review supplier action' };
   if (entityType === 'order' || text.includes('fulfillment')) return { screen: 'orders', actionLabel: 'Review order action' };
   if (entityType === 'shipment_plan' || text.includes('shipment') || text.includes('inbound')) return { screen: 'shipments', actionLabel: 'Review shipment plan' };
@@ -1572,6 +1576,23 @@ function recommendationTaskTarget(rec: any) {
   if (entityType === 'billing' || type === 'billing_profit' || text.includes('billing') || text.includes('margin')) return { screen: 'billing', actionLabel: 'Review billing impact' };
   if (entityType === 'business_double' || type === 'business_double' || text.includes('business double')) return { screen: 'double', actionLabel: 'Open Business Double' };
   return { screen: 'command', actionLabel: 'Review in Command Center' };
+}
+
+function recommendationBelongsInTaskInbox(rec: any) {
+  const state = String(rec?.approvalState || '').toLowerCase();
+  if (['waiting_approval', 'approved', 'rejected'].includes(state)) return false;
+
+  const text = [
+    rec?.recommendationType,
+    rec?.title,
+    rec?.summary,
+    rec?.requiredAction,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  // The task inbox is for prerequisite work. Concrete current-vs-suggested
+  // decisions remain in the decision surface where approve/deny has meaning.
+  return state.includes('blocked') ||
+    /(upload|connect|configure|complete|missing|readiness|evidence|feed|enrich|baseline|required data|data source)/.test(text);
 }
 
 function priorityForTask(text: string, score?: number) {
@@ -1655,8 +1676,8 @@ export async function refreshCortexTasks(userId: string) {
     });
   }
 
-  for (const rec of (recs.recommendations || []).filter(Boolean) as any[]) {
-    const dedupeKey = `recommendation:${rec.id}`;
+  for (const rec of (recs.recommendations || []).filter(recommendationBelongsInTaskInbox) as any[]) {
+    const dedupeKey = `work:${taskDedupeSlug(`${rec.entityType || rec.recommendationType}:${rec.entityId || rec.title}`)}`;
     activeKeys.add(dedupeKey);
     const target = recommendationTaskTarget(rec);
     await upsertCortexTask(userId, {
@@ -1686,7 +1707,7 @@ export async function refreshCortexTasks(userId: string) {
     `UPDATE oms_cortex_tasks
      SET status = 'done', completed_at = COALESCE(completed_at, now()), auto_completed_at = COALESCE(auto_completed_at, now()), updated_at = now()
      WHERE user_id = $1 AND status = 'open' AND dedupe_key LIKE ANY($2::text[]) AND NOT (dedupe_key = ANY($3::text[]))`,
-    [userId, ['readiness:%', 'recommendation:%'], Array.from(activeKeys)],
+    [userId, ['readiness:%', 'recommendation:%', 'work:%'], Array.from(activeKeys)],
   ).catch(() => null);
 
   const tasks = await rows(
