@@ -2905,6 +2905,9 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     const channelAccountId = trim(req.query?.channelAccountId);
     const values: unknown[] = [userId, limit, offset];
     let where = 'i.user_id = $1';
+    if (String(req.query?.includeArchived || '').toLowerCase() !== 'true') {
+      where += ' AND COALESCE(i.archived, false) = false';
+    }
     if (channelAccountId) {
       values.push(channelAccountId);
       where += ` AND EXISTS (SELECT 1 FROM item_channel_mappings m WHERE m.item_id = i.id AND m.channel_connection_id = $${values.length})`;
@@ -3045,16 +3048,16 @@ export async function sqlModeRoutes(app: FastifyInstance) {
            attributes = COALESCE($5::jsonb, attributes),
            default_uom = COALESCE($6, default_uom),
            tags = COALESCE($7, tags),
-           supplier_id = $8,
-           image = $9,
+           supplier_id = CASE WHEN $20::jsonb ? 'supplierId' THEN $8 ELSE supplier_id END,
+           image = CASE WHEN $20::jsonb ? 'image' THEN $9 ELSE image END,
            images = COALESCE($10::jsonb, images),
-           upc = $11,
-           ean = $12,
-           asin = $13,
-           category = $14,
-           sub_category = $15,
-           lob = $16,
-           weight = $17,
+           upc = CASE WHEN $20::jsonb ? 'upc' THEN $11 ELSE upc END,
+           ean = CASE WHEN $20::jsonb ? 'ean' THEN $12 ELSE ean END,
+           asin = CASE WHEN $20::jsonb ? 'asin' THEN $13 ELSE asin END,
+           category = CASE WHEN $20::jsonb ? 'category' THEN $14 ELSE category END,
+           sub_category = CASE WHEN $20::jsonb ? 'subCategory' THEN $15 ELSE sub_category END,
+           lob = CASE WHEN $20::jsonb ? 'lob' THEN $16 ELSE lob END,
+           weight = CASE WHEN $20::jsonb ? 'weight' THEN $17 ELSE weight END,
            dimensions = COALESCE($18::jsonb, dimensions),
            archived = COALESCE($19, archived),
            updated_at = now()
@@ -3080,6 +3083,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         body.weight === undefined || body.weight === '' ? null : Number(body.weight),
         body.dimensions === undefined ? null : JSON.stringify(body.dimensions || {}),
         body.archived === undefined ? null : Boolean(body.archived),
+        JSON.stringify(body),
       ],
     );
     if (!item) return reply.code(404).send({ error: 'Not found' });

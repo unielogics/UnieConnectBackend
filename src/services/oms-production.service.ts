@@ -686,7 +686,7 @@ function marketplaceFilterWhere(alias: string, filter: MarketplaceFilter, values
 
 async function getItems(userId: string, limit = 200, filter: MarketplaceFilter = {}) {
   const values: unknown[] = [userId, limit];
-  const clauses = ['i.user_id = $1', ...marketplaceFilterWhere('i', filter, values)];
+  const clauses = ['i.user_id = $1', 'COALESCE(i.archived, false) = false', ...marketplaceFilterWhere('i', filter, values)];
   const data = await rows(
     `SELECT i.* FROM catalog_items i WHERE ${clauses.join(' AND ')} ORDER BY i.updated_at DESC LIMIT $2`,
     values,
@@ -1404,6 +1404,42 @@ export async function getOmsSkus(userId: string, filter: MarketplaceFilter = {})
     amazon: amazonProfiles.get(String(sku.id)) || null,
   }));
   return { skus, total: skus.length };
+}
+
+export async function archiveOmsSkus(userId: string, skuIds: string[]) {
+  const ids = [...new Set(skuIds.map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) return { archivedCount: 0, archivedIds: [] as string[] };
+
+  const result = await pgQuery<{ id: string; sku: string }>(
+    `UPDATE catalog_items
+        SET archived = true, updated_at = now()
+      WHERE user_id = $1
+        AND id = ANY($2::text[])
+        AND archived = false
+      RETURNING id, sku`,
+    [userId, ids],
+  );
+  const archived = result?.rows || [];
+
+  await writeOmsLedgerEvent({
+    userId,
+    entityType: 'catalog_item_batch',
+    eventType: 'archived',
+    sourceSystem: 'oms',
+    summary: `${archived.length} catalog SKU${archived.length === 1 ? '' : 's'} archived.`,
+    payload: {
+      requestedCount: ids.length,
+      archivedCount: archived.length,
+      itemIds: archived.map((item) => item.id),
+      skus: archived.map((item) => item.sku),
+    },
+  });
+
+  return {
+    requestedCount: ids.length,
+    archivedCount: archived.length,
+    archivedIds: archived.map((item) => item.id),
+  };
 }
 
 export async function getOmsSkuDetail(userId: string, skuOrId: string) {

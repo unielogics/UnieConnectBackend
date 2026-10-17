@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import {
+  archiveOmsSkus,
   approveBusinessDouble,
   confirmShipmentWizardDraft,
   createLabelAuditRun,
@@ -83,6 +84,19 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getOmsSkus(userId, marketplaceFilter(req.query));
+  });
+
+  fastify.post('/oms/skus/archive', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    const ids: string[] = Array.isArray(req.body?.ids)
+      ? Array.from(new Set<string>(req.body.ids
+          .map((id: unknown): string => String(id || '').trim())
+          .filter((id: string) => id.length > 0)))
+      : [];
+    if (!ids.length) return reply.code(400).send({ error: 'Select at least one SKU to archive.' });
+    if (ids.length > 200) return reply.code(400).send({ error: 'Archive at most 200 SKUs at a time.' });
+    return archiveOmsSkus(userId, ids);
   });
 
   fastify.get('/oms/skus/:skuId', async (req: any, reply) => {
