@@ -2454,6 +2454,11 @@ function humanizeInternalLanguage(text: unknown) {
     .replace(/\bheadcount[_ ]reported\b/gi, 'team size')
     .replace(/\bemployee roster\b/gi, 'staff roster')
     .replace(/\bmissing datasets?\b/gi, 'missing account data')
+    .replace(/\bmissing backbone feeds?\b/gi, 'missing source data')
+    .replace(/\bbackbone feeds?\b/gi, 'source data')
+    .replace(/\breconciling key fields\s*\(SKU, order id, timestamps, fee code\)/gi, 'matching SKU, order, timing, and charge details across connected sources')
+    .replace(/\bfee codes?\b/gi, 'charge details')
+    .replace(/\bfeed completeness\b/gi, 'data completeness')
     .replace(/\bstronger cost\s*\/\s*tax\s*\/\s*operations inference\b/gi, 'more reliable cost, tax, and operations analysis')
     .replace(/\bupload billing\s*\/\s*invoice line CSV\b/gi, 'upload a billing or invoice-line CSV')
     .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
@@ -2490,7 +2495,7 @@ function polishCortexChatText(text: string) {
 const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
   oms_data_readiness: { screen: 'command', label: 'Account readiness' },
   oms_cortex_tasks: { screen: 'command', label: 'Cortex tasks' },
-  oms_recommendations: { screen: 'double', label: 'Cortex decisions' },
+  oms_recommendations: { screen: 'double', label: 'Cortex guidance' },
   oms_context_samples: { screen: 'command', label: 'OMS account context' },
   oms_skus: { screen: 'skus', label: 'SKU catalog' },
   oms_orders: { screen: 'orders', label: 'Orders' },
