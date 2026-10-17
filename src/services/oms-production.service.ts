@@ -1459,6 +1459,22 @@ export async function getBusinessDouble(userId: string) {
   const snapshotOptimized = snapshot?.businessDouble?.optimizedMetrics || snapshot?.businessDouble?.optimized_metrics;
   const snapshotSavings = snapshot?.businessDouble?.savings;
   const snapshotIsModeled = hasMaterialOptimizedPlan(snapshotCurrent, snapshotOptimized, snapshotSavings);
+  const modelBaselineMonthlyCost = money(snapshotCurrent?.monthlyCost ?? snapshotCurrent?.estimatedMonthlyCost);
+  const modelBaselineWarehouseNodes = number(snapshotCurrent?.warehouseNodes ?? snapshotCurrent?.warehouseCount);
+  const observedMonthlyCost = money(localPlan.currentMetrics.monthlyCost);
+  const connectedWarehouseNodes = number(localPlan.currentMetrics.warehouseNodes);
+  const costVarianceRatio = observedMonthlyCost > 0 && modelBaselineMonthlyCost > 0
+    ? Math.abs(modelBaselineMonthlyCost - observedMonthlyCost) / Math.max(observedMonthlyCost, modelBaselineMonthlyCost)
+    : 1;
+  const costGrounded = costVarianceRatio <= 0.2;
+  const networkGrounded = connectedWarehouseNodes > 0
+    && modelBaselineWarehouseNodes > 0
+    && connectedWarehouseNodes === modelBaselineWarehouseNodes;
+  const groundingIssues = [
+    ...(!costGrounded ? ['Modeled baseline cost does not reconcile with observed 30-day billing.'] : []),
+    ...(!networkGrounded ? ['Modeled baseline warehouse count does not match connected warehouse truth.'] : []),
+  ];
+  const decisionReady = snapshotIsModeled && costGrounded && networkGrounded;
   const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
     ? {
         ...localPlan,
@@ -1468,13 +1484,41 @@ export async function getBusinessDouble(userId: string) {
         title: snapshot?.businessDouble?.title || localPlan.title,
         summary: snapshot?.businessDouble?.summary || localPlan.summary,
         forecastHorizonMonths: snapshot?.businessDouble?.forecastHorizonMonths || snapshot?.businessDouble?.forecast_horizon_months || localPlan.forecastHorizonMonths,
-        currentMetrics: snapshotIsModeled ? (snapshotCurrent || localPlan.currentMetrics) : localPlan.currentMetrics,
+        currentMetrics: {
+          ...localPlan.currentMetrics,
+          ...(modelBaselineMonthlyCost > 0 ? { modelBaselineMonthlyCost } : {}),
+          ...(number(snapshotCurrent?.costPerUnit) > 0 ? { modelBaselineCostPerUnit: number(snapshotCurrent?.costPerUnit) } : {}),
+          ...(modelBaselineWarehouseNodes > 0 ? { modelBaselineWarehouseNodes } : {}),
+        },
         optimizedMetrics: snapshotIsModeled ? snapshotOptimized : localPlan.optimizedMetrics,
         savings: snapshotIsModeled ? snapshotSavings : localPlan.savings,
         modelStatus: snapshotIsModeled ? 'modeled' : 'not_modeled',
+        decisionReady,
+        impactStatus: decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
+        grounding: {
+          observedMonthlyCost,
+          modelBaselineMonthlyCost,
+          connectedWarehouseNodes,
+          modelBaselineWarehouseNodes,
+          costVariancePct: Math.round(costVarianceRatio * 10_000) / 100,
+          issues: groundingIssues,
+        },
       }
     : null;
-  const plan = attachCortexSource(cortexBusinessDouble || localPlan, snapshot, cortexBusinessDouble ? 'cortex_seller_optimization' : 'local_fallback_business_double');
+  const planBase = cortexBusinessDouble || {
+    ...localPlan,
+    decisionReady: false,
+    impactStatus: 'needs_model',
+    grounding: {
+      observedMonthlyCost,
+      modelBaselineMonthlyCost: 0,
+      connectedWarehouseNodes,
+      modelBaselineWarehouseNodes: 0,
+      costVariancePct: null,
+      issues: ['No current Cortex model is available for comparison.'],
+    },
+  };
+  const plan = attachCortexSource(planBase, snapshot, cortexBusinessDouble ? 'cortex_seller_optimization' : 'local_fallback_business_double');
 
   const decisions = await rows(
     `SELECT bp.id, bp.status, bp.title, bp.approved_at, bp.approved_by, bp.created_at,
@@ -1526,6 +1570,11 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
   }
   if (plan.modelStatus !== 'modeled' || !hasPlanPayload(plan.optimizedMetrics)) {
     const error: any = new Error('Cortex has not produced an executable optimized plan yet. Run Seller Optimization after completing readiness tasks.');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (plan.decisionReady !== true) {
+    const error: any = new Error(`This modeled scenario is not ready for approval. ${(plan.grounding?.issues || []).join(' ')}`.trim());
     error.statusCode = 409;
     throw error;
   }
@@ -1594,6 +1643,11 @@ export async function rejectBusinessDouble(userId: string, planId: string, rejec
   }
   if (plan.modelStatus !== 'modeled' || !hasPlanPayload(plan.optimizedMetrics)) {
     const error: any = new Error('There is no executable optimized plan to deny yet.');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (plan.decisionReady !== true) {
+    const error: any = new Error('This is a reference scenario, not an approval decision. Reconcile its billing and warehouse baseline before accepting or denying it.');
     error.statusCode = 409;
     throw error;
   }
