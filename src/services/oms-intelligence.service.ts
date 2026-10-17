@@ -2599,8 +2599,17 @@ function normalizeChatAction(value: any) {
   };
 }
 
+function chatRequestsPriority(message: string) {
+  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first thing|focus on)\b/i.test(message);
+}
+
+function chatRequestsAccountSnapshot(message: string) {
+  return /\b(summarize|account (?:status|snapshot|overview)|what(?:'s| is) happening in (?:my|the) account)\b/i.test(message);
+}
+
 function chatRequestsActions(message: string) {
-  return /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
+  return chatRequestsPriority(message)
+    || /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
 }
 
 function conversationAwareChatQuery(message: string, history: Array<{ role?: string; content?: string }>) {
@@ -2925,6 +2934,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   ].filter(Boolean);
   const gapLine = gaps.length ? `What is holding it back: ${gaps.join('; ')}.` : 'Nothing major is blocking the core intelligence path right now.';
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
+  const priorityIntent = chatRequestsPriority(message);
   const actionIntent = chatRequestsActions(message) || q.includes('get the account going') || q.includes('start') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
   const marketplaceIntent = /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q);
   const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
@@ -2986,6 +2996,20 @@ function buildLocalCortexChatFallback(message: string, context: any): {
         }
       }
     }
+  } else if (priorityIntent) {
+    const first = sortedTasks[0];
+    lines.push(`Account snapshot: ${dataLine} ${readinessLine}`);
+    if (first) {
+      const title = humanizeInternalLanguage(String(first.title || 'Review the Cortex task inbox')).replace(/[.!]+$/, '');
+      const detail = humanizeInternalLanguage(String(first.detail || '')).replace(/[.!]+$/, '');
+      const action = humanizeInternalLanguage(String(first.actionLabel || 'Open the related screen')).replace(/[.!]+$/, '');
+      lines.push(`First priority: ${title}.`);
+      if (detail && detail.toLowerCase() !== title.toLowerCase()) lines.push(`Why: ${detail}.`);
+      lines.push(`Action: ${action}.`);
+    } else {
+      lines.push('First priority: connect an operating data source or enrich the missing SKU fields so Cortex has enough evidence to rank an operational change.');
+    }
+    lines.push(gapLine);
   } else if (q.includes('what can i do') || q.includes('get the account going') || q.includes('start') || q.includes('next')) {
     lines.push('The fastest path is to improve the data that controls execution quality, then run optimization again.');
     if (nextSteps.length) lines.push(`Do these next:\n${nextSteps.join('\n')}`);
@@ -3025,7 +3049,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
     ],
-    tasks: actionIntent ? responseTasks.slice(0, 3).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel, entityId: task.entityId })) : [],
+    tasks: actionIntent ? responseTasks.slice(0, priorityIntent ? 1 : 3).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel, entityId: task.entityId })) : [],
     confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
     readinessNotes: null,
   };
@@ -3112,10 +3136,13 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     : buildLocalCortexChatFallback(focusQuery, context);
   const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
     && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
-  // Connection health is already authoritative in the tenant-scoped OMS context. Answering it
-  // locally avoids a model round-trip while preserving the same citations and repair task. Open-
-  // ended and analytical questions still flow through Cortex orchestration below.
-  const accountGroundedFastPath = marketplaceHealthQuestion;
+  const priorityIntent = chatRequestsPriority(message);
+  const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
+  const accountPriorityQuestion = priorityIntent && /\b(account|operational|issue|blocker|risk)\b/i.test(message);
+  // Connection health and account snapshots are already authoritative in the tenant-scoped OMS
+  // context. Answer them locally for consistent, fast guidance; open-ended analysis still flows
+  // through Cortex orchestration below.
+  const accountGroundedFastPath = marketplaceHealthQuestion || accountSnapshotQuestion || accountPriorityQuestion;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
@@ -3227,7 +3254,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       if (seenActions.has(key)) return false;
       seenActions.add(key);
       return true;
-    }).slice(0, 3);
+    }).slice(0, priorityIntent ? 1 : 3);
   }
   if (actionIntent && normalized.tasks.length) {
     const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
