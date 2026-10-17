@@ -4534,7 +4534,9 @@ export async function getOmsOrder(userId: string, orderId: string) {
      FROM orders o
      LEFT JOIN customers c ON c.id = o.customer_id
      LEFT JOIN marketplace_connections mc ON mc.id = o.channel_connection_id
-     WHERE o.user_id = $1 AND o.id = $2
+     WHERE o.user_id = $1
+       AND (o.id = $2 OR o.external_order_id = $2 OR o.order_number = $2)
+     ORDER BY CASE WHEN o.id = $2 THEN 0 WHEN o.order_number = $2 THEN 1 ELSE 2 END
      LIMIT 1`,
     [userId, orderId],
   );
