@@ -1,8 +1,11 @@
 import { pgQuery, isPostgresConfigured } from '../db/postgres';
+import { config } from '../config/env';
 import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
+import { getCortexCredentialHeaders } from './cortex-credentials.service';
 import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent, getBillingCategoryTotals, getStorageBillingSignal } from './oms-production.service';
 import { lookupProductByIdentifier, type KeepaLookupResult } from './keepa-lookup.service';
+import fetch from 'node-fetch';
 
 import { createHmac, timingSafeEqual } from "crypto";
 type Row = Record<string, any>;
@@ -1339,6 +1342,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
 }
 
 export async function getLatestOptimization(userId: string) {
+  await reconcileLatestCortexOptimization(userId).catch(() => null);
   const latest = await one(
     `SELECT * FROM oms_seller_optimization_runs
      WHERE user_id = $1
@@ -3291,6 +3295,17 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
   const { tenant_id: userId, run_id: cortexRunId, engagement_id: engagementId, result } = body;
   if (!userId || !cortexRunId) return { ok: false, reason: 'missing tenant or run id' };
 
+  const existingSnapshot = await one(
+    `SELECT id
+       FROM oms_seller_optimization_runs
+      WHERE user_id = $1 AND source_summary->>'cortexRunId' = $2
+      ORDER BY created_at DESC LIMIT 1`,
+    [userId, cortexRunId],
+  );
+  if (existingSnapshot) {
+    return { ok: true, duplicate: true, runId: existingSnapshot.id, cortexRunId };
+  }
+
   // Match a UnieConnect-side run row by cortex_run_id (set on enqueue), else
   // pick the latest pending row for this tenant.
   let run: Row | null = await one(
@@ -3512,4 +3527,51 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
   ).catch(() => null);
 
   return { ok: true, runId: run?.id || null, cortexRunId, recommendationCount: created };
+}
+
+async function reconcileLatestCortexOptimization(userId: string) {
+  const localRun = await one(
+    `SELECT id, cortex_run_id, output
+       FROM oms_intelligence_runs
+      WHERE user_id = $1
+        AND run_type = 'seller_optimization'
+        AND cortex_run_id IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [userId],
+  );
+  const cortexRunId = String(localRun?.cortex_run_id || '').trim();
+  if (!cortexRunId || json(localRun?.output, {})?.from_cortex === true) return null;
+
+  const existing = await one(
+    `SELECT id
+       FROM oms_seller_optimization_runs
+      WHERE user_id = $1 AND source_summary->>'cortexRunId' = $2
+      LIMIT 1`,
+    [userId, cortexRunId],
+  );
+  if (existing) return { ok: true, duplicate: true, runId: existing.id, cortexRunId };
+
+  const headers = await getCortexCredentialHeaders(userId).catch(() => null);
+  if (!headers) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await fetch(
+      `${config.cortex.apiUrl}/v1/assessment/seller-optimization/runs/${encodeURIComponent(cortexRunId)}`,
+      { headers, signal: controller.signal as any },
+    );
+    if (!response.ok) return null;
+    const remote: any = await response.json().catch(() => ({}));
+    if (!['complete', 'completed'].includes(String(remote?.status || '').toLowerCase()) || !remote?.result) return null;
+    return ingestCortexResult({
+      tenant_id: userId,
+      run_id: cortexRunId,
+      engagement_id: String(remote?.engagement_id || remote?.result?.engagement_id || ''),
+      status: 'completed',
+      result: remote.result,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
