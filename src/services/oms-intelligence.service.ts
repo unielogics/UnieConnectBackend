@@ -1732,7 +1732,8 @@ export async function refreshCortexTasks(userId: string) {
     if (!missingShopifyLocations && !degradedEntries.length && !disconnected) continue;
 
     const issueKind = missingShopifyLocations ? 'location-inventory-access' : disconnected ? 'authorization' : 'sync-health';
-    const dedupeKey = `connection:${connection.id}:${issueKind}`;
+    const dedupeKey = `connection:${channel}:${issueKind}`;
+    const connectionState = String(connection.status || 'not connected').replace(/_/g, ' ');
     activeKeys.add(dedupeKey);
     const degradedNames = degradedEntries.map(([entity]) => entity.replace(/_/g, ' '));
     await upsertCortexTask(userId, {
@@ -1744,12 +1745,12 @@ export async function refreshCortexTasks(userId: string) {
       title: missingShopifyLocations
         ? `Reconnect ${displayName} for warehouse-level inventory`
         : disconnected
-          ? `Finish ${displayName} marketplace authorization`
+          ? `Authorize ${channel.charAt(0).toUpperCase()}${channel.slice(1)} marketplace connection`
           : `Repair ${displayName} ${degradedNames.join(' and ')} sync`,
       detail: missingShopifyLocations
         ? 'Shopify products and orders are connected, but location inventory is using variant-level fallback quantities because read_locations is not authorized.'
         : disconnected
-          ? `The ${channel} connection is ${String(connection.status || 'not connected').replace(/_/g, ' ')}.`
+          ? `The ${channel} connection is ${connectionState === 'needs authorization' ? 'waiting for authorization' : connectionState}.`
           : `${degradedNames.join(', ')} data is degraded or reporting an error. Open Connections to review the provider evidence and repair the feed.`,
       priority: 'high',
       actionLabel: missingShopifyLocations ? 'Repair Shopify access' : 'Open Connections',
