@@ -6,7 +6,6 @@ import { config } from '../config/env';
 import { pgQuery } from '../db/postgres';
 import { isValidRole, normalizeRole } from '../lib/roles';
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
-import { seedDemoDataForUser, shouldAutoSeed } from '../services/demo-seed.service';
 import { syncCurrentUserProfileToWms } from '../services/wms-profile-sync.service';
 import { registerWmsCredential } from '../services/oms-wms-credentials.service';
 import {
@@ -375,12 +374,6 @@ export async function authRoutes(fastify: FastifyInstance) {
     } catch (err: any) {
       req.log?.warn({ err, userId, inviteId: invite.id }, 'warehouse auto-connect failed during invite signup');
     }
-    // Optional demo data seed for stage/demo accounts.
-    if (shouldAutoSeed(normalizedEmail)) {
-      void seedDemoDataForUser(userId).catch((err: any) => {
-        req.log?.warn({ err, userId }, 'demo auto-seed failed during signup');
-      });
-    }
     return { token: authToken, user };
   });
 
@@ -443,11 +436,6 @@ export async function authRoutes(fastify: FastifyInstance) {
     void ensureCortexCredentialForUser(userId).catch((err: any) => {
       req.log?.warn({ err, userId }, 'cortex credential auto-provision failed during direct signup');
     });
-    if (shouldAutoSeed(normalizedEmail)) {
-      void seedDemoDataForUser(userId).catch((err: any) => {
-        req.log?.warn({ err, userId }, 'demo auto-seed failed during direct signup');
-      });
-    }
     return { token: authToken, user };
   });
 
