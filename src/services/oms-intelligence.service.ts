@@ -2157,10 +2157,17 @@ async function resolveChatEntities(userId: string, message: string) {
   };
 }
 
-async function buildChatFocusContext(userId: string, message: string, screen: string, context: any) {
+async function buildChatFocusContext(
+  userId: string,
+  message: string,
+  screen: string,
+  context: any,
+  entityType?: string | null,
+  entityId?: string | null,
+) {
   const q = String(message || '').toLowerCase();
   const samples = context?.samples || {};
-  const resolvedEntities = await resolveChatEntities(userId, message);
+  const resolvedEntities = await resolveChatEntities(userId, [message, entityId].filter(Boolean).join(' '));
   if (screen === 'connections' || /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q)) {
     const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
     const connections = (samples.marketplaceConnections || [])
@@ -2183,7 +2190,7 @@ async function buildChatFocusContext(userId: string, message: string, screen: st
       connections,
     };
   }
-  if (screen === 'shipments' || /(shipment|asn|inbound)/.test(q)) {
+  if (entityType === 'asn' || screen === 'shipments' || /(shipment|asn|inbound)/.test(q)) {
     return {
       topic: 'shipments_and_asns',
       instruction: 'Answer from shipment plans and ASNs first.',
@@ -2199,7 +2206,7 @@ async function buildChatFocusContext(userId: string, message: string, screen: st
       billing: samples.billing || {},
     };
   }
-  if (screen === 'orders' || /\border(s)?\b/.test(q)) {
+  if (entityType === 'order' || screen === 'orders' || /\border(s)?\b/.test(q)) {
     return {
       topic: 'orders',
       instruction: resolvedEntities.orders.length
@@ -2210,7 +2217,7 @@ async function buildChatFocusContext(userId: string, message: string, screen: st
       requiredSource: 'oms_orders',
     };
   }
-  if (screen === 'skus' || screen === 'sku-detail' || /\b(sku|product|listing|inventory)\b/.test(q)) {
+  if (entityType === 'sku' || screen === 'skus' || screen === 'sku-detail' || /\b(sku|product|listing|inventory)\b/.test(q)) {
     return {
       topic: 'catalog',
       instruction: resolvedEntities.skus.length
@@ -2391,7 +2398,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const entityType = body.entityType ? String(body.entityType).slice(0, 80) : null;
   const entityId = body.entityId ? String(body.entityId).slice(0, 160) : null;
   let thread = body.threadId
-    ? await one('SELECT * FROM oms_cortex_chat_threads WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, String(body.threadId)]).catch(() => null)
+    ? await one(
+        `SELECT * FROM oms_cortex_chat_threads
+          WHERE user_id = $1 AND id = $2 AND screen = $3
+            AND entity_type IS NOT DISTINCT FROM $4
+            AND entity_id IS NOT DISTINCT FROM $5
+          LIMIT 1`,
+        [userId, String(body.threadId), screen, entityType, entityId],
+      ).catch(() => null)
     : null;
   if (!thread) {
     thread = await one(
@@ -2423,7 +2437,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
 
   const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
-  const focusContext = await buildChatFocusContext(userId, message, screen, context);
+  const focusContext = await buildChatFocusContext(userId, message, screen, context, entityType, entityId);
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
