@@ -3541,6 +3541,71 @@ function mapLabelRun(row: Row | null): LabelAuditRun | null {
   };
 }
 
+async function reconcileLabelAuditOptimizationEvidence(userId: string) {
+  await pgQuery(
+    `UPDATE oms_label_audit_findings
+        SET refund_amount = CASE
+              WHEN finding_type = 'late_delivery_refund'
+               AND COALESCE(evidence->>'service', '') ~* '(guaranteed|next[ -]?day|overnight|2nd[ -]?day|two[ -]?day|priority mail express)'
+               AND COALESCE(evidence->>'cost', '') ~ '^[0-9]+(\\.[0-9]+)?$'
+              THEN (evidence->>'cost')::numeric
+              WHEN finding_type = 'late_delivery_refund' THEN 0
+              ELSE refund_amount
+            END,
+            evidence = CASE
+              WHEN COALESCE(evidence->>'optimizationEvidence', '') <> 'carrier_rate_quote'
+               AND (evidence ? 'optimizedCarrier' OR evidence ? 'optimizedCost')
+              THEN (evidence - 'optimizedCarrier' - 'optimizedCost') || jsonb_build_object(
+                'optimizationStatus',
+                CASE WHEN finding_type IN ('optimized_service_swap', 'dim_weight_or_ltl_review')
+                  THEN 'rate_shop_required' ELSE 'not_applicable' END
+              )
+              ELSE evidence
+            END,
+            updated_at = now()
+      WHERE user_id = $1
+        AND (
+          finding_type = 'late_delivery_refund'
+          OR (
+            COALESCE(evidence->>'optimizationEvidence', '') <> 'carrier_rate_quote'
+            AND (evidence ? 'optimizedCarrier' OR evidence ? 'optimizedCost')
+          )
+        )`,
+    [userId],
+  ).catch(() => null);
+  await pgQuery(
+    `WITH calculated AS (
+       SELECT r.id,
+              COALESCE(SUM(f.refund_amount), 0) AS refunds,
+              COALESCE(SUM(
+                CASE
+                  WHEN f.evidence->>'optimizationEvidence' = 'carrier_rate_quote'
+                   AND COALESCE(f.evidence->>'cost', '') ~ '^[0-9]+(\\.[0-9]+)?$'
+                   AND COALESCE(f.evidence->>'optimizedCost', '') ~ '^[0-9]+(\\.[0-9]+)?$'
+                  THEN GREATEST(0, (f.evidence->>'cost')::numeric - (f.evidence->>'optimizedCost')::numeric)
+                  ELSE 0
+                END
+              ), 0) AS savings
+         FROM oms_label_audit_runs r
+         LEFT JOIN oms_label_audit_findings f
+           ON f.user_id = r.user_id AND f.evidence->>'runId' = r.id::text
+        WHERE r.user_id = $1
+        GROUP BY r.id
+     )
+     UPDATE oms_label_audit_runs r
+        SET estimated_refunds = calculated.refunds,
+            optimized_service_savings = calculated.savings,
+            result_summary = jsonb_set(
+              jsonb_set(COALESCE(result_summary, '{}'::jsonb), '{refunds}', to_jsonb(calculated.refunds), true),
+              '{optimizedServiceSavings}', to_jsonb(calculated.savings), true
+            ),
+            updated_at = now()
+       FROM calculated
+      WHERE r.id = calculated.id`,
+    [userId],
+  ).catch(() => null);
+}
+
 function valueFrom(row: Row, keys: string[]) {
   for (const key of keys) {
     const direct = row[key];
@@ -3699,20 +3764,22 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
   const shippedAt = parseDateValue(row.shipped);
   const daysInTransit = deliveredAt && shippedAt ? Math.max(0, Math.round((deliveredAt.getTime() - shippedAt.getTime()) / 86400000)) : null;
   const late = Boolean(deliveredAt && promisedAt && deliveredAt.getTime() > promisedAt.getTime());
+  const guaranteedService = /guaranteed|next[ -]?day|overnight|2nd[ -]?day|two[ -]?day|priority mail express/i.test(row.service || '');
   const highCost = row.cost >= 18 || (row.zone != null && row.zone >= 6 && row.cost >= 12);
   const heavyParcel = row.weight != null && row.weight >= 12 && /ground|priority|advantage|parcel/i.test(row.service || '');
   const missingEvidence = !row.trackingNumber || !row.carrier || row.carrier === 'Unknown carrier' || !row.delivered || !row.promised || !row.cost;
   type GeneratedLabelFinding = { type: string; severity: string; refund: number; recommendation: string; optimizedCarrier?: string | undefined; optimizedCost?: number | undefined; auditStatus: string };
   const findings: GeneratedLabelFinding[] = [];
   if (late) {
+    const claimAmount = guaranteedService && row.cost > 0 ? row.cost : 0;
     findings.push({
       type: 'late_delivery_refund',
       severity: 'high',
-      refund: money(Math.min(Math.max(row.cost * 0.8, 4), 35)),
-      recommendation: 'Cortex found a late-delivery refund candidate. Attach carrier tracking proof before filing.',
-      optimizedCarrier: row.carrier,
-      optimizedCost: row.cost,
-      auditStatus: 'claim_ready',
+      refund: money(claimAmount),
+      recommendation: claimAmount > 0
+        ? 'Cortex found a late guaranteed-service delivery. Verify the carrier guarantee and attach tracking proof before filing for the uploaded label cost.'
+        : 'Cortex found a late delivery. Verify the service guarantee and carrier adjustment policy before assigning a refund amount.',
+      auditStatus: claimAmount > 0 ? 'claim_candidate' : 'policy_review',
     });
   }
   if (highCost) {
@@ -3720,10 +3787,8 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
       type: 'optimized_service_swap',
       severity: 'medium',
       refund: 0,
-      recommendation: 'Cortex recommends reviewing carrier/service selection for this zone and shipment profile.',
-      optimizedCarrier: /ups/i.test(row.carrier) ? 'USPS Ground Advantage' : 'UPS Ground',
-      optimizedCost: money(row.cost * 0.82),
-      auditStatus: 'optimization',
+      recommendation: 'Cortex flagged this zone and shipment profile for a live carrier rate shop. No savings are claimed until a comparable rate quote is returned.',
+      auditStatus: 'rate_shop_required',
     });
   }
   if (heavyParcel) {
@@ -3731,10 +3796,8 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
       type: 'dim_weight_or_ltl_review',
       severity: 'medium',
       refund: 0,
-      recommendation: 'Cortex flagged this parcel for dim-weight or LTL consolidation review.',
-      optimizedCarrier: 'Cortex LTL / consolidated parcel',
-      optimizedCost: money(row.cost * 0.76),
-      auditStatus: 'review',
+      recommendation: 'Cortex flagged this parcel for dim-weight or LTL consolidation review. A live quote is required before showing an alternative cost.',
+      auditStatus: 'rate_shop_required',
     });
   }
   if (missingEvidence) {
@@ -3743,7 +3806,6 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
       severity: 'low',
       refund: 0,
       recommendation: 'Upload delivered/promised dates and label cost to raise claim confidence.',
-      optimizedCost: row.cost || 0,
       auditStatus: 'needs_evidence',
     });
   }
@@ -3753,8 +3815,6 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
       severity: 'low',
       refund: 0,
       recommendation: 'No refund issue found. Keep this label as a benchmark for carrier/service performance.',
-      optimizedCarrier: row.carrier,
-      optimizedCost: row.cost,
       auditStatus: 'no_claim',
     });
   }
@@ -3765,7 +3825,7 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
     findingType: finding.type,
     severity: finding.severity,
     refundAmount: finding.refund,
-    status: finding.auditStatus === 'claim_ready' ? 'open' : 'reviewed',
+    status: finding.auditStatus === 'claim_candidate' ? 'open' : 'reviewed',
     recommendation: finding.recommendation,
     evidence: {
       runId,
@@ -3784,6 +3844,9 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
       daysInTransit,
       optimizedCarrier: finding.optimizedCarrier,
       optimizedCost: finding.optimizedCost,
+      optimizationStatus: finding.optimizedCost == null
+        ? (['optimized_service_swap', 'dim_weight_or_ltl_review'].includes(finding.type) ? 'rate_shop_required' : 'not_applicable')
+        : 'quoted',
       auditStatus: finding.auditStatus,
       raw: row.raw,
     },
@@ -3792,6 +3855,7 @@ function labelFindingsForRow(row: ReturnType<typeof normalizeLabelCsvRow>, runId
 
 export async function getLabelAudit(userId: string): Promise<{ findings: LabelAuditFinding[]; summary: Record<string, number>; cortex: Record<string, unknown> }> {
   const cortex = await getLabelAuditCortexGate(userId);
+  await reconcileLabelAuditOptimizationEvidence(userId);
   const stored = await rows(
     'SELECT * FROM oms_label_audit_findings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100',
     [userId],
@@ -3825,7 +3889,10 @@ export async function getLabelAudit(userId: string): Promise<{ findings: LabelAu
     summary: {
       openFindings: findings.length,
       estimatedRefunds: money(findings.reduce((sum, f) => sum + f.refundAmount, 0)),
-      optimizedServiceSavings: money(findings.length * 14.25),
+      optimizedServiceSavings: money(findings.reduce((sum, finding) => {
+        if (finding.optimizedCost == null) return sum;
+        return sum + Math.max(0, number(finding.cost) - number(finding.optimizedCost));
+      }, 0)),
     },
     cortex: {
       available: cortex.ok,
@@ -3891,7 +3958,7 @@ export async function createLabelAuditRun(userId: string, body: any) {
       missingEvidenceCount,
       JSON.stringify({ filename, acceptedColumns: Object.keys(rowsInput[0] || {}) }),
       JSON.stringify({
-        cortexTool: 'shipment_label_audit_simulation',
+        cortexTool: 'shipment_label_audit_evidence_review',
         refunds: estimatedRefunds,
         optimizedServiceSavings,
         missingEvidenceCount,
@@ -3956,11 +4023,13 @@ export async function createLabelAuditRun(userId: string, body: any) {
 }
 
 export async function getLabelAuditRuns(userId: string) {
+  await reconcileLabelAuditOptimizationEvidence(userId);
   const data = await rows('SELECT * FROM oms_label_audit_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [userId]);
   return { runs: data.map(mapLabelRun).filter(Boolean) };
 }
 
 export async function getLabelAuditRun(userId: string, runId: string) {
+  await reconcileLabelAuditOptimizationEvidence(userId);
   const run = await one('SELECT * FROM oms_label_audit_runs WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, runId]);
   if (!run) return null;
   const findings = await rows('SELECT * FROM oms_label_audit_findings WHERE user_id = $1 AND evidence->>\'runId\' = $2 ORDER BY created_at DESC', [userId, runId]);
