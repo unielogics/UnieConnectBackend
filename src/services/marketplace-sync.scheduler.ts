@@ -21,7 +21,7 @@ function intervalMs() {
 }
 
 export async function runMarketplaceSyncOnce() {
-  const result = { connections: 0, synced: 0, failed: 0 };
+  const result = { connections: 0, synced: 0, partial: 0, failed: 0 };
   const query = await pgQuery<ShopifyConnection>(
     `SELECT m.id, m.user_id, m.shop_domain, m.access_token_enc,
             COALESCE((
@@ -66,7 +66,7 @@ export async function runMarketplaceSyncOnce() {
           JSON.stringify({ accountId: connection.id, syncResult }),
         ],
       ).catch(() => null);
-      if (issueCount) result.failed++;
+      if (issueCount) result.partial++;
       else result.synced++;
     } catch (error: any) {
       await pgQuery(
