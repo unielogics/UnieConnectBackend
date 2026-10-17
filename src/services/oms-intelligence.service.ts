@@ -1610,6 +1610,90 @@ function taskDedupeSlug(text: string) {
     .slice(0, 120) || 'task';
 }
 
+function readinessTaskDefinition(blocker: string) {
+  const value = String(blocker || '').toLowerCase();
+  if (value.includes('missing dimensions') || value.includes('dimensions or weight')) {
+    return {
+      key: 'sku-dimensions-weight',
+      screen: 'skus',
+      entityType: 'sku',
+      actionLabel: 'Enrich SKUs',
+      detail: 'Add package weight plus length, width, and height in SKU item details. Cortex will detect the completed fields automatically.',
+    };
+  }
+  if (value.includes('missing cost')) {
+    return {
+      key: 'sku-unit-cost',
+      screen: 'skus',
+      entityType: 'sku',
+      actionLabel: 'Add SKU costs',
+      detail: 'Add unit cost in SKU item details so margin and fulfillment comparisons use account evidence instead of assumptions.',
+    };
+  }
+  if (value.includes('wms') || value.includes('warehouse')) {
+    return {
+      key: 'warehouse-wms-truth',
+      screen: 'warehouses',
+      entityType: 'warehouse',
+      actionLabel: 'Connect warehouse',
+      detail: 'Connect at least one working warehouse or WMS feed so inventory and physical execution can be verified.',
+    };
+  }
+  if (value.includes('supplier') && value.includes('pickup')) {
+    return {
+      key: 'supplier-pickup-profiles',
+      screen: 'suppliers',
+      entityType: 'supplier',
+      actionLabel: 'Complete supplier profiles',
+      detail: 'Add pickup hours and origin details to incomplete supplier profiles so shipment routing has a valid starting point.',
+    };
+  }
+  if (value.includes('amazon') && value.includes('item sync')) {
+    return {
+      key: 'amazon-item-sync',
+      screen: 'connections',
+      entityType: 'marketplace_connection',
+      actionLabel: 'Sync Amazon catalog',
+      detail: 'Run Amazon item synchronization to identify listed, FBA, FBM, and incomplete marketplace SKUs.',
+    };
+  }
+  if (value.includes('amazon') && (value.includes('listing') || value.includes('fba'))) {
+    return {
+      key: 'amazon-listing-readiness',
+      screen: 'skus',
+      entityType: 'sku',
+      actionLabel: 'Review Amazon SKUs',
+      detail: 'Open the affected SKUs and complete the listing or FBA requirements shown in their Amazon action drawer.',
+    };
+  }
+  if (value.includes('create or import skus')) {
+    return {
+      key: 'catalog-baseline',
+      screen: 'skus',
+      entityType: 'sku',
+      actionLabel: 'Add SKUs',
+      detail: 'Create a product or import the catalog before running product or seller intelligence.',
+    };
+  }
+  if (value.includes('connect a marketplace') || value.includes('sales/product data')) {
+    return {
+      key: 'commerce-data-source',
+      screen: 'connections',
+      entityType: 'connection',
+      actionLabel: 'Connect marketplace',
+      detail: 'Connect a marketplace feed or import product and sales CSV data so Cortex has demand evidence to analyze.',
+    };
+  }
+  const target = taskTargetFromText(blocker);
+  return {
+    key: taskDedupeSlug(value.replace(/\b\d+(?:\.\d+)?\b/g, 'count')),
+    screen: target.screen,
+    entityType: target.entityType,
+    actionLabel: target.actionLabel,
+    detail: 'Open the related work area and complete the missing account evidence. Cortex will verify the result automatically.',
+  };
+}
+
 async function upsertCortexTask(userId: string, task: any) {
   await ensureCortexWorkspaceTables();
   const row = await one(
@@ -1673,19 +1757,19 @@ export async function refreshCortexTasks(userId: string) {
   const activeKeys = new Set<string>();
 
   for (const blocker of (readiness.blockers || []).filter(Boolean) as string[]) {
-    const target = taskTargetFromText(blocker);
-    const dedupeKey = `readiness:${taskDedupeSlug(blocker)}`;
+    const definition = readinessTaskDefinition(blocker);
+    const dedupeKey = `readiness:${definition.key}`;
     activeKeys.add(dedupeKey);
     await upsertCortexTask(userId, {
       dedupeKey,
       source: 'readiness',
-      screen: target.screen,
-      entityType: target.entityType,
+      screen: definition.screen,
+      entityType: definition.entityType,
       title: blocker,
-      detail: `Resolve this readiness blocker to improve Cortex confidence from ${readiness.score}%.`,
+      detail: definition.detail,
       priority: priorityForTask(blocker, readiness.score),
-      actionLabel: target.actionLabel,
-      actionTarget: target.screen,
+      actionLabel: definition.actionLabel,
+      actionTarget: definition.screen,
       evidence: { readinessScore: readiness.score, posture: readiness.posture, counts: readiness.counts },
     });
   }
