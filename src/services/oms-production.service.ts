@@ -1766,6 +1766,8 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
   const localPlan = {
     horizon,
     modelStatus: 'not_modeled',
+    decisionReady: false,
+    impactStatus: 'needs_model',
     generatedAt: new Date().toISOString(),
     current: {
       skuCount: items.length,
@@ -1797,18 +1799,46 @@ export async function getInventoryPlan(userId: string, horizon = '6m', filter: M
       : 0,
   };
   const snapshotInventoryIsModeled = hasMaterialOptimizedPlan(snapshotCurrentInventory, snapshotProposedInventory, snapshotInventorySavings);
+  const modelBaselineMonthlyCost = money(snapshotCurrentInventory?.estimatedMonthlyCost ?? snapshotCurrentInventory?.monthlyCost);
+  const modelBaselineWarehouseNodes = number(snapshotCurrentInventory?.warehouseCount ?? snapshotCurrentInventory?.warehouseNodes);
+  const costVarianceRatio = observedMonthlyCost > 0 && modelBaselineMonthlyCost > 0
+    ? Math.abs(modelBaselineMonthlyCost - observedMonthlyCost) / Math.max(observedMonthlyCost, modelBaselineMonthlyCost)
+    : 1;
+  const costGrounded = costVarianceRatio <= 0.2;
+  const networkGrounded = facilities.length > 0
+    && modelBaselineWarehouseNodes > 0
+    && facilities.length === modelBaselineWarehouseNodes;
+  const groundingIssues = [
+    ...(!costGrounded ? ['Modeled inventory-plan cost does not reconcile with observed 30-day billing.'] : []),
+    ...(!networkGrounded ? ['Modeled inventory-plan warehouse count does not match connected warehouse truth.'] : []),
+  ];
+  const decisionReady = snapshotInventoryIsModeled && costGrounded && networkGrounded;
   const cortexInventoryPlan = hasPlanPayload(snapshot?.inventoryPlan)
     ? {
         ...localPlan,
         ...snapshot?.inventoryPlan,
         horizon: snapshot?.inventoryPlan?.horizon || horizon,
         generatedAt: snapshot?.updatedAt || snapshot?.createdAt || localPlan.generatedAt,
-        current: snapshotInventoryIsModeled ? (snapshotCurrentInventory || localPlan.current) : localPlan.current,
+        current: {
+          ...localPlan.current,
+          ...(modelBaselineMonthlyCost > 0 ? { modelBaselineMonthlyCost } : {}),
+          ...(modelBaselineWarehouseNodes > 0 ? { modelBaselineWarehouseCount: modelBaselineWarehouseNodes } : {}),
+        },
         proposed: snapshotInventoryIsModeled ? snapshotProposedInventory : localPlan.proposed,
-        months: snapshotInventoryIsModeled && Array.isArray(snapshot?.inventoryPlan?.months) ? snapshot?.inventoryPlan?.months : localPlan.months,
-        skus: Array.isArray(snapshot?.inventoryPlan?.skus) && snapshot?.inventoryPlan?.skus.length ? snapshot?.inventoryPlan?.skus : localPlan.skus,
-        warehouses: Array.isArray(snapshot?.inventoryPlan?.warehouses) ? snapshot?.inventoryPlan?.warehouses : localPlan.warehouses,
+        months: decisionReady && Array.isArray(snapshot?.inventoryPlan?.months) ? snapshot?.inventoryPlan?.months : localPlan.months,
+        skus: decisionReady && Array.isArray(snapshot?.inventoryPlan?.skus) && snapshot?.inventoryPlan?.skus.length ? snapshot?.inventoryPlan?.skus : localPlan.skus,
+        warehouses: decisionReady && Array.isArray(snapshot?.inventoryPlan?.warehouses) ? snapshot?.inventoryPlan?.warehouses : localPlan.warehouses,
         modelStatus: snapshotInventoryIsModeled ? 'modeled' : 'not_modeled',
+        decisionReady,
+        impactStatus: decisionReady ? 'traceable' : snapshotInventoryIsModeled ? 'scenario_only' : 'needs_model',
+        grounding: {
+          observedMonthlyCost,
+          modelBaselineMonthlyCost,
+          connectedWarehouseNodes: facilities.length,
+          modelBaselineWarehouseNodes,
+          costVariancePct: Math.round(costVarianceRatio * 10_000) / 100,
+          issues: groundingIssues,
+        },
       }
     : null;
   return attachCortexSource(cortexInventoryPlan || localPlan, snapshot, cortexInventoryPlan ? 'cortex_seller_optimization' : 'local_fallback_inventory_plan');
