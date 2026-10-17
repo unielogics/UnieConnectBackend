@@ -3492,13 +3492,24 @@ function normalizeLabelCsvRow(raw: Row, index: number) {
   const promised =
     valueFrom(raw, ['promised', 'promisedDate', 'promiseDate', 'estimatedDeliveryDate', 'expectedDeliveryDate', 'commitmentDate', 'guaranteedDeliveryDate']) ||
     valueLike(raw, [/promise/, /estimateddelivery/, /expecteddelivery/, /commitment/, /guarantee/]);
-  const cost = money(valueFrom(raw, ['cost', 'labelCost', 'shippingCost', 'postage', 'charge', 'amount', 'netCharge', 'totalCharge', 'transportationCharge', 'shipmentCost']) || valueLike(raw, [/cost/, /charge/, /postage/, /amount/]));
-  const zone = number(valueFrom(raw, ['zone', 'shippingZone', 'destinationZone', 'carrierZone']) || valueLike(raw, [/zone/]), NaN);
-  const weight = number(valueFrom(raw, ['weight', 'weightLb', 'weightLbs', 'actualWeight', 'billableWeight', 'packageWeight']) || valueLike(raw, [/weight/]), NaN);
+  const costValue = valueFrom(raw, ['cost', 'labelCost', 'shippingCost', 'postage', 'charge', 'amount', 'netCharge', 'totalCharge', 'transportationCharge', 'shipmentCost']) || valueLike(raw, [/cost/, /charge/, /postage/, /amount/]);
+  const zoneValue = valueFrom(raw, ['zone', 'shippingZone', 'destinationZone', 'carrierZone']) || valueLike(raw, [/zone/]);
+  const weightValue = valueFrom(raw, ['weight', 'weightLb', 'weightLbs', 'actualWeight', 'billableWeight', 'packageWeight']) || valueLike(raw, [/weight/]);
+  const cost = money(costValue);
+  const zone = number(zoneValue, NaN);
+  const weight = number(weightValue, NaN);
   const dim = dimensionValue(raw);
   const state = valueFrom(raw, ['state', 'shipToState', 'ship_state', 'recipientState', 'destinationState']) || valueLike(raw, [/shipto.*state/, /recipient.*state/, /destination.*state/]);
   const zip = valueFrom(raw, ['zip', 'shipToZip', 'postalCode', 'postcode', 'recipientZip', 'destinationZip']) || valueLike(raw, [/zip/, /postal/, /postcode/]);
   const errors: string[] = [];
+  const rowLabel = `Row ${index + 1}`;
+  if (!order && !trackingNumber) errors.push(`${rowLabel}: include an order number or tracking number.`);
+  if (shipped && !parseDateValue(shipped)) errors.push(`${rowLabel}: shipped date is not valid.`);
+  if (delivered && !parseDateValue(delivered)) errors.push(`${rowLabel}: delivered date is not valid.`);
+  if (promised && !parseDateValue(promised)) errors.push(`${rowLabel}: promised date is not valid.`);
+  if (costValue && !Number.isFinite(Number(String(costValue).replace(/[$,\s]/g, '')))) errors.push(`${rowLabel}: cost is not a valid number.`);
+  if (zoneValue && !Number.isFinite(zone)) errors.push(`${rowLabel}: zone is not a valid number.`);
+  if (weightValue && !Number.isFinite(weight)) errors.push(`${rowLabel}: weight is not a valid number.`);
   return {
     rowNumber: index + 1,
     order,
