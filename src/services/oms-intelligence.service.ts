@@ -2099,6 +2099,8 @@ function polishCortexChatText(text: string) {
   return scrubVendorLanguage(text)
     .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/Cortex response unavailable; used scoped OMS fallback\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
+    .replace(/\bread_locations\s+scope\b/gi, 'Shopify location inventory permission')
+    .replace(/\bproduct-variant fallback quantities\b/gi, 'store-level inventory totals')
     .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, humanizeCortexTimestamp)
     .replace(/[ \t]+([,.;!?])/g, '$1')
     .replace(/([.!?])(?:\s*\1)+/g, '$1')
@@ -2468,7 +2470,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
         if (issues.length) lines.push(`Attention required: ${issues.join('; ').replace(/[.\s]+$/, '')}.`);
         const scopes = Array.isArray(connection.scopes) ? connection.scopes.map((scope: any) => String(scope)) : [];
         if (channel === 'shopify' && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations')) {
-          lines.push('Next step: reconnect Shopify with location access so inventory can synchronize by warehouse instead of using product-variant fallback quantities.');
+          lines.push('Next step: open Connections, select Repair Shopify access, and approve location inventory access. This enables inventory by warehouse instead of store-level totals.');
         }
       }
     }
