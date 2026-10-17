@@ -1162,7 +1162,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
         network_context_patch: cortexContext.networkContextPatch,
         planning_body: cortexContext.planningBody,
         seller_context: cortexContext.sellerContext,
-      }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }))
+      }, { userId }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }))
     : ({ ok: false, status: 412, data: { error: 'Cortex engagement not yet provisioned for this user' } } as const);
 
   // Persist Cortex's run_id on the local run row so the webhook can match the
