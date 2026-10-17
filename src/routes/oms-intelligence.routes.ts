@@ -176,9 +176,10 @@ export async function omsIntelligenceRoutes(fastify: FastifyInstance) {
   fastify.post('/oms/intelligence/tasks/:id/complete', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const task = await completeCortexTask(userId, String(req.params?.id || ''));
-    if (!task) return reply.code(404).send({ error: 'Cortex task not found' });
-    return { task };
+    const result = await completeCortexTask(userId, String(req.params?.id || ''));
+    if (!result) return reply.code(404).send({ error: 'Cortex task not found' });
+    if (!result.verified) return reply.code(409).send({ error: result.message, ...result });
+    return result;
   });
 
   fastify.post('/oms/intelligence/tasks/:id/dismiss', async (req: any, reply) => {

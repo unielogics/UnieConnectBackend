@@ -1898,13 +1898,39 @@ export async function getCortexTasks(userId: string, query: any = {}) {
 
 export async function completeCortexTask(userId: string, taskId: string) {
   await ensureCortexWorkspaceTables();
+  const existing = await one(
+    'SELECT * FROM oms_cortex_tasks WHERE user_id = $1 AND id = $2 LIMIT 1',
+    [userId, taskId],
+  );
+  if (!existing) return null;
+
+  if (existing.source === 'readiness' || existing.source === 'connection_health') {
+    await refreshCortexTasks(userId);
+    const verified = await one(
+      'SELECT * FROM oms_cortex_tasks WHERE user_id = $1 AND id = $2 LIMIT 1',
+      [userId, taskId],
+    );
+    const complete = verified?.status === 'done';
+    return {
+      task: verified ? mapCortexTask(verified) : mapCortexTask(existing),
+      verified: complete,
+      message: complete
+        ? 'Cortex verified the account evidence and completed this task.'
+        : `Cortex still detects this blocker: ${existing.title}`,
+    };
+  }
+
   const row = await one(
     `UPDATE oms_cortex_tasks
      SET status = 'done', completed_at = COALESCE(completed_at, now()), updated_at = now()
      WHERE user_id = $1 AND id = $2 RETURNING *`,
     [userId, taskId],
   );
-  return row ? mapCortexTask(row) : null;
+  return row ? {
+    task: mapCortexTask(row),
+    verified: true,
+    message: 'Task completed.',
+  } : null;
 }
 
 export async function dismissCortexTask(userId: string, taskId: string) {
