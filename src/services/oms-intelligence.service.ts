@@ -3039,7 +3039,17 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         readinessNotes: 'Cortex is not configured for this account.',
       }
     : buildLocalCortexChatFallback(focusQuery, context);
-  const cortex = await postCortex('/v1/orchestration/oms/chat', {
+  const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
+    && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
+  // Connection health is already authoritative in the tenant-scoped OMS context. Answering it
+  // locally avoids a model round-trip while preserving the same citations and repair task. Open-
+  // ended and analytical questions still flow through Cortex orchestration below.
+  const accountGroundedFastPath = marketplaceHealthQuestion;
+  const cortex = accountGroundedFastPath ? {
+    ok: false,
+    status: 200,
+    data: { reason: 'account_grounded_answer' },
+  } : await postCortex('/v1/orchestration/oms/chat', {
     tenant_id: userId,
     userId,
     screen,
@@ -3070,7 +3080,9 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       unsupported_claim_behavior: 'state what evidence is missing instead of estimating',
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
-  const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
+  const normalized = accountGroundedFastPath
+    ? fallback
+    : normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
   const decisionIntent = chatRequestsDecision(message);
   if (decisionIntent) {
     normalized.answer = fallback.answer;
@@ -3114,8 +3126,6 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         : action;
     });
   }
-  const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
-    && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
   const marketplaceAnswerHasCoverage = /(products?|orders?)/i.test(normalized.answer)
     && /inventory/i.test(normalized.answer)
     && /(next|repair|reconnect|authoriz)/i.test(normalized.answer);
@@ -3128,16 +3138,20 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
   const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
-  const liveRouteAvailable = Boolean(cortex?.ok);
+  const liveRouteAvailable = !accountGroundedFastPath && Boolean(cortex?.ok);
   const cortexHealth = {
     available: accountScopedChatAvailable,
     chatIntegrated: accountScopedChatAvailable,
     status: accountScopedChatAvailable ? 200 : 503,
-    reason: liveRouteAvailable ? 'live_chat_available' : accountScopedChatAvailable ? 'account_chat_available' : 'cortex_not_configured',
+    reason: accountGroundedFastPath
+      ? 'account_grounded_answer'
+      : liveRouteAvailable ? 'live_chat_available' : accountScopedChatAvailable ? 'account_chat_available' : 'cortex_not_configured',
     mode: liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'account_scoped' : 'unavailable',
     liveRouteAvailable,
     liveRouteStatus: cortex?.status || 503,
-    liveRouteReason: cortex?.ok
+    liveRouteReason: accountGroundedFastPath
+      ? 'not_required_for_account_fact'
+      : cortex?.ok
       ? 'live_chat_available'
       : cortex?.status === 404
         ? 'cortex_chat_route_not_available'
@@ -3156,7 +3170,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       JSON.stringify(normalized.tasks),
       normalized.confidence,
       normalized.readinessNotes,
-      liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'fallback' : 'unavailable',
+      liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'account_scoped' : 'unavailable',
       JSON.stringify(cortex || {}),
     ],
   );
@@ -3167,7 +3181,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   await pgQuery(
     `INSERT INTO oms_copilot_events (user_id, screen, prompt, response)
      VALUES ($1, $2, $3, $4::jsonb)`,
-    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'fallback' : 'unavailable', cortexHealth })],
+    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: liveRouteAvailable ? 'live' : accountScopedChatAvailable ? 'account_scoped' : 'unavailable', cortexHealth })],
   ).catch(() => null);
   return {
     thread: mapCortexThread(thread),
