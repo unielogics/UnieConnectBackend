@@ -25,7 +25,7 @@ export async function runMarketplaceSyncOnce() {
   const query = await pgQuery<ShopifyConnection>(
     `SELECT m.id, m.user_id, m.shop_domain, m.access_token_enc,
             COALESCE((
-              SELECT COALESCE(NULLIF(s.metadata->>'historicalBackfill', ''), 'false')::boolean
+              SELECT s.metadata ? 'historicalBackfillCompletedAt'
               FROM channel_sync_status s
               WHERE s.channel_account_id = m.id AND s.entity_type = 'orders'
             ), false) AS historical_backfill_complete

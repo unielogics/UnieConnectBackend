@@ -511,12 +511,20 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
       pageInfo = parseNextPageInfo(res.headers.get('link'));
     } while (pageInfo);
     result.orders = count;
+    const totalImportedRow = await one<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM orders
+       WHERE user_id = $1 AND channel_connection_id = $2 AND channel = 'shopify'`,
+      [ctx.userId, ctx.channelAccountId],
+    );
+    const totalImported = num(totalImportedRow?.count);
     await setSyncStatus(ctx.channelAccountId, 'orders', 'synced', {
-      count,
+      count: totalImported,
       metadata: {
         windowDays,
-        historicalBackfill: Boolean(initialSync),
-        ...(initialSync ? { historicalBackfillCompletedAt: new Date().toISOString() } : {}),
+        rowsProcessed: count,
+        totalImported,
+        ...(initialSync ? { historicalBackfill: true, historicalBackfillCompletedAt: new Date().toISOString() } : {}),
       },
     });
   } catch (err: any) {
