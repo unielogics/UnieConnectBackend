@@ -3295,21 +3295,15 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
   const { tenant_id: userId, run_id: cortexRunId, engagement_id: engagementId, result } = body;
   if (!userId || !cortexRunId) return { ok: false, reason: 'missing tenant or run id' };
 
-  const existingSnapshot = await one(
-    `SELECT id
-       FROM oms_seller_optimization_runs
-      WHERE user_id = $1 AND source_summary->>'cortexRunId' = $2
-      ORDER BY created_at DESC LIMIT 1`,
-    [userId, cortexRunId],
-  );
-  if (existingSnapshot) {
-    return { ok: true, duplicate: true, runId: existingSnapshot.id, cortexRunId };
-  }
-
-  // Match a UnieConnect-side run row by cortex_run_id (set on enqueue), else
-  // pick the latest pending row for this tenant.
+  // Cortex resets and reuses one remote run resource for repeated executions of
+  // the same engagement. Match the newest local execution deterministically;
+  // cortex_run_id alone is therefore not a unique execution identifier.
   let run: Row | null = await one(
-    `SELECT * FROM oms_intelligence_runs WHERE user_id = $1 AND cortex_run_id = $2 LIMIT 1`,
+    `SELECT *
+       FROM oms_intelligence_runs
+      WHERE user_id = $1 AND cortex_run_id = $2
+      ORDER BY created_at DESC
+      LIMIT 1`,
     [userId, cortexRunId],
   );
   if (!run) {
@@ -3320,6 +3314,27 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
        ORDER BY created_at DESC LIMIT 1`,
       [userId],
     );
+  }
+
+  const existingSnapshot = run?.id
+    ? await one(
+        `SELECT id
+           FROM oms_seller_optimization_runs
+          WHERE user_id = $1 AND run_id = $2
+            AND source_summary->>'cortexRunId' = $3
+          ORDER BY created_at DESC LIMIT 1`,
+        [userId, run.id, cortexRunId],
+      )
+    : await one(
+        `SELECT id
+           FROM oms_seller_optimization_runs
+          WHERE user_id = $1 AND run_id IS NULL
+            AND source_summary->>'cortexRunId' = $2
+          ORDER BY created_at DESC LIMIT 1`,
+        [userId, cortexRunId],
+      );
+  if (existingSnapshot) {
+    return { ok: true, duplicate: true, runId: existingSnapshot.id, cortexRunId };
   }
 
   // Cortex bundle shape:
@@ -3423,7 +3438,13 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
           demand,
         },
       }),
-      JSON.stringify({ source: 'cortex_webhook', cortexRunId, engagementId, schema_version: (result as any)?.schema_version }),
+      JSON.stringify({
+        source: 'cortex_webhook',
+        cortexRunId,
+        localRunId: run?.id || null,
+        engagementId,
+        schema_version: (result as any)?.schema_version,
+      }),
       Math.min(0.98, Math.max(0.5, confidence)),
     ],
   );
@@ -3451,7 +3472,7 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
       approvalState: 'waiting_approval',
       wmsTruthState: 'forecast_only',
       confidence,
-      sourceSummary: { from_cortex: true, cortexRunId, verdict: execSummary?.verdict || null },
+      sourceSummary: { from_cortex: true, cortexRunId, localRunId: run?.id || null, verdict: execSummary?.verdict || null },
     });
     created += 1;
   }
@@ -3474,6 +3495,7 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
       sourceSummary: {
         from_cortex: true,
         cortexRunId,
+        localRunId: run?.id || null,
         item_id: item?.id || null,
         priority: item?.priority || null,
         category: item?.category || null,
@@ -3548,14 +3570,15 @@ async function reconcileLatestCortexOptimization(userId: string) {
     [userId],
   );
   const cortexRunId = String(localRun?.cortex_run_id || '').trim();
-  if (!cortexRunId || json(localRun?.output, {})?.from_cortex === true) return null;
+  if (!localRun || !cortexRunId || json(localRun.output, {})?.from_cortex === true) return null;
 
   const existing = await one(
     `SELECT id
        FROM oms_seller_optimization_runs
-      WHERE user_id = $1 AND source_summary->>'cortexRunId' = $2
+      WHERE user_id = $1 AND run_id = $2
+        AND source_summary->>'cortexRunId' = $3
       LIMIT 1`,
-    [userId, cortexRunId],
+    [userId, localRun.id, cortexRunId],
   );
   if (existing) return { ok: true, duplicate: true, runId: existing.id, cortexRunId };
 
