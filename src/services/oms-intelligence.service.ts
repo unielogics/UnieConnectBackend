@@ -840,8 +840,6 @@ async function createSellerContextRecommendations(params: {
   const scopedRunId = runId || null;
   const confidence = stored?.confidence == null ? readiness.score / 100 : Number(stored.confidence);
   const wmsTruthState = readiness.counts.wmsLinks > 0 ? 'wms_confirmed' : 'forecast_only';
-  const currentMonthlyCost = number(summary.currentMonthlyCost);
-  const optimizedMonthlyCost = number(summary.optimizedMonthlyCost);
   const monthlySavings = number(summary.monthlySavings);
   const sourceSummary = readiness;
 
@@ -952,7 +950,6 @@ async function createSellerContextRecommendations(params: {
   if (billingRecs.length) recommendations.push(...billingRecs);
 
   if (readiness.counts.orders > 0 || readiness.counts.csvOrders > 0 || readiness.counts.marketplaceOrders > 0) {
-    const claimableBaseline = Math.max(0, Math.round(currentMonthlyCost * 0.012 * 100) / 100);
     recommendations.push(await createRecommendation(userId, {
       runId: scopedRunId,
       recommendationType: 'carrier_audit',
@@ -963,8 +960,12 @@ async function createSellerContextRecommendations(params: {
         ? 'Marketplace order history can be paired with label/courier evidence to expose refund and dispute opportunities.'
         : 'CSV order data can seed audit review, but carrier evidence improves claim confidence.',
       currentValue: { orders: readiness.counts.orders, marketplaceOrders: readiness.counts.marketplaceOrders, csvOrders: readiness.counts.csvOrders },
-      optimizedValue: { preventableLeakage: claimableBaseline, evidenceMode: readiness.counts.marketplaceOrders > 0 ? 'marketplace_plus_carrier' : 'csv_evidence_needed' },
-      estimatedImpact: { monthlySavings: claimableBaseline, annualizedSavings: claimableBaseline * 12 },
+      optimizedValue: {
+        preventableLeakage: null,
+        evidenceMode: readiness.counts.marketplaceOrders > 0 ? 'marketplace_plus_carrier' : 'csv_evidence_needed',
+        impactStatus: 'pending_carrier_evidence',
+      },
+      estimatedImpact: {},
       requiredAction: 'review_carrier_audit_evidence',
       approvalState: 'not_required',
       wmsTruthState,
@@ -1251,8 +1252,11 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
   }
 
   const currentMonthlyCost = number(business.plan?.currentMetrics?.monthlyCost) || number(inventory.current?.estimatedMonthlyCost);
-  const optimizedMonthlyCost = number(business.plan?.optimizedMetrics?.monthlyCost) || number(inventory.proposed?.estimatedMonthlyCost);
-  const monthlySavings = Math.max(0, currentMonthlyCost - optimizedMonthlyCost);
+  const optimizationDecisionReady = business.plan?.decisionReady === true;
+  const optimizedMonthlyCost = optimizationDecisionReady
+    ? number(business.plan?.optimizedMetrics?.monthlyCost) || number(inventory.proposed?.estimatedMonthlyCost)
+    : 0;
+  const monthlySavings = optimizationDecisionReady ? Math.max(0, currentMonthlyCost - optimizedMonthlyCost) : 0;
   const summary = {
     title: 'Marketplace-first Seller Optimization',
     sourceMode: readiness.sourceMode,
@@ -1269,6 +1273,9 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
     sharedPalletCandidates: inventory.proposed?.sharedPalletCandidates || 0,
     blockers: readiness.blockers,
     networkPolicy,
+    decisionReady: optimizationDecisionReady,
+    impactStatus: optimizationDecisionReady ? 'traceable' : business.plan?.impactStatus || 'needs_model',
+    grounding: business.plan?.grounding || null,
     cortexContextEvidence: cortexContext.evidence,
   };
 
@@ -1290,7 +1297,7 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
   );
 
   const recommendations = [];
-  if (monthlySavings > 0) {
+  if (optimizationDecisionReady && monthlySavings > 0) {
     recommendations.push(await createRecommendation(userId, {
       runId: run?.id || null,
       recommendationType: 'business_double',
@@ -3609,10 +3616,15 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
     ],
   );
 
+  const validatedBusiness = haveBusinessDouble
+    ? await getBusinessDouble(userId).catch(() => null)
+    : null;
+  const businessDecisionReady = validatedBusiness?.plan?.decisionReady === true;
+
   await supersedeOpenRecommendations(userId, SELLER_OPTIMIZATION_RECOMMENDATION_TYPES);
   let created = 0;
 
-  if (haveBusinessDouble) {
+  if (haveBusinessDouble && businessDecisionReady) {
     await createRecommendation(userId, {
       runId: run?.id || null,
       recommendationType: 'business_double',
