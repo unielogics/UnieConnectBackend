@@ -1406,6 +1406,98 @@ export async function getOmsSkus(userId: string, filter: MarketplaceFilter = {})
   return { skus, total: skus.length };
 }
 
+export async function searchOmsEntities(userId: string, rawQuery: string, requestedLimit = 12) {
+  const query = String(rawQuery || '').trim().slice(0, 80);
+  const limit = Math.min(25, Math.max(5, number(requestedLimit, 12)));
+  if (query.length < 2) return { query, results: [], total: 0 };
+
+  const pattern = `%${query}%`;
+  const perType = Math.max(3, Math.ceil(limit / 2));
+  const [skuRows, orderRows, asnRows, invoiceRows, ticketRows] = await Promise.all([
+    rows(
+      `SELECT id, sku, title, asin, image, updated_at
+         FROM catalog_items
+        WHERE user_id = $1
+          AND COALESCE(archived, false) = false
+          AND (sku ILIKE $2 OR title ILIKE $2 OR COALESCE(asin, '') ILIKE $2 OR COALESCE(upc, '') ILIKE $2 OR COALESCE(ean, '') ILIKE $2)
+        ORDER BY CASE WHEN lower(sku) = lower($3) OR lower(COALESCE(asin, '')) = lower($3) THEN 0 ELSE 1 END,
+                 updated_at DESC
+        LIMIT $4`,
+      [userId, pattern, query, perType],
+    ),
+    rows(
+      `SELECT id, order_number, external_order_id, channel, status, tracking_number, placed_at, updated_at
+         FROM orders
+        WHERE user_id = $1
+          AND (id ILIKE $2 OR COALESCE(order_number, '') ILIKE $2 OR COALESCE(external_order_id, '') ILIKE $2 OR COALESCE(tracking_number, '') ILIKE $2)
+        ORDER BY CASE WHEN lower(COALESCE(order_number, external_order_id, id)) = lower($3) THEN 0 ELSE 1 END,
+                 COALESCE(placed_at, updated_at) DESC
+        LIMIT $4`,
+      [userId, pattern, query, perType],
+    ),
+    rows(
+      `SELECT id, asn_number, status, created_at, updated_at
+         FROM asns
+        WHERE user_id = $1
+          AND (id ILIKE $2 OR COALESCE(asn_number, '') ILIKE $2)
+        ORDER BY CASE WHEN lower(COALESCE(asn_number, id)) = lower($3) THEN 0 ELSE 1 END,
+                 updated_at DESC
+        LIMIT $4`,
+      [userId, pattern, query, perType],
+    ),
+    rows(
+      `SELECT invoice_id, MAX(description) AS description, MAX(status) AS status,
+              SUM(amount)::numeric AS amount, MAX(updated_at) AS updated_at
+         FROM invoice_lines
+        WHERE user_id = $1
+          AND invoice_id IS NOT NULL
+          AND (invoice_id ILIKE $2 OR description ILIKE $2)
+        GROUP BY invoice_id
+        ORDER BY CASE WHEN lower(invoice_id) = lower($3) THEN 0 ELSE 1 END,
+                 MAX(updated_at) DESC
+        LIMIT $4`,
+      [userId, pattern, query, perType],
+    ),
+    rows(
+      `SELECT id, subject, status, priority, entity_type, entity_id, updated_at
+         FROM support_tickets
+        WHERE user_id = $1
+          AND (id ILIKE $2 OR subject ILIKE $2 OR COALESCE(body, '') ILIKE $2)
+        ORDER BY CASE WHEN lower(id) = lower($3) THEN 0 ELSE 1 END,
+                 updated_at DESC
+        LIMIT $4`,
+      [userId, pattern, query, perType],
+    ),
+  ]);
+
+  const results = [
+    ...skuRows.map((row) => ({
+      type: 'sku', id: row.id, entityId: row.id, screen: 'sku-detail',
+      label: row.sku, description: row.title || row.asin || 'Catalog SKU', status: null, image: row.image || null,
+    })),
+    ...orderRows.map((row) => ({
+      type: 'order', id: row.id, entityId: row.id, screen: 'orders',
+      label: row.order_number || row.external_order_id || publicEntityId('OR', row.id),
+      description: [row.channel, row.tracking_number ? `Tracking ${row.tracking_number}` : null].filter(Boolean).join(' · ') || 'Marketplace order',
+      status: row.status || null,
+    })),
+    ...asnRows.map((row) => ({
+      type: 'asn', id: row.id, entityId: row.id, screen: 'shipments',
+      label: row.asn_number || publicEntityId('AS', row.id), description: 'Advance shipping notice', status: row.status || null,
+    })),
+    ...invoiceRows.map((row) => ({
+      type: 'invoice', id: row.invoice_id, entityId: row.invoice_id, screen: 'billing',
+      label: row.invoice_id, description: row.description || `$${money(row.amount).toFixed(2)} invoice activity`, status: row.status || null,
+    })),
+    ...ticketRows.map((row) => ({
+      type: 'ticket', id: row.id, entityId: row.id, screen: 'support',
+      label: publicEntityId('TI', row.id), description: row.subject || 'Support ticket', status: row.status || null,
+    })),
+  ].slice(0, limit);
+
+  return { query, results, total: results.length };
+}
+
 export async function archiveOmsSkus(userId: string, skuIds: string[]) {
   const ids = [...new Set(skuIds.map((id) => String(id || '').trim()).filter(Boolean))];
   if (!ids.length) return { archivedCount: 0, archivedIds: [] as string[] };

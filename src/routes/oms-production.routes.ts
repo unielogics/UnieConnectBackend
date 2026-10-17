@@ -33,6 +33,7 @@ import {
   getWarehouseOverview,
   generateShipmentPalletLabelsPdf,
   retryShipmentVendorEmail,
+  searchOmsEntities,
   updateOmsSkuEnrichment,
 } from '../services/oms-production.service';
 import { ensureBillingPlanRecommendations } from '../services/oms-intelligence.service';
@@ -78,6 +79,12 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
     const userId = requireUser(req, reply);
     if (!userId) return;
     return getInventoryPlan(userId, String(req.query?.horizon || '6m'), marketplaceFilter(req.query));
+  });
+
+  fastify.get('/oms/search', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    return searchOmsEntities(userId, String(req.query?.q || ''), Number(req.query?.limit || 12));
   });
 
   fastify.get('/oms/skus', async (req: any, reply) => {
