@@ -2080,7 +2080,30 @@ function scrubVendorLanguage(text: string) {
     .replace(/\bNVIDIA\s*NIM\b/gi, 'Cortex')
     .replace(/\bNIM\b/g, 'Cortex')
     .replace(/\bNVIDIA\b/gi, 'Cortex')
+    .replace(/\blive Cortex\b/gi, 'Cortex')
+    .replace(/\bCortex\/Cortex\b/gi, 'Cortex')
     .replace(/\bdrivers?\b/gi, 'runtime');
+}
+
+function humanizeCortexTimestamp(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return `${new Intl.DateTimeFormat('en-US', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: 'UTC',
+  }).format(parsed)} UTC`;
+}
+
+function polishCortexChatText(text: string) {
+  return scrubVendorLanguage(text)
+    .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
+    .replace(/Cortex response unavailable; used scoped OMS fallback\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
+    .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, humanizeCortexTimestamp)
+    .replace(/[ \t]+([,.;!?])/g, '$1')
+    .replace(/([.!?])(?:\s*\1)+/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
@@ -2481,7 +2504,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   }
 
   return {
-    answer: scrubVendorLanguage(lines.join('\n\n')),
+    answer: polishCortexChatText(lines.join('\n\n')),
     sources: [
       { source: 'oms_data_readiness', readinessScore: readiness.score, posture: readiness.posture },
       { source: 'oms_cortex_tasks', count: tasks.length },
@@ -2507,11 +2530,11 @@ function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof bu
   const confidence = closedLoopNumber(data.confidence, data.response?.confidence, data.result?.confidence);
   const readinessNotes = data.readiness_notes || data.readinessNotes || data.blocked_reason || data.missing_data || null;
   return {
-    answer: scrubVendorLanguage(String(answer || fallback.answer)),
+    answer: polishCortexChatText(String(answer || fallback.answer)),
     sources: sources.length ? sources : fallback.sources.map(normalizeChatSource).filter(Boolean),
     tasks: allowActions && tasks.length ? tasks : allowActions ? fallback.tasks.map(normalizeChatAction).filter(Boolean) : [],
     confidence: confidence ?? fallback.confidence,
-    readinessNotes: readinessNotes ? scrubVendorLanguage(String(readinessNotes)) : readinessNotes,
+    readinessNotes: readinessNotes ? polishCortexChatText(String(readinessNotes)) : readinessNotes,
   };
 }
 
@@ -2589,6 +2612,18 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       suggested_actions: 'array of proposed user actions or tasks',
       confidence: 'number 0-1',
       readiness_notes: 'blocked or missing data notes',
+    },
+    answer_policy: {
+      lead_with_direct_answer: true,
+      use_plain_business_language: true,
+      humanize_dates_and_percentages: true,
+      distinguish_observed_fact_from_suggestion: true,
+      use_readiness_tasks_only_when_relevant: true,
+      maximum_next_actions: 3,
+      never_name_model_vendor_or_runtime: true,
+      never_expose_internal_field_names: true,
+      current_vs_suggested_requires_measurable_impact: true,
+      unsupported_claim_behavior: 'state what evidence is missing instead of estimating',
     },
   }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const normalized = normalizeCortexChatResponse(cortex, fallback, chatRequestsActions(message));
