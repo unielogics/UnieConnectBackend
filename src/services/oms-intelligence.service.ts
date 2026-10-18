@@ -4336,8 +4336,10 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   normalized.sources = normalized.sources.slice(0, 5);
   normalized.answer = polishCortexChatText(normalized.answer);
   if (normalized.readinessNotes) normalized.readinessNotes = polishCortexChatText(normalized.readinessNotes);
-  const accountScopedChatAvailable = context.readiness?.cortex?.configured !== false;
   const liveRouteAvailable = !accountGroundedFastPath && Boolean(cortex?.ok);
+  // A tenant credential can remain valid even when the global bootstrap key is
+  // absent. A successful tenant route is authoritative for chat availability.
+  const accountScopedChatAvailable = liveRouteAvailable || context.readiness?.cortex?.configured !== false;
   const cortexHealth = {
     available: accountScopedChatAvailable,
     chatIntegrated: accountScopedChatAvailable,
@@ -4391,31 +4393,10 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
 }
 
 export async function getCortexChatHealth(userId: string, screen = 'command') {
-  const context = await getAccountOmsContextBundle(userId, String(screen || 'command').slice(0, 80)).catch(() => null);
-  if (!context) {
-    return {
-      ok: false,
-      status: 503,
-      health: {
-        available: false,
-        chatIntegrated: false,
-        status: 503,
-        reason: 'account_context_unavailable',
-      },
-    };
-  }
-  if (context?.readiness?.cortex?.configured === false) {
-    return {
-      ok: false,
-      status: 503,
-      health: {
-        available: false,
-        chatIntegrated: false,
-        status: 503,
-        reason: 'cortex_not_configured',
-      },
-    };
-  }
+  // Health polling runs continuously in the top bar and drawer. It must not
+  // build the full OMS context bundle (orders, SKUs, tasks, warehouses) every
+  // minute; the real chat request performs that grounding when the user asks.
+  const configured = cortexConfigStatus().configured;
   const live = await postCortex('/v1/orchestration/oms/chat/health', {
     tenant_id: userId,
     userId,
@@ -4424,6 +4405,23 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
     idempotencyKey: `oms-cortex-chat-health-${userId}-${Math.floor(Date.now() / 60_000)}`,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex health check failed' } }));
   const liveRouteAvailable = Boolean(live?.ok && live?.data?.available !== false);
+  const accountScopedChatAvailable = configured || liveRouteAvailable;
+  if (!accountScopedChatAvailable) {
+    return {
+      ok: false,
+      status: 503,
+      health: {
+        available: false,
+        chatIntegrated: false,
+        status: 503,
+        reason: 'cortex_not_configured',
+        mode: 'unavailable',
+        liveRouteAvailable: false,
+        liveRouteStatus: Number(live?.status || 503),
+        liveRouteReason: live?.data?.error || live?.data?.detail || 'cortex_chat_unavailable',
+      },
+    };
+  }
   const health = {
     available: true,
     chatIntegrated: true,
