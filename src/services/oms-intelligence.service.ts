@@ -632,6 +632,33 @@ async function createRecommendation(userId: string, params: {
   confidence?: number | null;
   sourceSummary?: any;
 }) {
+  // Repeated optimization and callback runs can describe the same unresolved
+  // work. Keep its history, but expose only the newest evidence as active so
+  // duplicate prerequisite rows cannot crowd decisions or chat context.
+  await pgQuery(
+    `UPDATE oms_recommendations
+        SET status = 'superseded',
+            approval_state = CASE
+              WHEN approval_state IN ('approved', 'rejected') THEN approval_state
+              ELSE 'superseded'
+            END,
+            updated_at = now()
+      WHERE user_id = $1
+        AND status = 'open'
+        AND recommendation_type = $2
+        AND COALESCE(entity_type, '') = COALESCE($3, '')
+        AND COALESCE(entity_id, '') = COALESCE($4, '')
+        AND title = $5
+        AND COALESCE(required_action, '') = COALESCE($6, '')`,
+    [
+      userId,
+      params.recommendationType,
+      params.entityType || null,
+      params.entityId || null,
+      params.title,
+      params.requiredAction || null,
+    ],
+  ).catch(() => null);
   const rec = await one(
     `INSERT INTO oms_recommendations
       (user_id, run_id, recommendation_type, entity_type, entity_id, title, summary, current_value, optimized_value,
@@ -1439,6 +1466,34 @@ export async function getLatestOptimization(userId: string) {
 }
 
 async function reconcileRecommendationIntegrity(userId: string) {
+  await pgQuery(
+    `WITH ranked AS (
+       SELECT id,
+              row_number() OVER (
+                PARTITION BY recommendation_type,
+                             COALESCE(entity_type, ''),
+                             COALESCE(entity_id, ''),
+                             title,
+                             COALESCE(required_action, '')
+                ORDER BY created_at DESC, id DESC
+              ) AS row_rank
+         FROM oms_recommendations
+        WHERE user_id = $1
+          AND status = 'open'
+     )
+     UPDATE oms_recommendations r
+        SET status = 'superseded',
+            approval_state = CASE
+              WHEN r.approval_state IN ('approved', 'rejected') THEN r.approval_state
+              ELSE 'superseded'
+            END,
+            updated_at = now()
+       FROM ranked
+      WHERE r.id = ranked.id
+        AND ranked.row_rank > 1`,
+    [userId],
+  ).catch(() => null);
+
   await pgQuery(
     `UPDATE oms_recommendations
         SET status = 'superseded',
