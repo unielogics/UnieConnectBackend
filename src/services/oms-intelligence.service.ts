@@ -2815,6 +2815,15 @@ function chatRequestsActions(message: string) {
     || /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
 }
 
+function chatRequestsMarketplaceApps(message: string, screen?: string) {
+  if (screen === 'marketplace') return true;
+  const q = String(message || '').toLowerCase();
+  if (/\b(marketplace apps?|which apps?|installed apps?|available apps?)\b/.test(q)) return true;
+  const appSubject = /\b(app|apps|feature|features|suite|marketplace|entitlement|subscription)\b/.test(q);
+  const appLifecycle = /\b(install|uninstall|activat(?:e|ed|ion)|gated|unlock|unlocks|unlocked|entitlement|subscription)\b/.test(q);
+  return appSubject && appLifecycle;
+}
+
 function conversationAwareChatQuery(message: string, history: Array<{ role?: string; content?: string }>) {
   const current = String(message || '').trim();
   if (!current) return current;
@@ -3173,8 +3182,7 @@ async function buildChatFocusContext(
     };
   }
   const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
-  const marketplaceAppIntent = screen === 'marketplace'
-    || /\b(marketplace apps?|which apps?|installed apps?|available apps?|install|uninstall|activat(?:e|ed|ion)|gated|unlock|entitlement|subscription)\b/.test(q);
+  const marketplaceAppIntent = chatRequestsMarketplaceApps(message, screen);
   const providerHealthIntent = Boolean(requestedMarketplaceChannel)
     && /\b(work(?:ing)?|down|health|status|sync|connect|permission|inventory|orders?|products?|webhook|repair|reconnect)\b/.test(q);
   const marketplaceConnectionIntent = screen === 'connections'
@@ -3503,6 +3511,58 @@ function skuOpportunityAnswerPassesQuality(answer: string, grounded: ReturnType<
   return explainsReason && namesOutcome && statesEvidenceLimit;
 }
 
+function buildGroundedSkuOpportunityFollowup(message: string, context: any, focusContext?: any) {
+  const ranked = rankedSkuOpportunityCandidates(context, focusContext);
+  const selected = ranked[0];
+  if (!selected) return buildGroundedSkuOpportunityResponse(message, context, focusContext);
+  const sku = selected.sku;
+  const skuCode = String(sku.sku);
+  const missing = selected.missing;
+  const unitsSold = number(sku.unitsSold);
+  const lines: string[] = [];
+  if (/^\s*why\b/i.test(message)) {
+    lines.push(`${skuCode} ranks first because it has the largest combination of traceable operating gaps${unitsSold > 0 ? ` and ${unitsSold} sold unit${unitsSold === 1 ? '' : 's'} of real demand evidence` : ''}.`);
+    if (missing.includes('unit cost') || missing.includes('selling price')) {
+      lines.push('Cost and selling price are incomplete, so margin dollars and margin percentage cannot be calculated yet.');
+    }
+    if (missing.includes('dimensions') || missing.includes('weight')) {
+      lines.push('Dimensions and weight are incomplete, so dimensional weight, warehouse fit, pallet fill, and freight cost cannot be compared yet.');
+    }
+    lines.push('That makes this a high-value enrichment target, not a claim that savings have already been proven.');
+  } else {
+    const firstFields = ['unit cost', 'selling price'].filter((field) => missing.includes(field));
+    const fulfillmentFields = ['dimensions', 'weight'].filter((field) => missing.includes(field));
+    const listingFields = missing.filter((field: string) => !firstFields.includes(field) && !fulfillmentFields.includes(field));
+    if (firstFields.length) {
+      lines.push(`Start with ${firstFields.join(' and ')} for ${skuCode}. Those fields unlock gross margin dollars and margin percentage, which are the clearest financial baseline.`);
+    } else if (fulfillmentFields.length) {
+      lines.push(`Start with ${fulfillmentFields.join(' and ')} for ${skuCode}. Those fields unlock dimensional-weight, warehouse-fit, pallet-fill, and freight-cost comparisons.`);
+    } else if (listingFields.length) {
+      lines.push(`Start with ${listingFields.slice(0, 2).join(' and ')} for ${skuCode}. Those are the first remaining product-baseline gaps.`);
+    } else {
+      lines.push(`${skuCode} already has the core enrichment baseline. The next step is to rerun SKU optimization and compare a concrete operating scenario.`);
+    }
+    const remaining = [...fulfillmentFields, ...listingFields].filter((field: string) => !firstFields.includes(field));
+    if (firstFields.length && remaining.length) lines.push(`After that, complete ${remaining.slice(0, 4).join(', ')}.`);
+    lines.push('Cortex will not show a savings estimate until the required cost or fulfillment inputs support the calculation.');
+  }
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{ source: 'oms_skus', count: ranked.length, selectedSku: skuCode }],
+    tasks: [{
+      title: `Improve ${skuCode}`,
+      priority: 'normal',
+      screen: 'sku-detail',
+      actionTarget: 'sku-detail',
+      actionLabel: 'Open SKU details',
+      entityId: sku.id || skuCode,
+    }],
+    confidence: 0.96,
+    readinessNotes: null,
+    selectedSku: sku,
+  };
+}
+
 function buildLocalCortexChatFallback(message: string, context: any, focusContext?: any): {
   answer: string;
   sources: any[];
@@ -3547,8 +3607,7 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
   const priorityIntent = chatRequestsPriority(message);
   const actionIntent = chatRequestsActions(message) || q.includes('get the account going') || q.includes('start') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
   const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
-  const marketplaceAppIntent = context?.screen === 'marketplace'
-    || /\b(marketplace apps?|which apps?|installed apps?|available apps?|install|uninstall|activat(?:e|ed|ion)|gated|unlock|entitlement|subscription)\b/.test(q);
+  const marketplaceAppIntent = chatRequestsMarketplaceApps(message, context?.screen);
   const providerHealthIntent = Boolean(requestedMarketplaceChannel)
     && /\b(work(?:ing)?|down|health|status|sync|connect|permission|inventory|orders?|products?|webhook|repair|reconnect)\b/.test(q);
   const marketplaceConnectionIntent = (context?.screen === 'connections'
@@ -3898,8 +3957,11 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     ? fallback
     : normalizeCortexChatResponse(cortex, fallback, actionIntent);
   if (chatRequestsSkuOpportunityRanking(focusQuery)) {
-    const groundedSkuOpportunity = buildGroundedSkuOpportunityResponse(focusQuery, context, focusContext);
-    if (!skuOpportunityAnswerPassesQuality(normalized.answer, groundedSkuOpportunity)) {
+    const directSkuRankingQuestion = chatRequestsSkuOpportunityRanking(message);
+    const groundedSkuOpportunity = directSkuRankingQuestion
+      ? buildGroundedSkuOpportunityResponse(focusQuery, context, focusContext)
+      : buildGroundedSkuOpportunityFollowup(message, context, focusContext);
+    if (!directSkuRankingQuestion || !skuOpportunityAnswerPassesQuality(normalized.answer, groundedSkuOpportunity)) {
       normalized.answer = groundedSkuOpportunity.answer;
       normalized.sources = groundedSkuOpportunity.sources.map(normalizeChatSource).filter(Boolean);
       normalized.tasks = actionIntent
