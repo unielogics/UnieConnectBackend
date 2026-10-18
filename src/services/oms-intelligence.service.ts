@@ -3690,6 +3690,73 @@ function chatRequestsFinancialLeakage(message: string) {
     && /\b(losing money|money (?:is )?going|cost drivers?|largest costs?|biggest costs?|spend concentration|operating spend|expense concentration)\b/.test(q);
 }
 
+function chatRequestsShipmentReadiness(message: string) {
+  const q = String(message || '').toLowerCase();
+  return /\b(shipment|asn|inbound)\b/.test(q)
+    && /\b(can i|can we|ready|create|start|block|blocking|prevent|before)\b/.test(q);
+}
+
+function buildGroundedShipmentReadiness(context: any) {
+  const samples = context?.samples || {};
+  const skus = Array.isArray(samples.skus) ? samples.skus : [];
+  const suppliers = Array.isArray(samples.suppliers)
+    ? samples.suppliers.filter((supplier: any) => String(supplier?.status || 'active').toLowerCase() !== 'archived')
+    : [];
+  const warehouses = Array.isArray(samples.warehouses) ? samples.warehouses : [];
+  const supplierLinkedSkus = skus.filter((sku: any) => Boolean(sku?.supplier?.id));
+  const readiness = context?.readiness || {};
+  const counts = readiness.counts || {};
+  const missingDimensions = chatCount(counts.missingDimensions);
+  const missingCost = chatCount(counts.missingCost);
+  const canStart = suppliers.length > 0 && supplierLinkedSkus.length > 0;
+  const lines = canStart ? [
+    `Yes. You can start a shipment plan now: this account has ${chatPlural(suppliers.length, 'supplier')} and ${chatPlural(supplierLinkedSkus.length, 'supplier-linked SKU')}.`,
+    'Select one or more SKUs from the same supplier. Step 1 confirms that supplier and requires explicit approval before reassigning any mixed or unassigned SKU.',
+  ] : [
+    `Not yet. Shipment planning requires at least one supplier and one SKU linked to that supplier; this account currently has ${chatPlural(suppliers.length, 'supplier')} and ${chatPlural(supplierLinkedSkus.length, 'supplier-linked SKU')}.`,
+  ];
+  if (warehouses.length > 0) {
+    lines.push(`${chatPlural(warehouses.length, 'connected warehouse')} ${warehouses.length === 1 ? 'is' : 'are'} available. Cortex routing is constrained to those connected destinations.`);
+  } else {
+    lines.push('No warehouse is connected. Cortex may model a national-network destination, but physical execution remains projected until WMS truth is connected.');
+  }
+  const confidenceGaps: string[] = [];
+  if (missingDimensions > 0) confidenceGaps.push(`${missingDimensions} SKUs missing dimensions or weight reduce pallet and freight confidence`);
+  if (missingCost > 0) confidenceGaps.push(`${missingCost} SKUs missing unit cost prevent reliable margin analysis`);
+  if (confidenceGaps.length) {
+    lines.push(`Data quality: ${confidenceGaps.join('; ')}. These gaps affect optimization confidence; they do not by themselves block creation of a shipment plan.`);
+  }
+  lines.push('Existing cancelled, completed, or projected shipment records do not block a new shipment plan.');
+  const task = !suppliers.length ? {
+    title: 'Create a supplier for shipment planning',
+    priority: 'high',
+    screen: 'suppliers',
+    actionTarget: 'suppliers',
+    actionLabel: 'Open suppliers',
+  } : {
+    title: canStart ? 'Select supplier-linked SKUs' : 'Assign a supplier to a SKU',
+    priority: canStart ? 'normal' : 'high',
+    screen: 'skus',
+    actionTarget: 'skus',
+    actionLabel: canStart ? 'Select SKUs' : 'Open SKU catalog',
+  };
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [
+      { source: 'oms_suppliers', count: suppliers.length },
+      { source: 'oms_skus', count: skus.length, supplierLinked: supplierLinkedSkus.length },
+      { source: 'oms_warehouses', count: warehouses.length },
+    ],
+    tasks: [task],
+    confidence: 0.98,
+    readinessNotes: confidenceGaps.length
+      ? canStart
+        ? 'Shipment creation is available, but pricing and optimization confidence remain limited for SKUs with missing physical or cost data.'
+        : 'Shipment creation remains blocked by supplier setup; missing physical or cost data also limits later pricing and optimization confidence.'
+      : null,
+  };
+}
+
 function buildGroundedFinancialLeakage(context: any) {
   const billing = json(context?.samples?.billing, {});
   const categoryTotals = json(billing.categoryTotals30d, {});
@@ -4760,6 +4827,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
   const aiPlanApprovalQuestion = chatRequestsAiPlanApproval(focusQuery);
   const financialLeakageQuestion = chatRequestsFinancialLeakage(focusQuery);
+  const shipmentReadinessQuestion = chatRequestsShipmentReadiness(focusQuery);
   const connectionScreenHealthQuestion = screen === 'connections'
     && ['shopify', 'amazon', 'ebay'].some((channel) => focusQuery.toLowerCase().includes(channel))
     && /(working|works?|healthy|health|down|degraded|status|happening|exactly|what does not)/i.test(message);
@@ -4774,7 +4842,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || accountPriorityQuestion
     || operationalRoadmapQuestion
     || aiPlanApprovalQuestion
-    || financialLeakageQuestion;
+    || financialLeakageQuestion
+    || shipmentReadinessQuestion;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
@@ -4836,9 +4905,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     if (!directSkuRankingQuestion || !skuOpportunityAnswerPassesQuality(normalized.answer, groundedSkuOpportunity)) {
       normalized.answer = groundedSkuOpportunity.answer;
       normalized.sources = groundedSkuOpportunity.sources.map(normalizeChatSource).filter(Boolean);
-      normalized.tasks = actionIntent
-        ? groundedSkuOpportunity.tasks.map(normalizeChatAction).filter(Boolean)
-        : [];
+      normalized.tasks = groundedSkuOpportunity.tasks.map(normalizeChatAction).filter(Boolean);
       normalized.confidence = groundedSkuOpportunity.confidence;
       normalized.readinessNotes = groundedSkuOpportunity.readinessNotes;
     }
@@ -4858,6 +4925,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.tasks = groundedFinancialLeakage.tasks.map(normalizeChatAction).filter(Boolean);
     normalized.confidence = groundedFinancialLeakage.confidence;
     normalized.readinessNotes = groundedFinancialLeakage.readinessNotes;
+  }
+  if (shipmentReadinessQuestion) {
+    const groundedShipmentReadiness = buildGroundedShipmentReadiness(context);
+    normalized.answer = groundedShipmentReadiness.answer;
+    normalized.sources = groundedShipmentReadiness.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedShipmentReadiness.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedShipmentReadiness.confidence;
+    normalized.readinessNotes = groundedShipmentReadiness.readinessNotes;
   }
   if (chatRequestsOrderPriority(focusQuery)) {
     const groundedOrderPriority = buildGroundedOrderPriorityResponse(message, context, focusContext);
@@ -4969,6 +5044,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     }
     normalized.tasks = normalized.tasks.map((action: any) => {
       const actionTarget = String(action.actionTarget || action.screen || '');
+      if (shipmentReadinessQuestion) return action;
       if (action.entityId && ['sku-detail', 'orders', 'warehouses'].includes(actionTarget)) return action;
       const matchingTask = contextTasks.find((task: any) => String(task.id || '') === String(action.id || ''))
         || (() => {
