@@ -1273,8 +1273,13 @@ export async function createSellerOptimizationRun(userId: string, input: any = {
   const cortexRunId = (cortex.ok && (cortex.data as any)?.id) || null;
   if (run?.id && cortexRunId) {
     await pgQuery(
-      `UPDATE oms_intelligence_runs SET cortex_run_id = $2, status = 'pending_cortex', updated_at = now() WHERE id = $1`,
-      [run.id, cortexRunId],
+      `UPDATE oms_intelligence_runs
+          SET cortex_run_id = $2,
+              status = 'pending_cortex',
+              input = input || $3::jsonb,
+              updated_at = now()
+        WHERE id = $1`,
+      [run.id, cortexRunId, JSON.stringify({ cortexContextEvidence: cortexContext.evidence })],
     ).catch(() => null);
   }
 
@@ -5650,6 +5655,29 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
   const planning = (result as any)?.planning || {};
   const fbm = planning?.scenario_integrated_fbm || {};
   const econ = fbm?.network_fulfillment_economics || {};
+  const warehouseNetwork = fbm?.warehouse_network || {};
+  const sellerContext = (result as any)?.seller_context || {};
+  const sellerCurrentBusiness = sellerContext?.currentBusiness || sellerContext?.current_business || {};
+  const runInput = json(run?.input, {});
+  const runSourceSummary = json(run?.source_summary, {});
+  const modelBaselineWarehouseNodes = Math.max(1, number(
+    sellerCurrentBusiness?.warehouseNodes
+      ?? sellerCurrentBusiness?.warehouse_nodes
+      ?? runInput?.cortexContextEvidence?.warehouseCount
+      ?? runSourceSummary?.counts?.wmsLinks
+      ?? 1,
+  ));
+  const selectedWarehouseNodes = Math.max(1,
+    number(warehouseNetwork?.selected_warehouse_count)
+      || (Array.isArray(warehouseNetwork?.selected_warehouses) ? warehouseNetwork.selected_warehouses.length : 0)
+      || modelBaselineWarehouseNodes,
+  );
+  const networkRecommendation = String(fbm?.recommendation || '').trim().toLowerCase();
+  const networkRecommendationIsNoop = !networkRecommendation
+    || /^(?:no[ _-]?op|keep[ _-]current|none|no[ _-]change)$/.test(networkRecommendation);
+  const proposedWarehouseNodes = networkRecommendationIsNoop
+    ? modelBaselineWarehouseNodes
+    : selectedWarehouseNodes;
   const demand = number(
     fbm?.warehouse_network?.order_velocity_enrichment?.estimated_monthly_demand_units_for_planning ||
       fbm?.warehouse_network?.monthly_total_demand_units ||
@@ -5657,20 +5685,23 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
   );
   const singleCostPU = number(econ?.single_warehouse_fulfillment_cost_usd_per_unit);
   const multiCostPU = number(econ?.multi_warehouse_fulfillment_cost_usd_per_unit);
-  const perUnitSavings = Math.max(0, singleCostPU - multiCostPU);
-  const monthlyCurrentCost = singleCostPU * demand;
-  const monthlyOptimizedCost = multiCostPU * demand;
+  const currentCostPU = modelBaselineWarehouseNodes > 1 ? multiCostPU : singleCostPU;
+  const proposedCostPU = proposedWarehouseNodes > 1 ? multiCostPU : singleCostPU;
+  const perUnitSavings = currentCostPU - proposedCostPU;
+  const monthlyCurrentCost = currentCostPU * demand;
+  const monthlyOptimizedCost = proposedCostPU * demand;
   const monthlySavings = perUnitSavings * demand;
-  const savingsPct = number(econ?.savings_pct_multi_warehouse_vs_single_warehouse);
+  const savingsPct = monthlyCurrentCost > 0 ? (monthlySavings / monthlyCurrentCost) * 100 : 0;
   const confidence = number(
     synthesis?.competitive_kpis?.confidence ?? execSummary?.confidence ?? 0.85,
     0.85,
   );
 
-  const haveBusinessDouble = monthlySavings > 0 && demand > 0;
+  const haveModeledEconomics = demand > 0 && currentCostPU > 0 && proposedCostPU > 0;
+  const haveBusinessDouble = haveModeledEconomics && !networkRecommendationIsNoop && monthlySavings > 0;
   const haveAIRecs = aiItems.length > 0;
 
-  if (!haveBusinessDouble && !haveAIRecs) {
+  if (!haveModeledEconomics && !haveAIRecs) {
     // Nothing actionable in this bundle; leave existing recs in place so the UI
     // does not appear to regress between cycles.
     if (run?.id) {
@@ -5715,15 +5746,18 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
         optimizedMonthlyCost: monthlyOptimizedCost,
         demandUnitsMonthly: demand,
         savingsPct,
+        modelBaselineWarehouseNodes,
+        selectedWarehouseNodes,
+        proposedWarehouseNodes,
+        networkRecommendation: networkRecommendation || null,
         verdict: execSummary?.verdict || null,
       }),
       JSON.stringify({
-        currentMetrics: { monthlyCost: monthlyCurrentCost, costPerUnit: singleCostPU, warehouseNodes: 1 },
+        currentMetrics: { monthlyCost: monthlyCurrentCost, costPerUnit: currentCostPU, warehouseNodes: modelBaselineWarehouseNodes },
         optimizedMetrics: {
           monthlyCost: monthlyOptimizedCost,
-          costPerUnit: multiCostPU,
-          warehouseNodes:
-            number(fbm?.warehouse_network?.network_selection_meta?.selected_warehouse_count) || 2,
+          costPerUnit: proposedCostPU,
+          warehouseNodes: proposedWarehouseNodes,
         },
         savings: {
           perUnit: perUnitSavings,
@@ -5734,12 +5768,21 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
           costReductionPct: savingsPct,
         },
         recommendationVerdict: fbm?.recommendation || null,
+        recommendationReason: fbm?.recommendation_reason || null,
       }),
       JSON.stringify({
         scenario_integrated_fbm_snapshot: {
           recommendation: fbm?.recommendation,
+          recommendation_reason: fbm?.recommendation_reason,
           savings_pct: savingsPct,
           demand,
+          model_baseline_warehouse_nodes: modelBaselineWarehouseNodes,
+          selected_warehouse_nodes: selectedWarehouseNodes,
+          proposed_warehouse_nodes: proposedWarehouseNodes,
+          comparative_economics: {
+            single_cost_per_unit: singleCostPU,
+            multi_cost_per_unit: multiCostPU,
+          },
         },
       }),
       JSON.stringify({
@@ -5768,13 +5811,12 @@ export async function ingestCortexResult(body: CortexCallbackBody) {
       entityType: 'business_double',
       entityId: stored?.id,
       title: 'Approve Cortex-optimized multi-warehouse plan',
-      summary: `Cortex AI projects $${Math.round(monthlySavings).toLocaleString()}/mo savings (~${Math.round(savingsPct)}%) by moving from a single warehouse to the recommended multi-node layout. Monthly demand: ${Math.round(demand).toLocaleString()} units.`,
-      currentValue: { monthlyCost: monthlyCurrentCost, costPerUnit: singleCostPU, warehouseNodes: 1 },
+      summary: `Cortex projects $${Math.round(monthlySavings).toLocaleString()}/mo savings (~${Math.round(savingsPct)}%) by changing the network from ${modelBaselineWarehouseNodes} to ${proposedWarehouseNodes} warehouse nodes. Monthly demand: ${Math.round(demand).toLocaleString()} units.`,
+      currentValue: { monthlyCost: monthlyCurrentCost, costPerUnit: currentCostPU, warehouseNodes: modelBaselineWarehouseNodes },
       optimizedValue: {
         monthlyCost: monthlyOptimizedCost,
-        costPerUnit: multiCostPU,
-        warehouseNodes:
-          number(fbm?.warehouse_network?.network_selection_meta?.selected_warehouse_count) || 2,
+        costPerUnit: proposedCostPU,
+        warehouseNodes: proposedWarehouseNodes,
       },
       estimatedImpact: { monthlySavings, annualizedSavings: monthlySavings * 12, savingsPct },
       requiredAction: 'approve_business_double',
