@@ -2835,11 +2835,17 @@ function conversationAwareChatQuery(message: string, history: Array<{ role?: str
   );
   if (standaloneTopic || !contextualFollowup) return current;
 
-  const previousUserMessage = [...history]
-    .reverse()
-    .find((entry) => entry?.role === 'user' && String(entry?.content || '').trim());
-  if (!previousUserMessage) return current;
-  return `${String(previousUserMessage.content).trim()}\nFollow-up: ${current}`;
+  const prior = [...history].reverse();
+  const domainPattern = /\b(shopify|amazon|ebay|marketplace|connection|sync|inventory|sku|product|listing|order|shipment|asn|warehouse|wms|supplier|billing|invoice|cost|margin|profit|label|audit|return|customer|task|readiness|decision|optimization|plan)\b/i;
+  const topicAnchor = prior.find((entry) => entry?.role === 'user' && domainPattern.test(String(entry?.content || '')))
+    || prior.find((entry) => entry?.role === 'user' && String(entry?.content || '').trim());
+  if (!topicAnchor) return current;
+  const previousAnswer = prior.find((entry) => entry?.role === 'assistant' && String(entry?.content || '').trim());
+  return [
+    String(topicAnchor.content).trim(),
+    previousAnswer ? `Previous answer: ${String(previousAnswer.content).trim().slice(0, 2400)}` : null,
+    `Follow-up: ${current}`,
+  ].filter(Boolean).join('\n');
 }
 
 function chatRequestsDecision(message: string) {
