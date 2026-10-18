@@ -3571,7 +3571,7 @@ function buildGroundedSkuOpportunityFollowup(message: string, context: any, focu
   };
 }
 
-function buildLocalCortexChatFallback(message: string, context: any, focusContext?: any): {
+function buildLocalCortexChatFallback(message: string, context: any, focusContext?: any, intentMessage = message): {
   answer: string;
   sources: any[];
   tasks: any[];
@@ -3612,8 +3612,9 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
   ].filter(Boolean);
   const gapLine = gaps.length ? `What is holding it back: ${gaps.join('; ')}.` : 'Nothing major is blocking the core intelligence path right now.';
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
-  const priorityIntent = chatRequestsPriority(message);
-  const actionIntent = chatRequestsActions(message) || q.includes('get the account going') || q.includes('start') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
+  const intentQuery = String(intentMessage || '').toLowerCase();
+  const priorityIntent = chatRequestsPriority(intentMessage);
+  const actionIntent = chatRequestsActions(intentMessage) || intentQuery.includes('get the account going') || intentQuery.includes('start') || intentQuery.includes('blocking') || intentQuery.includes('confidence') || intentQuery.includes('missing');
   const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
   const marketplaceAppIntent = chatRequestsMarketplaceApps(message, context?.screen);
   const providerHealthIntent = Boolean(requestedMarketplaceChannel)
@@ -3631,7 +3632,7 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
   const responseTasks = marketplaceConnectionIntent ? marketplaceTasks : sortedTasks;
   const includeMarketplaceRepair = marketplaceConnectionIntent && marketplaceTasks.length > 0;
 
-  if (chatRequestsDecision(message)) {
+  if (chatRequestsDecision(intentMessage)) {
     const decision = decisionRecommendations[0];
     if (!decision) {
       lines.push('There is no measurable current-versus-suggested decision ready for approval right now.');
@@ -3896,7 +3897,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         confidence: 0.35,
         readinessNotes: 'Cortex is not configured for this account.',
       }
-    : buildLocalCortexChatFallback(focusQuery, context, focusContext);
+    : buildLocalCortexChatFallback(focusQuery, context, focusContext, message);
   const marketplaceHealthFocus = String(focusContext?.topic || '').endsWith('_connection_health')
     || String(focusContext?.requiredSource || '') === 'oms_marketplace_connections';
   const marketplaceHealthQuestion = marketplaceHealthFocus
