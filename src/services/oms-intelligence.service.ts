@@ -3610,6 +3610,12 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const marketplaceAppStateQuestion = String(focusContext?.topic || '') === 'marketplace_apps'
     && /(installed|available|gated|active|activated|activation|status|what (?:does|is)|which apps? (?:are|is))/i.test(message)
     && !/(should|recommend|best|most value|worth|priority|prioritize)/i.test(message);
+  const marketplaceApps = Array.isArray(focusContext?.apps) ? focusContext.apps : [];
+  const marketplaceAllAppsEnabled = marketplaceApps.length > 0
+    && marketplaceApps.every((app: any) => Boolean(app?.isEnabled));
+  const marketplaceInstalledRecommendation = String(focusContext?.topic || '') === 'marketplace_apps'
+    && marketplaceAllAppsEnabled
+    && /(should|recommend|prioriti[sz]e|next|best|most value|worth)/i.test(message);
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
   const accountPriorityQuestion = priorityIntent && /\b(account|operational|issue|blocker|risk)\b/i.test(message);
@@ -3618,6 +3624,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   // through Cortex orchestration below.
   const accountGroundedFastPath = marketplaceHealthQuestion
     || marketplaceAppStateQuestion
+    || marketplaceInstalledRecommendation
     || accountSnapshotQuestion
     || accountPriorityQuestion;
   const cortex = accountGroundedFastPath ? {
