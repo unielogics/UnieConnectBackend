@@ -2573,7 +2573,7 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     getDataReadiness(userId),
     getRecommendations(userId, { screen, status: 'open', limit: 10 }),
     getCortexTasks(userId, { status: 'open', limit: 20, refresh: options.refreshTasks }),
-    rows(`SELECT entity_type, entity_id, event_type, source_system, summary, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]).catch(() => []),
+    rows(`SELECT entity_type, entity_id, event_type, source_system, summary, payload, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]).catch(() => []),
     rows(
       `SELECT ci.id, ci.sku, ci.title,
               COALESCE(ci.metadata->>'subtitle', ci.metadata->>'subTitle', ci.attributes->>'subtitle', ci.sub_category) AS subtitle,
@@ -3039,6 +3039,10 @@ function chatRequestsPriorActionNavigation(message: string) {
 
 function chatRequestsAccountSnapshot(message: string) {
   return /\b(summarize|account (?:status|snapshot|overview)|what(?:'s| is) happening in (?:my|the) account)\b/i.test(message);
+}
+
+function chatRequestsRecentActivity(message: string) {
+  return /\b(what changed|changes? today|what happened|happened today|recent activity|latest changes|latest activity)\b/i.test(message);
 }
 
 function chatRequestsActions(message: string) {
@@ -3622,8 +3626,9 @@ async function buildChatFocusContext(
   if (screen === 'ledger' || /\b(ledger|execution history|what changed|recent actions?)\b/.test(q)) {
     return {
       topic: 'execution_ledger',
-      instruction: 'Answer from the account execution ledger first. Clearly distinguish proposed, approved, executed, failed, and observed events.',
+      instruction: 'Answer from the account execution ledger first. Clearly distinguish proposed, approved, executed, failed, and observed events. When a marketplace refresh is partial, state the affected data area and the exact repair action from connection health.',
       events: context?.ledger || [],
+      connections: samples.marketplaceConnections || [],
       requiredSource: 'oms_execution_ledger',
     };
   }
@@ -3932,6 +3937,101 @@ function buildGroundedAccountSnapshot(context: any) {
     tasks: [],
     confidence: 0.99,
     readinessNotes: null,
+  };
+}
+
+function buildGroundedRecentActivity(context: any) {
+  const ledger = Array.isArray(context?.ledger) ? context.ledger : [];
+  const connections = Array.isArray(context?.samples?.marketplaceConnections)
+    ? context.samples.marketplaceConnections
+    : [];
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const shopify = connections.find((connection: any) => String(connection?.channel || '').toLowerCase() === 'shopify');
+  const shopifySync = json(shopify?.sync, {});
+  const inventoryState = json(shopifySync.inventory, {});
+  const inventoryWarning = String(inventoryState?.metadata?.warning || inventoryState?.error || '').trim();
+  const shopifyInventoryDegraded = Boolean(
+    shopify
+    && (inventoryState?.status === 'error' || inventoryState?.metadata?.degraded || inventoryWarning),
+  );
+  const shopifyTask = tasks.find((task: any) => {
+    const text = `${task?.dedupeKey || ''} ${task?.title || ''} ${task?.detail || ''}`.toLowerCase();
+    return String(task?.source || '') === 'connection_health' && text.includes('shopify');
+  });
+  const seen = new Set<string>();
+  const recentEvents = ledger.filter((event: any) => {
+    const summary = humanizeInternalLanguage(event?.summary || '').trim();
+    if (!summary) return false;
+    const key = summary.toLowerCase().replace(/\d+ warning\(s\)/g, 'warning');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return !(shopifyInventoryDegraded
+      && String(event?.source_system || '').toLowerCase() === 'shopify'
+      && /refresh completed with|location-level inventory|location inventory/i.test(summary));
+  }).slice(0, 4);
+  const lines = ['Recent account activity'];
+
+  if (shopify) {
+    const status = String(shopify?.status || '').toLowerCase();
+    if (shopifyInventoryDegraded) {
+      lines.push(
+        `Shopify products and orders continue to sync, but location-level inventory is degraded because location inventory access has not been approved. UnieConnect is using fallback quantities for ${chatPlural(chatCount(inventoryState?.count), 'SKU')}.`,
+        'Next action: open Connections, select Repair Shopify access, and approve location inventory access.',
+      );
+    } else if (['connected', 'active', 'synced'].includes(status)) {
+      lines.push('Shopify is connected, and no product, order, or inventory sync degradation is recorded.');
+    }
+  }
+
+  if (recentEvents.length) {
+    lines.push([
+      'Other recorded changes:',
+      ...recentEvents.map((event: any) => `- ${humanizeInternalLanguage(event.summary).replace(/[.!]+$/, '')}.`),
+    ].join('\n'));
+  } else if (!shopify) {
+    lines.push('No recent operational change is recorded in the account execution ledger.');
+  }
+
+  const action = shopifyTask
+    ? {
+        id: shopifyTask.id,
+        dedupeKey: shopifyTask.dedupeKey,
+        title: shopifyTask.title,
+        priority: shopifyTask.priority,
+        screen: shopifyTask.screen,
+        actionTarget: shopifyTask.actionTarget || shopifyTask.screen,
+        actionLabel: shopifyTask.actionLabel,
+        entityType: shopifyTask.entityType,
+        entityId: shopifyTask.entityId,
+      }
+    : shopifyInventoryDegraded
+      ? {
+          title: 'Restore Shopify location inventory',
+          priority: 'high',
+          screen: 'connections',
+          actionTarget: 'connections',
+          actionLabel: 'Repair Shopify access',
+          entityType: 'marketplace_connection',
+          entityId: shopify?.id,
+        }
+      : null;
+
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [
+      { source: 'oms_execution_ledger', count: recentEvents.length },
+      ...(shopify ? [{
+        source: 'oms_marketplace_connections',
+        channel: 'shopify',
+        status: shopify.status,
+        inventoryStatus: shopifyInventoryDegraded ? 'degraded' : 'healthy',
+      }] : []),
+    ],
+    tasks: action ? [action] : [],
+    confidence: 0.99,
+    readinessNotes: shopifyInventoryDegraded
+      ? 'Shopify location-level inventory remains degraded until the store authorization is repaired.'
+      : null,
   };
 }
 
@@ -4867,6 +4967,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     && /(should|recommend|prioriti[sz]e|next|best|most value|worth)/i.test(message);
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
+  const recentActivityQuestion = chatRequestsRecentActivity(focusQuery);
   const accountPriorityQuestion = priorityIntent
     && (screen === 'command' || /\b(account|operational|issue|blocker|risk)\b/i.test(message));
   const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
@@ -4884,6 +4985,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || marketplaceAppStateQuestion
     || marketplaceInstalledRecommendation
     || accountSnapshotQuestion
+    || recentActivityQuestion
     || accountPriorityQuestion
     || operationalRoadmapQuestion
     || aiPlanApprovalQuestion
@@ -4942,6 +5044,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.tasks = [];
     normalized.confidence = groundedAccountSnapshot.confidence;
     normalized.readinessNotes = groundedAccountSnapshot.readinessNotes;
+  }
+  if (recentActivityQuestion) {
+    const groundedRecentActivity = buildGroundedRecentActivity(context);
+    normalized.answer = groundedRecentActivity.answer;
+    normalized.sources = groundedRecentActivity.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedRecentActivity.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedRecentActivity.confidence;
+    normalized.readinessNotes = groundedRecentActivity.readinessNotes;
   }
   if (chatRequestsSkuOpportunityRanking(focusQuery)) {
     const directSkuRankingQuestion = chatRequestsSkuOpportunityRanking(message);
@@ -5136,7 +5246,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     }
     normalized.tasks = normalized.tasks.map((action: any) => {
       const actionTarget = String(action.actionTarget || action.screen || '');
-      if (shipmentReadinessQuestion || priorActionFollowup) return action;
+      if (shipmentReadinessQuestion || recentActivityQuestion || priorActionFollowup) return action;
       if (action.entityId && ['sku-detail', 'orders', 'warehouses'].includes(actionTarget)) return action;
       const matchingTask = contextTasks.find((task: any) => String(task.id || '') === String(action.id || ''))
         || (() => {
@@ -5183,7 +5293,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       if (seenActions.has(key)) return false;
       seenActions.add(key);
       return true;
-    }).slice(0, priorityIntent || accountSnapshotQuestion || priorActionFollowup ? 1 : 3);
+    }).slice(0, priorityIntent || accountSnapshotQuestion || recentActivityQuestion || priorActionFollowup ? 1 : 3);
   }
   if (actionIntent && normalized.tasks.length) {
     const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
@@ -5202,7 +5312,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.answer = fallback.answer;
   }
   const requiredFocusSource = normalizeChatSource({ source: focusContext?.requiredSource });
-  if (requiredFocusSource && !chatRequestsOperationalRoadmap(focusQuery) && !aiPlanApprovalQuestion) {
+  if (requiredFocusSource && !chatRequestsOperationalRoadmap(focusQuery) && !aiPlanApprovalQuestion && !recentActivityQuestion) {
     const focusedSources = normalized.sources.filter((source: any) => source?.source === requiredFocusSource.source);
     normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
