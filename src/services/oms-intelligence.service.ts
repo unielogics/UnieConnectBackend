@@ -2983,10 +2983,11 @@ function conversationAwareChatQuery(message: string, history: Array<{ role?: str
   const topicAnchor = prior.find((entry) => entry?.role === 'user' && domainPattern.test(String(entry?.content || '')))
     || prior.find((entry) => entry?.role === 'user' && String(entry?.content || '').trim());
   if (!topicAnchor) return current;
-  const previousAnswer = prior.find((entry) => entry?.role === 'assistant' && String(entry?.content || '').trim());
+  // Full assistant history is sent to Cortex separately. Including assistant
+  // prose in the routing query leaks secondary terms (for example, a SKU
+  // answer mentioning warehouse fit) into unrelated intent classifiers.
   return [
     String(topicAnchor.content).trim(),
-    previousAnswer ? `Previous answer: ${String(previousAnswer.content).trim().slice(0, 2400)}` : null,
     `Follow-up: ${current}`,
   ].filter(Boolean).join('\n');
 }
