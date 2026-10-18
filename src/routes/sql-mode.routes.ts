@@ -4567,7 +4567,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       warehouseCode: warehouse.warehouseCode,
       amount: money(warehouse.totalEstimatedCost ?? warehouse.feePreview?.total ?? 0),
       transitDays: null,
-      recommendation: `${warehouse.warehouseCode || 'Warehouse'} pricing includes fulfillment, label, storage, and transportation intelligence where available.`,
+      recommendation: `${warehouse.warehouseCode || 'Warehouse'} pricing includes fulfillment, outbound parcel postage, storage, and transportation intelligence where available. ASN pallet-label documents are excluded.`,
       source: warehouse.source || 'cortex',
       confidence: warehouse.confidence ?? pricingPreview.confidence,
     }));
