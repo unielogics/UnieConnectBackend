@@ -2285,11 +2285,26 @@ export async function getCortexTasks(userId: string, query: any = {}) {
       values,
     ),
     rows(
-      `SELECT COUNT(*)::int AS total FROM oms_cortex_tasks WHERE ${filters.join(' AND ')}`,
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE priority = 'high')::int AS high_priority,
+              COALESCE(array_agg(DISTINCT COALESCE(action_target, screen))
+                FILTER (WHERE COALESCE(action_target, screen) IS NOT NULL), ARRAY[]::text[]) AS work_areas,
+              COALESCE(array_agg(DISTINCT source)
+                FILTER (WHERE source IS NOT NULL), ARRAY[]::text[]) AS sources
+         FROM oms_cortex_tasks WHERE ${filters.join(' AND ')}`,
       countValues,
     ),
   ]);
-  return { tasks: tasks.map(mapCortexTask), total: number(countRows[0]?.total, 0) };
+  const summary = countRows[0] || {};
+  return {
+    tasks: tasks.map(mapCortexTask),
+    total: number(summary.total, 0),
+    summary: {
+      highPriority: number(summary.high_priority, 0),
+      workAreas: Array.isArray(summary.work_areas) ? summary.work_areas : [],
+      sources: Array.isArray(summary.sources) ? summary.sources : [],
+    },
+  };
 }
 
 export async function completeCortexTask(userId: string, taskId: string) {
