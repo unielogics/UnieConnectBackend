@@ -5009,7 +5009,11 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
         if (syncEntries.length) {
           lines.push(`Synchronized data: ${syncEntries.map(([entity, item]) => {
             const count = chatCount(item?.count);
-            return `${entity.replace(/_/g, ' ')} ${count} (${String(item?.status || 'unknown').replace(/_/g, ' ')})`;
+            const capabilityDegraded = Boolean(item?.error || item?.metadata?.warning || item?.metadata?.degraded);
+            const capabilityStatus = capabilityDegraded
+              ? 'degraded fallback'
+              : String(item?.status || 'unknown').replace(/_/g, ' ');
+            return `${entity.replace(/_/g, ' ')} ${count} (${capabilityStatus})`;
           }).join('; ')}.`);
         }
         const issues = syncEntries
@@ -5077,7 +5081,14 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
       ...(marketplaceAppIntent ? [{ source: 'oms_marketplace_apps', count: Array.isArray(samples.marketplaceApps) ? samples.marketplaceApps.length : 0 }] : []),
-      ...(marketplaceConnectionIntent ? [{ source: 'oms_marketplace_connections', count: Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections.length : 0 }] : []),
+      ...(marketplaceConnectionIntent ? [{
+        source: 'oms_marketplace_connections',
+        channel: requestedMarketplaceChannel || 'all',
+        count: Array.isArray(samples.marketplaceConnections)
+          ? samples.marketplaceConnections.filter((connection: any) => !requestedMarketplaceChannel
+            || String(connection?.channel || '').toLowerCase() === requestedMarketplaceChannel).length
+          : 0,
+      }] : []),
     ],
     tasks: actionIntent || includeMarketplaceRepair || snapshotIntent
       ? responseTasks.slice(0, marketplaceConnectionIntent || priorityIntent || snapshotIntent ? 1 : 3).map((task: any) => ({
@@ -5092,7 +5103,9 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
           entityType: task.entityType,
         }))
       : [],
-    confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
+    confidence: marketplaceConnectionIntent
+      ? 0.98
+      : readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
     readinessNotes: null,
   };
 }
@@ -5699,6 +5712,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     // scoped answer. Live-route diagnostics remain available separately.
     available: chatAvailable,
     chatIntegrated: accountChatConfigured || liveRouteAvailable,
+    tenantConfigured: Boolean(context.readiness?.cortex?.tenantConfigured),
+    bootstrapConfigured: Boolean(context.readiness?.cortex?.bootstrapConfigured),
     status: chatAvailable ? 200 : 503,
     reason: accountGroundedFastPath
       ? 'account_grounded_answer'
