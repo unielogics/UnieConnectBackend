@@ -1795,12 +1795,28 @@ export async function approveRecommendation(userId: string, recommendationId: st
   if (!rec) return null;
   const blocked = recommendationDecisionBlockReason(rec);
   if (blocked) return recommendationDecisionConflict(rec, blocked);
+  const hasOptimizedOverride = Object.prototype.hasOwnProperty.call(body || {}, 'optimizedValue');
+  const optimizedOverride = body?.optimizedValue;
+  if (
+    hasOptimizedOverride
+    && (!optimizedOverride || typeof optimizedOverride !== 'object' || Array.isArray(optimizedOverride))
+  ) {
+    throw new Error('The edited Cortex suggestion must be a JSON object.');
+  }
+  const optimizedOverrideJson = hasOptimizedOverride ? JSON.stringify(optimizedOverride) : null;
+  if (optimizedOverrideJson && optimizedOverrideJson.length > 50_000) {
+    throw new Error('The edited Cortex suggestion is too large to approve.');
+  }
   const updated = await one(
     `UPDATE oms_recommendations
-     SET approval_state = 'approved', status = 'approved', approved_at = now(), updated_at = now()
+     SET approval_state = 'approved',
+         status = 'approved',
+         optimized_value = COALESCE($3::jsonb, optimized_value),
+         approved_at = now(),
+         updated_at = now()
      WHERE user_id = $1 AND id = $2 AND approval_state IN ('waiting_approval', 'draft')
      RETURNING *`,
-    [userId, recommendationId],
+    [userId, recommendationId, optimizedOverrideJson],
   );
   if (!updated) {
     const current = await one('SELECT * FROM oms_recommendations WHERE user_id = $1 AND id = $2 LIMIT 1', [userId, recommendationId]);
@@ -1832,7 +1848,13 @@ export async function approveRecommendation(userId: string, recommendationId: st
     eventType: 'recommendation_approved',
     sourceSystem: 'oms',
     summary: `Approved recommendation: ${rec.title}`,
-    payload: { recommendationId, cortexDecisionId: `oms-rec-${recommendationId}`, cortex, lifecycleState: cortex?.data?.lifecycle_state || 'approved' },
+    payload: {
+      recommendationId,
+      cortexDecisionId: `oms-rec-${recommendationId}`,
+      cortex,
+      lifecycleState: cortex?.data?.lifecycle_state || 'approved',
+      editedSuggestionApplied: hasOptimizedOverride,
+    },
     confidence: rec.confidence,
   });
   return { recommendation: mapRecommendation(updated), cortex };
