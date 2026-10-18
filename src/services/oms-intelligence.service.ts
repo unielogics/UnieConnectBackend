@@ -3021,7 +3021,15 @@ function normalizeChatAction(value: any) {
 }
 
 function chatRequestsPriority(message: string) {
-  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first (?:thing|action|step)|next action|where (?:should|do|can) i start|what (?:should|do|can) i (?:do|fix|address|handle|resolve|work on) first|focus on)\b/i.test(message);
+  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first (?:thing|action|step)|next action|what (?:should|can|do) i do next|where (?:should|do|can) i start|what (?:should|do|can) i (?:do|fix|address|handle|resolve|work on) first|focus on)\b/i.test(message);
+}
+
+function chatRequestsPriorActionExplanation(message: string) {
+  return /^\s*(?:why|why that|why this|how come|explain(?: that| this)?|tell me why)[?.!\s]*$/i.test(String(message || ''));
+}
+
+function chatRequestsPriorActionNavigation(message: string) {
+  return /^\s*(?:take me there|open (?:it|that|this)|go there|show me (?:it|that|this)|let(?:'s| us) do (?:it|that|this))[?.!\s]*$/i.test(String(message || ''));
 }
 
 function chatRequestsAccountSnapshot(message: string) {
@@ -4781,7 +4789,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   );
 
   const threadHistoryRows = (await rows(
-    `SELECT role, content
+    `SELECT role, content, sources, tasks, confidence, readiness_notes
        FROM oms_cortex_chat_messages
       WHERE user_id = $1 AND thread_id = $2 AND role IN ('user', 'assistant')
       ORDER BY created_at DESC
@@ -4794,6 +4802,17 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   }
   const threadHistory = threadHistoryRows
     .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
+  const previousAssistantMessage = [...threadHistoryRows]
+    .reverse()
+    .find((item: any) => item?.role === 'assistant');
+  const previousAssistantActions = (Array.isArray(previousAssistantMessage?.tasks)
+    ? previousAssistantMessage.tasks
+    : json(previousAssistantMessage?.tasks, []))
+    .map(normalizeChatAction)
+    .filter(Boolean);
+  const priorActionExplanation = chatRequestsPriorActionExplanation(message) && previousAssistantActions.length > 0;
+  const priorActionNavigation = chatRequestsPriorActionNavigation(message) && previousAssistantActions.length > 0;
+  const priorActionFollowup = priorActionExplanation || priorActionNavigation;
 
   // The shell refreshes readiness tasks on load and after mutations. Chat reads
   // that account state without regenerating every task for every user message.
@@ -4847,7 +4866,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || operationalRoadmapQuestion
     || aiPlanApprovalQuestion
     || financialLeakageQuestion
-    || shipmentReadinessQuestion;
+    || shipmentReadinessQuestion
+    || priorActionFollowup;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
@@ -5023,6 +5043,51 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.confidence = fallback.confidence;
     normalized.readinessNotes = null;
   }
+  if (priorActionFollowup) {
+    const previousAction = previousAssistantActions[0];
+    const contextTasks = Array.isArray(context?.tasks) ? context.tasks : [];
+    const matchingTask = contextTasks.find((task: any) => (
+      (previousAction.id && String(task?.id || '') === String(previousAction.id))
+      || (previousAction.dedupeKey && String(task?.dedupeKey || '') === String(previousAction.dedupeKey))
+    ));
+    const groundedAction = matchingTask
+      ? normalizeChatAction({
+          id: matchingTask.id,
+          dedupeKey: matchingTask.dedupeKey,
+          title: matchingTask.title,
+          priority: matchingTask.priority,
+          screen: matchingTask.screen,
+          actionTarget: matchingTask.actionTarget || matchingTask.screen,
+          actionLabel: matchingTask.actionLabel,
+          entityType: matchingTask.entityType,
+          entityId: matchingTask.entityId,
+        })
+      : previousAction;
+    const title = humanizeInternalLanguage(String(matchingTask?.title || groundedAction?.title || 'the recommended action')).replace(/[.!]+$/, '');
+    const actionLabel = humanizeInternalLanguage(String(matchingTask?.actionLabel || groundedAction?.actionLabel || 'Open the related screen')).replace(/[.!]+$/, '');
+    if (priorActionExplanation) {
+      const detail = humanizeInternalLanguage(String(matchingTask?.detail || '')).replace(/[.!]+$/, '');
+      const readinessScore = Number(context?.readiness?.score);
+      const priority = String(matchingTask?.priority || groundedAction?.priority || 'normal').toLowerCase();
+      normalized.answer = polishCortexChatText([
+        `Why this is the next priority: ${title}.`,
+        detail || 'It is the highest-ranked open account task backed by the current OMS data.',
+        Number.isFinite(readinessScore)
+          ? `Current evidence: account readiness is ${Math.round(readinessScore)}%, and this remains an open ${priority === 'high' ? 'high-priority' : 'readiness'} item.`
+          : `Current evidence: this remains an open ${priority === 'high' ? 'high-priority' : 'readiness'} item in this account.`,
+        `Next action: ${actionLabel}.`,
+      ].join('\n\n'));
+    } else {
+      normalized.answer = polishCortexChatText(`Open ${actionLabel} to work on "${title}."\n\nThe same account-scoped action from the previous answer is available below.`);
+    }
+    normalized.tasks = groundedAction ? [groundedAction] : [];
+    normalized.sources = [
+      normalizeChatSource({ source: 'oms_cortex_tasks', taskId: matchingTask?.id || groundedAction?.id }),
+      normalizeChatSource({ source: 'oms_data_readiness', readinessScore: context?.readiness?.score }),
+    ].filter(Boolean);
+    normalized.confidence = matchingTask ? 0.98 : Math.max(0.75, Number(previousAssistantMessage?.confidence) || 0);
+    normalized.readinessNotes = null;
+  }
   if (normalized.tasks.length) {
     const contextTasks = Array.isArray(context?.tasks) ? context.tasks : [];
     const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => message.toLowerCase().includes(channel));
@@ -5048,7 +5113,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     }
     normalized.tasks = normalized.tasks.map((action: any) => {
       const actionTarget = String(action.actionTarget || action.screen || '');
-      if (shipmentReadinessQuestion) return action;
+      if (shipmentReadinessQuestion || priorActionFollowup) return action;
       if (action.entityId && ['sku-detail', 'orders', 'warehouses'].includes(actionTarget)) return action;
       const matchingTask = contextTasks.find((task: any) => String(task.id || '') === String(action.id || ''))
         || (() => {
@@ -5095,7 +5160,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       if (seenActions.has(key)) return false;
       seenActions.add(key);
       return true;
-    }).slice(0, priorityIntent || accountSnapshotQuestion ? 1 : 3);
+    }).slice(0, priorityIntent || accountSnapshotQuestion || priorActionFollowup ? 1 : 3);
   }
   if (actionIntent && normalized.tasks.length) {
     const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
