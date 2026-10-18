@@ -2035,6 +2035,61 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     [userId, skuOrId],
   )) as Row | null;
   if (!item) return null;
+  const [channelRows, mappedChannelRows] = await Promise.all([
+    rows<{
+      channel: string;
+      orders: string;
+      units: string;
+      revenue: string;
+      refunded_orders: string;
+    }>(
+      `SELECT COALESCE(NULLIF(lower(o.channel), ''), NULLIF(lower(mc.channel), ''), 'manual') AS channel,
+              COUNT(DISTINCT o.id)::text AS orders,
+              COALESCE(SUM(ol.quantity), 0)::text AS units,
+              COALESCE(SUM(COALESCE(ol.total_price, ol.unit_price * ol.quantity, 0)), 0)::text AS revenue,
+              COUNT(DISTINCT CASE WHEN o.paid = 'refunded' THEN o.id END)::text AS refunded_orders
+         FROM order_lines ol
+         INNER JOIN orders o ON o.id = ol.order_id AND o.user_id = ol.user_id
+         LEFT JOIN marketplace_connections mc ON mc.id = o.channel_connection_id AND mc.user_id = o.user_id
+        WHERE ol.user_id = $1
+          AND (ol.item_id = $2 OR lower(COALESCE(ol.sku, '')) = lower($3))
+          AND COALESCE(o.placed_at, o.created_at) >= now() - interval '30 days'
+          AND COALESCE(o.status, '') <> 'cancelled'
+        GROUP BY 1
+        ORDER BY SUM(COALESCE(ol.quantity, 0)) DESC`,
+      [userId, item.id, item.sku],
+    ),
+    rows<{ channel: string }>(
+      `SELECT DISTINCT lower(m.channel) AS channel
+         FROM item_channel_mappings m
+        WHERE m.user_id = $1
+          AND m.item_id = $2
+          AND COALESCE(m.status, 'active') <> 'deleted'
+          AND COALESCE(m.channel, '') <> ''
+        ORDER BY 1`,
+      [userId, item.id],
+    ),
+  ]);
+  const performanceByChannel = new Map(channelRows.map((row) => [row.channel, row]));
+  const mappedChannels = new Set(mappedChannelRows.map((row) => row.channel));
+  const channelKeys = Array.from(new Set([...mappedChannels, ...channelRows.map((row) => row.channel)]));
+  const totalChannelUnits = channelRows.reduce((sum, row) => sum + number(row.units), 0);
+  const channelPerformance = channelKeys
+    .map((channel) => {
+      const row = performanceByChannel.get(channel);
+      const orders30d = number(row?.orders);
+      const units30d = number(row?.units);
+      return {
+        channel,
+        mapped: mappedChannels.has(channel),
+        orders30d,
+        units30d,
+        revenue30d: money(row?.revenue),
+        shareOfDemand: totalChannelUnits > 0 ? Math.round((units30d / totalChannelUnits) * 10_000) / 10_000 : 0,
+        refundRate: orders30d > 0 ? Math.round((number(row?.refunded_orders) / orders30d) * 10_000) / 10_000 : 0,
+      };
+    })
+    .sort((a, b) => b.units30d - a.units30d || a.channel.localeCompare(b.channel));
   const plan = await getInventoryPlan(userId);
   const intelligence = (Array.isArray((plan as any).skus) ? (plan as any).skus : []).find((s: any) => s.sku === item.sku);
   const activityPlans = await rows(
@@ -2259,6 +2314,7 @@ export async function getOmsSkuDetail(userId: string, skuOrId: string) {
     // state rather than a row of placeholder zeros for every facility.
     warehouses: skuWarehousesWithBilling,
     history: skuHistoryTimeline(item, activityPlans, asnRows, activityLogs, ledgerRows),
+    channels: channelPerformance,
     billing: skuBilling,
   };
 }
