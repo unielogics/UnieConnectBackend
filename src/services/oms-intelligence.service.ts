@@ -4001,6 +4001,7 @@ function buildGroundedFinancialLeakage(context: any) {
     actionLabel: task.actionLabel,
     entityType: task.entityType,
     entityId: task.entityId,
+    navigationPayload: task.navigationPayload,
   }));
   return {
     answer: polishCortexChatText(lines.join('\n\n')),
@@ -4229,6 +4230,7 @@ function buildGroundedSupplierGuidance(context: any) {
         actionLabel: supplierTask.actionLabel,
         entityType: supplierTask.entityType,
         entityId: supplierTask.entityId,
+        navigationPayload: supplierTask.navigationPayload,
       }
     : incomplete.length || !suppliers.length
       ? {
@@ -4494,6 +4496,7 @@ function buildGroundedMarginGuidance(context: any) {
     actionLabel: task.actionLabel,
     entityType: task.entityType,
     entityId: task.entityId,
+    navigationPayload: task.navigationPayload,
   }));
   return {
     answer: polishCortexChatText(lines.join('\n\n')),
@@ -4957,6 +4960,7 @@ function buildGroundedOperationalRoadmap(context: any) {
       actionLabel: task.actionLabel,
       entityType: task.entityType,
       entityId: task.entityId,
+      navigationPayload: task.navigationPayload,
     }));
 
   const answer = [
@@ -5196,6 +5200,7 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
           actionLabel: task.actionLabel,
           entityId: task.entityId,
           entityType: task.entityType,
+          navigationPayload: task.navigationPayload,
         }))
       : [],
     confidence: marketplaceConnectionIntent
@@ -5253,6 +5258,7 @@ function buildCortexModelContext(context: any, focusContext: any) {
       actionLabel: task.actionLabel,
       entityType: task.entityType,
       entityId: task.entityId,
+      navigationPayload: task.navigationPayload,
     })),
     recommendations: recommendations.slice(0, 8).map((recommendation: any) => ({
       id: recommendation.id,
@@ -5730,6 +5736,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             actionLabel: connectionRepair.actionLabel,
             entityType: connectionRepair.entityType,
             entityId: connectionRepair.entityId,
+            navigationPayload: connectionRepair.navigationPayload,
           })].filter(Boolean)
         : [];
       normalized.confidence = 1;
@@ -5770,6 +5777,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
           actionLabel: matchingTask.actionLabel,
           entityType: matchingTask.entityType,
           entityId: matchingTask.entityId,
+          navigationPayload: matchingTask.navigationPayload,
         })
       : previousAction;
     const title = humanizeInternalLanguage(String(matchingTask?.title || groundedAction?.title || 'the recommended action')).replace(/[.!]+$/, '');
@@ -5818,6 +5826,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
           actionLabel: task.actionLabel,
           entityType: task.entityType,
           entityId: task.entityId,
+          navigationPayload: task.navigationPayload,
         }))
         .filter(Boolean);
     }
@@ -5861,6 +5870,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             actionLabel: matchingTask.actionLabel,
             entityType: matchingTask.entityType,
             entityId: matchingTask.entityId,
+            navigationPayload: matchingTask.navigationPayload,
           })
         : action;
     }).filter(Boolean);
