@@ -2272,14 +2272,21 @@ export async function getCortexTasks(userId: string, query: any = {}) {
     values.push(String(query.screen));
     filters.push(`screen = $${values.length}`);
   }
+  const countValues = [...values];
   values.push(Math.min(200, Math.max(1, number(query.limit, 100))));
-  const tasks = await rows(
-    `SELECT * FROM oms_cortex_tasks WHERE ${filters.join(' AND ')}
-     ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC
-     LIMIT $${values.length}`,
-    values,
-  );
-  return { tasks: tasks.map(mapCortexTask) };
+  const [tasks, countRows] = await Promise.all([
+    rows(
+      `SELECT * FROM oms_cortex_tasks WHERE ${filters.join(' AND ')}
+       ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC
+       LIMIT $${values.length}`,
+      values,
+    ),
+    rows(
+      `SELECT COUNT(*)::int AS total FROM oms_cortex_tasks WHERE ${filters.join(' AND ')}`,
+      countValues,
+    ),
+  ]);
+  return { tasks: tasks.map(mapCortexTask), total: number(countRows[0]?.total, 0) };
 }
 
 export async function completeCortexTask(userId: string, taskId: string) {
