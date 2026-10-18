@@ -2377,6 +2377,7 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     labelRuns,
     labelFindings,
     marketplaces,
+    marketplaceApps,
     shipmentPlans,
     asns,
     billing,
@@ -2431,6 +2432,23 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
          FROM marketplace_connections m
         WHERE m.user_id = $1 AND COALESCE(m.metadata->>'source', '') <> 'demo'
         ORDER BY m.updated_at DESC LIMIT 25`,
+      [userId],
+    ).catch(() => []),
+    rows(
+      `SELECT f.id, f.name, f.description, f.category, f.status, f.price, f.payload,
+              uf.status AS user_status, uf.enabled_at,
+              (COALESCE((f.payload->>'isCore')::boolean, false)
+                OR COALESCE((f.payload->>'isStandard')::boolean, false)
+                OR uf.status = 'enabled') AS is_enabled
+         FROM features f
+         LEFT JOIN user_features uf ON uf.feature_id = f.id AND uf.user_id = $1
+        WHERE f.status = 'active'
+          AND COALESCE(
+            (f.payload->>'isMarketplaceApp')::boolean,
+            f.category IN ('marketplace', 'optimization', 'finance', 'audit', 'analytics')
+          )
+        ORDER BY COALESCE((f.payload->>'marketplaceOrder')::int, 999), f.name
+        LIMIT 100`,
       [userId],
     ).catch(() => []),
     rows(
@@ -2520,6 +2538,35 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
         updatedAt: iso(row.updated_at),
       })),
       marketplaceConnections: marketplaces,
+      marketplaceApps: marketplaceApps.map((row: any) => {
+        const payload = json(row.payload, {});
+        const metadata = payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
+        const isStandard = Boolean(payload.isCore || payload.isStandard);
+        const userStatus = row.user_status || (isStandard ? 'enabled' : 'available');
+        return {
+          id: row.id,
+          name: row.name,
+          slug: payload.slug || row.id,
+          description: row.description,
+          category: row.category,
+          status: row.status,
+          price: money(row.price),
+          pricing: payload.pricing || {
+            type: money(row.price) > 0 ? 'subscription' : 'free',
+            amount: money(row.price),
+            currency: 'USD',
+          },
+          isStandard,
+          systemManaged: Boolean(payload.systemManaged || metadata.systemManaged || isStandard),
+          isEnabled: Boolean(isStandard || row.is_enabled || userStatus === 'enabled'),
+          userStatus,
+          enabledAt: iso(row.enabled_at),
+          tags: Array.isArray(payload.tags) ? payload.tags : [],
+          unlockedScreens: payload.unlockedScreens || metadata.unlockedScreens || [],
+          requiredConnections: payload.requiredConnections || metadata.requiredConnections || [],
+          setupSteps: payload.setupSteps || metadata.setupSteps || [],
+        };
+      }),
       shipmentPlans: shipmentPlans.map((row: any) => ({
         ...row,
         item_count: number(row.item_count),
@@ -2545,6 +2592,7 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       { source: 'oms_warehouses', screen: 'warehouses', label: 'Warehouses' },
       { source: 'oms_suppliers', screen: 'suppliers', label: 'Suppliers' },
       { source: 'oms_marketplace_connections', screen: 'connections', label: 'Marketplace connections' },
+      { source: 'oms_marketplace_apps', screen: 'marketplace', label: 'Marketplace apps' },
       { source: 'oms_shipment_plans', screen: 'shipments', label: 'Shipment plans' },
       { source: 'oms_asns', screen: 'shipments', label: 'ASNs' },
       { source: 'oms_label_audits', screen: 'labels', label: 'Label audits' },
@@ -2643,6 +2691,7 @@ const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
   oms_warehouses: { screen: 'warehouses', label: 'Warehouses' },
   oms_suppliers: { screen: 'suppliers', label: 'Suppliers' },
   oms_marketplace_connections: { screen: 'connections', label: 'Marketplace connections' },
+  oms_marketplace_apps: { screen: 'marketplace', label: 'Marketplace apps' },
   oms_shipment_plans: { screen: 'shipments', label: 'Shipment plans' },
   oms_asns: { screen: 'shipments', label: 'ASNs' },
   oms_label_audits: { screen: 'labels', label: 'Label audits' },
@@ -3061,10 +3110,16 @@ async function buildChatFocusContext(
       decisions,
     };
   }
-  if (screen === 'connections' || /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q)) {
-    const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
+  const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
+  const marketplaceAppIntent = screen === 'marketplace'
+    || /\b(marketplace apps?|which apps?|installed apps?|available apps?|install|uninstall|activat(?:e|ed|ion)|gated|unlock|entitlement|subscription)\b/.test(q);
+  const providerHealthIntent = Boolean(requestedMarketplaceChannel)
+    && /\b(work(?:ing)?|down|health|status|sync|connect|permission|inventory|orders?|products?|webhook|repair|reconnect)\b/.test(q);
+  const marketplaceConnectionIntent = screen === 'connections'
+    || /\b(shopify|amazon|ebay|connection|sync|webhook|authorization|permission|reconnect)\b/.test(q);
+  if (marketplaceConnectionIntent && (!marketplaceAppIntent || providerHealthIntent)) {
     const connections = (samples.marketplaceConnections || [])
-      .filter((connection: any) => !requestedChannel || String(connection.channel).toLowerCase() === requestedChannel)
+      .filter((connection: any) => !requestedMarketplaceChannel || String(connection.channel).toLowerCase() === requestedMarketplaceChannel)
       .map((connection: any) => ({
         id: connection.id,
         channel: connection.channel,
@@ -3077,10 +3132,19 @@ async function buildChatFocusContext(
         sync: connection.sync,
       }));
     return {
-      topic: requestedChannel ? `${requestedChannel}_connection_health` : 'marketplace_connection_health',
+      topic: requestedMarketplaceChannel ? `${requestedMarketplaceChannel}_connection_health` : 'marketplace_connection_health',
       instruction: 'Answer the marketplace connection and sync-health question directly from these records before discussing unrelated readiness gaps. State connection status, last sync time, entity counts, every degraded or error state present in sync metadata, and the concrete next repair step when action is required.',
       requiredSource: 'oms_marketplace_connections',
       connections,
+    };
+  }
+  if (marketplaceAppIntent) {
+    return {
+      topic: 'marketplace_apps',
+      instruction: 'Answer from this account\'s Marketplace app catalog and entitlement state first. Clearly distinguish installed, available, gated, system-managed, and connection-dependent apps. Never say an app is active unless isEnabled is true. Explain required connections and unlocked screens in plain language, and recommend activation only when the account has the prerequisite connection or a concrete workflow need.',
+      requiredSource: 'oms_marketplace_apps',
+      apps: samples.marketplaceApps || [],
+      connections: samples.marketplaceConnections || [],
     };
   }
   if (screen === 'labels' || screen === 'audits' || /\b(carrier|label|refund|claim|late delivery|delivery audit)\b/.test(q)) {
@@ -3257,17 +3321,23 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
   const priorityIntent = chatRequestsPriority(message);
   const actionIntent = chatRequestsActions(message) || q.includes('get the account going') || q.includes('start') || q.includes('blocking') || q.includes('confidence') || q.includes('missing');
-  const marketplaceIntent = /(shopify|amazon|ebay|marketplace|connection|sync)/.test(q);
   const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
-  const marketplaceTasks = marketplaceIntent
+  const marketplaceAppIntent = context?.screen === 'marketplace'
+    || /\b(marketplace apps?|which apps?|installed apps?|available apps?|install|uninstall|activat(?:e|ed|ion)|gated|unlock|entitlement|subscription)\b/.test(q);
+  const providerHealthIntent = Boolean(requestedMarketplaceChannel)
+    && /\b(work(?:ing)?|down|health|status|sync|connect|permission|inventory|orders?|products?|webhook|repair|reconnect)\b/.test(q);
+  const marketplaceConnectionIntent = (context?.screen === 'connections'
+    || /\b(shopify|amazon|ebay|connection|sync|webhook|authorization|permission|reconnect)\b/.test(q))
+    && (!marketplaceAppIntent || providerHealthIntent);
+  const marketplaceTasks = marketplaceConnectionIntent
     ? sortedTasks.filter((task: any) => {
         const text = `${task?.stableKey || ''} ${task?.title || ''} ${task?.detail || ''}`.toLowerCase();
         return String(task?.source || '') === 'connection_health'
           && (!requestedMarketplaceChannel || text.includes(requestedMarketplaceChannel));
       })
     : [];
-  const responseTasks = marketplaceIntent ? marketplaceTasks : sortedTasks;
-  const includeMarketplaceRepair = marketplaceIntent && marketplaceTasks.length > 0;
+  const responseTasks = marketplaceConnectionIntent ? marketplaceTasks : sortedTasks;
+  const includeMarketplaceRepair = marketplaceConnectionIntent && marketplaceTasks.length > 0;
 
   if (chatRequestsDecision(message)) {
     const decision = decisionRecommendations[0];
@@ -3280,7 +3350,26 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       lines.push(`Expected impact: ${chatDecisionImpact(decision.estimatedImpact || {})}.`);
       lines.push('Open Current vs Suggested Decisions to compare the recorded current state, proposed change, and impact before accepting or denying it.');
     }
-  } else if (marketplaceIntent) {
+  } else if (marketplaceAppIntent && !marketplaceConnectionIntent) {
+    const apps = Array.isArray(samples.marketplaceApps) ? samples.marketplaceApps : [];
+    const installed = apps.filter((app: any) => Boolean(app?.isEnabled));
+    const available = apps.filter((app: any) => !app?.isEnabled);
+    lines.push(`Marketplace status: ${chatPlural(installed.length, 'app')} installed and ${chatPlural(available.length, 'app')} available.`);
+    if (installed.length) {
+      lines.push(`Installed: ${installed.slice(0, 12).map((app: any) => `${app.name}${app.systemManaged ? ' (managed)' : ''}`).join(', ')}.`);
+    }
+    if (available.length) {
+      lines.push(`Available: ${available.slice(0, 12).map((app: any) => {
+        const required = Array.isArray(app.requiredConnections) ? app.requiredConnections.map((item: any) => String(item)) : [];
+        return `${app.name}${required.length ? ` (needs ${required.join('; ')})` : ''}`;
+      }).join(', ')}.`);
+    }
+    const gated = available.filter((app: any) => Array.isArray(app.unlockedScreens) && app.unlockedScreens.length > 0);
+    if (gated.length) {
+      lines.push(`Gated until activation: ${gated.slice(0, 12).map((app: any) => `${app.name} unlocks ${app.unlockedScreens.join(', ')}`).join('; ')}.`);
+    }
+    lines.push('Only apps marked installed are active for this account. Managed apps remain available as built-in services and cannot be disabled by a normal user.');
+  } else if (marketplaceConnectionIntent) {
     const requestedChannel = requestedMarketplaceChannel;
     const connections = (Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections : [])
       .filter((connection: any) => !requestedChannel || String(connection?.channel || '').toLowerCase() === requestedChannel);
@@ -3370,9 +3459,11 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       { source: 'oms_cortex_tasks', count: tasks.length },
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
+      ...(marketplaceAppIntent ? [{ source: 'oms_marketplace_apps', count: Array.isArray(samples.marketplaceApps) ? samples.marketplaceApps.length : 0 }] : []),
+      ...(marketplaceConnectionIntent ? [{ source: 'oms_marketplace_connections', count: Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections.length : 0 }] : []),
     ],
     tasks: actionIntent || includeMarketplaceRepair
-      ? responseTasks.slice(0, marketplaceIntent || priorityIntent ? 1 : 3).map((task: any) => ({
+      ? responseTasks.slice(0, marketplaceConnectionIntent || priorityIntent ? 1 : 3).map((task: any) => ({
           id: task.id,
           title: task.title,
           priority: task.priority,
