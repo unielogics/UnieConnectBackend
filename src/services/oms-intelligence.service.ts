@@ -2209,7 +2209,7 @@ export async function refreshCortexTasks(userId: string) {
         AND recommendation_type IN ('data_enrichment', 'data_readiness')`,
     [userId],
   ).catch(() => null);
-  const [readiness, recs, marketplaceConnections] = await Promise.all([
+  const [readiness, recs, marketplaceConnections, businessDouble] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { status: 'open', limit: 100 }),
     rows(
@@ -2226,6 +2226,7 @@ export async function refreshCortexTasks(userId: string) {
         WHERE m.user_id = $1 AND COALESCE(m.metadata->>'source', '') <> 'demo'`,
       [userId],
     ).catch(() => []),
+    getBusinessDouble(userId).catch(() => null),
   ]);
   const activeKeys = new Set<string>();
 
@@ -2327,12 +2328,74 @@ export async function refreshCortexTasks(userId: string) {
     });
   }
 
+  const plan = businessDouble?.plan;
+  if (plan?.modelStatus === 'modeled' && plan?.decisionReady !== true) {
+    const grounding = json(plan?.grounding, {});
+    const observedMonthlyCost = number(grounding.observedMonthlyCost);
+    const modelBaselineMonthlyCost = number(grounding.modelBaselineMonthlyCost);
+    const connectedWarehouseNodes = number(grounding.connectedWarehouseNodes);
+    const modelBaselineWarehouseNodes = number(grounding.modelBaselineWarehouseNodes);
+    const costMismatch = observedMonthlyCost <= 0
+      || modelBaselineMonthlyCost <= 0
+      || Number(grounding.costVariancePct || 0) > 20;
+    const warehouseMismatch = connectedWarehouseNodes <= 0
+      || modelBaselineWarehouseNodes <= 0
+      || connectedWarehouseNodes !== modelBaselineWarehouseNodes;
+
+    if (costMismatch) {
+      const dedupeKey = 'business-double:billing-baseline';
+      activeKeys.add(dedupeKey);
+      await upsertCortexTask(userId, {
+        dedupeKey,
+        source: 'readiness',
+        screen: 'billing',
+        entityType: 'business_double',
+        entityId: plan.id,
+        title: 'Reconcile the AI plan cost baseline',
+        detail: `The latest model used ${modelBaselineMonthlyCost > 0 ? `$${modelBaselineMonthlyCost.toFixed(2)}` : 'an incomplete amount'} in monthly cost, while current 30-day billing shows ${observedMonthlyCost > 0 ? `$${observedMonthlyCost.toFixed(2)}` : 'no complete cost baseline'}. Review billing evidence, then rerun optimization.`,
+        priority: 'high',
+        actionLabel: 'Review billing evidence',
+        actionTarget: 'billing',
+        evidence: {
+          planId: plan.id,
+          observedMonthlyCost,
+          modelBaselineMonthlyCost,
+          costVariancePct: grounding.costVariancePct ?? null,
+          impactStatus: plan.impactStatus,
+        },
+      });
+    }
+
+    if (warehouseMismatch) {
+      const dedupeKey = 'business-double:warehouse-baseline';
+      activeKeys.add(dedupeKey);
+      await upsertCortexTask(userId, {
+        dedupeKey,
+        source: 'readiness',
+        screen: 'double',
+        entityType: 'business_double',
+        entityId: plan.id,
+        title: 'Refresh the AI plan with current warehouse truth',
+        detail: `The latest model used ${modelBaselineWarehouseNodes || 'no confirmed'} warehouse${modelBaselineWarehouseNodes === 1 ? '' : 's'}, while the account currently has ${connectedWarehouseNodes} connected. Confirm the connections and rerun optimization before approving the plan.`,
+        priority: 'high',
+        actionLabel: 'Open Business Double',
+        actionTarget: 'double',
+        evidence: {
+          planId: plan.id,
+          connectedWarehouseNodes,
+          modelBaselineWarehouseNodes,
+          impactStatus: plan.impactStatus,
+        },
+      });
+    }
+  }
+
   const autoCompleted = await pgQuery(
     `UPDATE oms_cortex_tasks
      SET status = 'done', completed_at = COALESCE(completed_at, now()), auto_completed_at = COALESCE(auto_completed_at, now()), updated_at = now()
      WHERE user_id = $1 AND status = 'open' AND dedupe_key LIKE ANY($2::text[]) AND NOT (dedupe_key = ANY($3::text[]))
      RETURNING id, entity_type, entity_id, title, source, dedupe_key`,
-    [userId, ['readiness:%', 'recommendation:%', 'work:%', 'connection:%'], Array.from(activeKeys)],
+    [userId, ['readiness:%', 'recommendation:%', 'work:%', 'connection:%', 'business-double:%'], Array.from(activeKeys)],
   ).catch(() => null);
   for (const task of autoCompleted?.rows || []) {
     await writeOmsLedgerEvent({
