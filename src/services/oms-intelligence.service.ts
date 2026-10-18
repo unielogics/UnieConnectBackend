@@ -3141,7 +3141,7 @@ async function buildChatFocusContext(
   if (marketplaceAppIntent) {
     return {
       topic: 'marketplace_apps',
-      instruction: 'Answer from this account\'s Marketplace app catalog and entitlement state first. Clearly distinguish installed, available, gated, system-managed, and connection-dependent apps. Never say an app is active unless isEnabled is true. Explain required connections and unlocked screens in plain language, and recommend activation only when the account has the prerequisite connection or a concrete workflow need.',
+      instruction: 'Answer from this account\'s Marketplace app catalog and entitlement state first. Clearly distinguish installed, available, gated, system-managed, and connection-dependent apps. isEnabled is authoritative: never recommend installing or activating an app when isEnabled is true. A connected provider remains connected even when one data area is degraded. If every app is enabled, say that no app activation is needed and recommend the most relevant repair or workflow instead. Explain required connections and unlocked screens in plain language, and recommend activation only when isEnabled is false and the account has the prerequisite connection or a concrete workflow need.',
       requiredSource: 'oms_marketplace_apps',
       apps: samples.marketplaceApps || [],
       connections: samples.marketplaceConnections || [],
@@ -3664,6 +3664,46 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const normalized = accountGroundedFastPath
     ? fallback
     : normalizeCortexChatResponse(cortex, fallback, actionIntent);
+  if (String(focusContext?.topic || '') === 'marketplace_apps') {
+    const apps = Array.isArray(focusContext?.apps) ? focusContext.apps : [];
+    const enabledApps = apps.filter((app: any) => Boolean(app?.isEnabled));
+    const allAppsEnabled = apps.length > 0 && enabledApps.length === apps.length;
+    const recommendationIntent = /(should|recommend|prioriti[sz]e|next|best|most value|worth)/i.test(message);
+    const contradictsEntitlements = allAppsEnabled
+      && /(activat(?:e|ion)|install|not enabled|establish a connection|connect to at least one)/i.test(normalized.answer);
+    if (allAppsEnabled && (recommendationIntent || contradictsEntitlements)) {
+      const connectionRepair = (Array.isArray(context?.tasks) ? context.tasks : []).find((task: any) => {
+        const text = `${task?.title || ''} ${task?.detail || ''}`.toLowerCase();
+        return String(task?.source || '') === 'connection_health' && /(shopify|amazon|ebay|marketplace)/.test(text);
+      });
+      const installedNames = enabledApps.map((app: any) => app.name).filter(Boolean).join(', ');
+      const lines = [
+        `No Marketplace app needs installation or activation. All ${enabledApps.length} apps are already active: ${installedNames}.`,
+      ];
+      if (connectionRepair) {
+        lines.push(`The next priority is connection quality, not another app: ${humanizeInternalLanguage(connectionRepair.title)}.`);
+        if (connectionRepair.detail) lines.push(humanizeInternalLanguage(connectionRepair.detail));
+        if (connectionRepair.actionLabel) lines.push(`Next action: ${humanizeInternalLanguage(connectionRepair.actionLabel)}.`);
+      } else {
+        lines.push('Choose the installed app that matches the workflow you want to run; activation is not blocking any Marketplace screen on this account.');
+      }
+      normalized.answer = polishCortexChatText(lines.join('\n\n'));
+      normalized.sources = [normalizeChatSource({ source: 'oms_marketplace_apps' })].filter(Boolean);
+      normalized.tasks = connectionRepair && actionIntent
+        ? [normalizeChatAction({
+            id: connectionRepair.id,
+            title: connectionRepair.title,
+            priority: connectionRepair.priority,
+            screen: connectionRepair.screen,
+            actionTarget: connectionRepair.actionTarget || connectionRepair.screen,
+            actionLabel: connectionRepair.actionLabel,
+            entityId: connectionRepair.entityId,
+          })].filter(Boolean)
+        : [];
+      normalized.confidence = 1;
+      normalized.readinessNotes = null;
+    }
+  }
   const decisionIntent = chatRequestsDecision(message);
   if (decisionIntent) {
     normalized.answer = fallback.answer;
