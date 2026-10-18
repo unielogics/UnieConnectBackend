@@ -3988,6 +3988,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             .filter((token) => token.length > 3 && !['open', 'review', 'complete', 'related', 'screen'].includes(token)));
           const candidates = contextTasks
             .filter((task: any) => {
+              const taskTarget = String(task.actionTarget || task.screen || '');
+              if (actionTarget && taskTarget && taskTarget !== actionTarget) return false;
               if (actionTarget !== 'connections' || !requestedChannel) return true;
               const text = `${task.dedupeKey || ''} ${task.title || ''} ${task.detail || ''}`.toLowerCase();
               return String(task.source || '') === 'connection_health' && text.includes(requestedChannel);
