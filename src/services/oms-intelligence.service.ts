@@ -4172,14 +4172,15 @@ function buildGroundedOrderPriorityResponse(message: string, context: any, focus
   return {
     answer: polishCortexChatText(lines.join('\n\n')),
     sources: [{ source: 'oms_orders', count: ranked.length, selectedOrder: label }],
-    tasks: chatRequestsActions(message) ? [{
+    tasks: [{
       title: `Review ${label}`,
       priority: 'high',
       screen: 'orders',
       actionTarget: 'orders',
       actionLabel: 'Open order',
+      entityType: 'order',
       entityId: order.id,
-    }] : [],
+    }],
     confidence: 0.96,
     readinessNotes: null,
   };
@@ -4241,14 +4242,15 @@ function buildGroundedWarehouseRiskResponse(message: string, context: any, focus
   return {
     answer: polishCortexChatText(lines.join('\n\n')),
     sources: [{ source: 'oms_warehouses', count: ranked.length, selectedWarehouse: code }],
-    tasks: chatRequestsActions(message) ? [{
+    tasks: [{
       title: `Review ${code}`,
       priority: selected.disconnected ? 'high' : 'normal',
       screen: 'warehouses',
       actionTarget: 'warehouses',
       actionLabel: 'Open warehouse',
+      entityType: 'warehouse',
       entityId: code,
-    }] : [],
+    }],
     confidence: 0.96,
     readinessNotes: null,
   };
