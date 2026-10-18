@@ -3064,6 +3064,100 @@ function chatRequestsDecision(message: string) {
   return /\b(current\s+(?:vs\.?|versus)\s+(?:suggested|optimized)|decision|approval|approve|accept|deny|decline)\b/i.test(message);
 }
 
+function chatRequestsAiPlanApproval(message: string) {
+  const q = String(message || '');
+  const namesPlan = /\b(ai plan|business double|six[- ]month (?:multi[- ]warehouse |operating )?plan|optimized business plan)\b/i.test(q);
+  const asksApproval = /\b(approv(?:e|al|able)|accept|decision[- ]ready|blocked|blocking|cannot|can't|can not|not ready|make it ready|what (?:should|can|do) (?:i|we))\b/i.test(q);
+  return namesPlan && asksApproval;
+}
+
+function buildGroundedAiPlanApprovalResponse(context: any, focusContext: any) {
+  const businessDouble = focusContext?.businessDouble || {};
+  const plan = businessDouble?.plan || {};
+  const grounding = json(plan?.grounding, {});
+  const observedMonthlyCost = money(grounding.observedMonthlyCost);
+  const modelBaselineMonthlyCost = money(grounding.modelBaselineMonthlyCost);
+  const connectedWarehouseNodes = number(grounding.connectedWarehouseNodes);
+  const modelBaselineWarehouseNodes = number(grounding.modelBaselineWarehouseNodes);
+  const costVariancePct = Number.isFinite(Number(grounding.costVariancePct))
+    ? Math.round(Number(grounding.costVariancePct) * 100) / 100
+    : null;
+  const planTasks = (Array.isArray(context?.tasks) ? context.tasks : [])
+    .filter((task: any) => [
+      'business-double:billing-baseline',
+      'business-double:warehouse-baseline',
+    ].includes(String(task?.dedupeKey || '')))
+    .sort((a: any, b: any) => String(a.dedupeKey).localeCompare(String(b.dedupeKey)));
+
+  if (plan?.decisionReady === true) {
+    return {
+      answer: [
+        'The AI Plan is ready for review and approval because its cost and warehouse baselines match current account evidence.',
+        'Open Business Double to compare the observed current state, the proposed operating plan, and the traceable impact before making the decision.',
+      ].join('\n\n'),
+      sources: [
+        { source: 'oms_business_double' },
+        { source: 'oms_billing' },
+        { source: 'oms_warehouses' },
+      ],
+      tasks: [],
+      confidence: 1,
+      readinessNotes: null,
+    };
+  }
+
+  if (String(plan?.modelStatus || '') !== 'modeled') {
+    return {
+      answer: [
+        'The AI Plan cannot be approved yet because Cortex has not produced a complete modeled plan for this account.',
+        'Complete the plan readiness work, then rerun Business Double. Approval becomes available only when the proposed results can be compared with current billing and connected warehouse evidence.',
+      ].join('\n\n'),
+      sources: [{ source: 'oms_business_double' }, { source: 'oms_cortex_tasks' }],
+      tasks: planTasks,
+      confidence: 0.95,
+      readinessNotes: 'Approval remains unavailable until a grounded plan is modeled.',
+    };
+  }
+
+  const costDifference = Math.abs(modelBaselineMonthlyCost - observedMonthlyCost);
+  const costMismatch = observedMonthlyCost <= 0
+    || modelBaselineMonthlyCost <= 0
+    || (costVariancePct != null && costVariancePct > 20);
+  const warehouseMismatch = connectedWarehouseNodes <= 0
+    || modelBaselineWarehouseNodes <= 0
+    || connectedWarehouseNodes !== modelBaselineWarehouseNodes;
+  const formatUsd = (value: number) => `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const reasons: string[] = [];
+  if (costMismatch) {
+    reasons.push(
+      observedMonthlyCost > 0 && modelBaselineMonthlyCost > 0
+        ? `Cost baseline: the model used ${formatUsd(modelBaselineMonthlyCost)} per month, while the latest 30 days of observed billing total ${formatUsd(observedMonthlyCost)}. That is a ${formatUsd(costDifference)} difference${costVariancePct == null ? '' : ` (${costVariancePct.toFixed(2)}%)`}, so projected savings are not traceable yet.`
+        : 'Cost baseline: complete observed billing and modeled monthly cost are not both available, so projected savings cannot be verified.',
+    );
+  }
+  if (warehouseMismatch) {
+    reasons.push(
+      `Warehouse baseline: the model used ${modelBaselineWarehouseNodes || 'no confirmed'} warehouse${modelBaselineWarehouseNodes === 1 ? '' : 's'}, while the account currently has ${connectedWarehouseNodes} connected. The network assumptions must match before the routing and savings proposal can be approved.`,
+    );
+  }
+
+  return {
+    answer: [
+      'The AI Plan is modeled, but approval is blocked because its operating baseline does not match current account evidence.',
+      ...reasons,
+      'Next steps: review the billing evidence, then rerun Business Double using the current connected warehouse network. Once both baselines reconcile, Cortex can present traceable improvements for approval.',
+    ].join('\n\n'),
+    sources: [
+      { source: 'oms_business_double' },
+      { source: 'oms_billing' },
+      { source: 'oms_warehouses' },
+    ],
+    tasks: planTasks,
+    confidence: 0.99,
+    readinessNotes: 'Approval remains blocked until the cost and warehouse baselines reconcile with current account evidence.',
+  };
+}
+
 function chatRecommendationIsDecision(rec: any) {
   const state = String(rec?.approvalState || '').toLowerCase();
   const type = String(rec?.recommendationType || '').toLowerCase();
@@ -3358,7 +3452,7 @@ async function buildChatFocusContext(
   const q = String(message || '').toLowerCase();
   const samples = context?.samples || {};
   const resolvedEntities = await resolveChatEntities(userId, [message, entityId].filter(Boolean).join(' '));
-  if (screen === 'double' || /\b(business double|six[- ]month (?:operating )?plan|optimized business plan)\b/.test(q)) {
+  if (screen === 'double' || chatRequestsAiPlanApproval(message) || /\b(business double|six[- ]month (?:operating )?plan|optimized business plan)\b/.test(q)) {
     const businessDouble = await getBusinessDouble(userId).catch(() => null);
     return {
       topic: 'business_double',
@@ -4505,6 +4599,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const accountPriorityQuestion = priorityIntent
     && (screen === 'command' || /\b(account|operational|issue|blocker|risk)\b/i.test(message));
   const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
+  const aiPlanApprovalQuestion = chatRequestsAiPlanApproval(focusQuery);
   const connectionScreenHealthQuestion = screen === 'connections'
     && ['shopify', 'amazon', 'ebay'].some((channel) => focusQuery.toLowerCase().includes(channel))
     && /(working|works?|healthy|health|down|degraded|status|happening|exactly|what does not)/i.test(message);
@@ -4517,7 +4612,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || marketplaceInstalledRecommendation
     || accountSnapshotQuestion
     || accountPriorityQuestion
-    || operationalRoadmapQuestion;
+    || operationalRoadmapQuestion
+    || aiPlanApprovalQuestion;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
@@ -4655,8 +4751,16 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       normalized.readinessNotes = null;
     }
   }
+  if (aiPlanApprovalQuestion) {
+    const groundedAiPlan = buildGroundedAiPlanApprovalResponse(context, focusContext);
+    normalized.answer = groundedAiPlan.answer;
+    normalized.sources = groundedAiPlan.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedAiPlan.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedAiPlan.confidence;
+    normalized.readinessNotes = groundedAiPlan.readinessNotes;
+  }
   const decisionIntent = chatRequestsDecision(message);
-  if (decisionIntent) {
+  if (decisionIntent && !aiPlanApprovalQuestion) {
     normalized.answer = fallback.answer;
     normalized.sources = fallback.sources.map(normalizeChatSource).filter(Boolean);
     normalized.tasks = [];
@@ -4753,7 +4857,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.answer = fallback.answer;
   }
   const requiredFocusSource = normalizeChatSource({ source: focusContext?.requiredSource });
-  if (requiredFocusSource && !chatRequestsOperationalRoadmap(focusQuery)) {
+  if (requiredFocusSource && !chatRequestsOperationalRoadmap(focusQuery) && !aiPlanApprovalQuestion) {
     const focusedSources = normalized.sources.filter((source: any) => source?.source === requiredFocusSource.source);
     normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
