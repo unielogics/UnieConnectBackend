@@ -3,7 +3,7 @@ import { config } from '../config/env';
 import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
 import { getCortexCredentialHeaders } from './cortex-credentials.service';
-import { getBusinessDouble, getInventoryPlan, writeOmsLedgerEvent, getBillingCategoryTotals, getStorageBillingSignal } from './oms-production.service';
+import { getBusinessDouble, getInventoryPlan, getWarehouseOverview, writeOmsLedgerEvent, getBillingCategoryTotals, getStorageBillingSignal } from './oms-production.service';
 import { lookupProductByIdentifier, type KeepaLookupResult } from './keepa-lookup.service';
 import fetch from 'node-fetch';
 
@@ -2430,8 +2430,17 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
         LIMIT 250`,
       [userId],
     ).catch(() => []),
-    rows(`SELECT id, order_number, channel, status, totals, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
-    rows(`SELECT warehouse_code, status, facility_id, metadata, connected_at FROM oms_warehouse_links WHERE user_id = $1 ORDER BY connected_at DESC NULLS LAST LIMIT 25`, [userId]).catch(() => []),
+    rows(
+      `SELECT id, order_number, external_order_id, channel, status, paid, totals,
+              shipping_address, tracking_number, service_level, ship_by_date,
+              metadata, placed_at, created_at, updated_at
+         FROM orders
+        WHERE user_id = $1
+        ORDER BY COALESCE(placed_at, created_at) DESC NULLS LAST
+        LIMIT 250`,
+      [userId],
+    ).catch(() => []),
+    getWarehouseOverview(userId).then((result) => result.warehouses).catch(() => []),
     rows(`SELECT id, name, status, email, metadata, updated_at FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(
       `SELECT c.id, c.name, c.company, c.channel, c.updated_at,
@@ -2550,11 +2559,20 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       orders: orders.map((r) => ({
         id: r.id,
         orderNumber: r.order_number,
+        externalOrderId: r.external_order_id,
         channel: r.channel,
         status: r.status,
+        paymentStatus: r.paid,
         total: money(r.totals?.total ?? r.totals?.grandTotal ?? r.totals?.price ?? r.totals?.amount),
         currency: r.totals?.currency || r.totals?.currencyCode || 'USD',
         state: r.shipping_address?.state || r.shipping_address?.province || null,
+        trackingNumber: r.tracking_number,
+        serviceLevel: r.service_level,
+        shipByDate: iso(r.ship_by_date),
+        placedAt: iso(r.placed_at),
+        createdAt: iso(r.created_at),
+        updatedAt: iso(r.updated_at),
+        metadata: json(r.metadata, {}),
       })),
       warehouses,
       suppliers,
@@ -3571,6 +3589,173 @@ function buildGroundedSkuOpportunityFollowup(message: string, context: any, focu
   };
 }
 
+function chatRequestsOrderPriority(message: string) {
+  const q = String(message || '').toLowerCase();
+  return /\border(?:s)?\b/.test(q)
+    && /\b(attention|priority|prioriti[sz]e|first|risk|urgent|problem|exception|blocked|stuck)\b/.test(q);
+}
+
+function chatRequestsWarehouseRisk(message: string) {
+  const q = String(message || '').toLowerCase();
+  return /\b(warehouse|warehouses|facility|facilities)\b/.test(q)
+    && /\b(highest|biggest|most|first|risk|attention|problem|issue|blocked|stuck)\b/.test(q);
+}
+
+function ageInDays(value: any) {
+  const timestamp = value ? new Date(value).getTime() : Number.NaN;
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.max(0, Math.floor((Date.now() - timestamp) / 86_400_000));
+}
+
+function rankedOrderAttentionCandidates(context: any, focusContext?: any) {
+  const orders = Array.isArray(focusContext?.orders) && focusContext.orders.length
+    ? focusContext.orders
+    : Array.isArray(context?.samples?.orders) ? context.samples.orders : [];
+  return orders.map((order: any, index: number) => {
+    const status = String(order?.status || 'unknown').toLowerCase().replace(/[\s-]+/g, '_');
+    const paymentStatus = String(order?.paymentStatus || order?.paid || '').toLowerCase();
+    const metadata = json(order?.metadata, {});
+    const raw = json(metadata?.raw, {});
+    const explicitlyHeld = Boolean(metadata?.wmsHold?.held || raw?.held || status === 'hold' || status === 'on_hold');
+    const terminal = ['delivered', 'completed', 'complete', 'shipped', 'fulfilled', 'cancelled', 'canceled', 'refunded', 'closed'].includes(status)
+      || ['refunded', 'voided'].includes(paymentStatus)
+      || Boolean(raw?.cancelled_at || raw?.closed_at);
+    const exception = /failed|exception|backorder|blocked/.test(status);
+    const open = /pending|open|new|packing|picking|processing|unfulfilled|partial/.test(status);
+    const shipBy = order?.shipByDate ? new Date(order.shipByDate).getTime() : Number.NaN;
+    const overdue = !terminal && Number.isFinite(shipBy) && shipBy < Date.now();
+    const staleDays = ageInDays(order?.updatedAt || order?.placedAt || order?.createdAt);
+    const missingTrackingAfterShipment = ['shipped', 'fulfilled'].includes(status) && !order?.trackingNumber;
+    const score = (explicitlyHeld ? 140 : 0)
+      + (exception ? 120 : 0)
+      + (overdue ? 100 : 0)
+      + (open && !terminal ? 45 : 0)
+      + (missingTrackingAfterShipment ? 70 : 0)
+      + (!terminal && staleDays != null ? Math.min(60, staleDays) : 0)
+      + (!terminal ? Math.min(12, Math.log10(Math.max(1, number(order?.total))) * 3) : 0);
+    return { order, status, paymentStatus, explicitlyHeld, terminal, exception, open, overdue, staleDays, missingTrackingAfterShipment, score, index };
+  }).sort((a: any, b: any) => b.score - a.score || a.index - b.index);
+}
+
+function buildGroundedOrderPriorityResponse(message: string, context: any, focusContext?: any) {
+  const ranked = rankedOrderAttentionCandidates(context, focusContext);
+  const selected = ranked.find((candidate: any) => candidate.score > 0 && !candidate.terminal);
+  if (!selected) {
+    return {
+      answer: 'I do not see an open order with enough exception, hold, deadline, or stale-status evidence to rank as needing attention first.',
+      sources: [{ source: 'oms_orders', count: ranked.length }],
+      tasks: [],
+      confidence: 0.92,
+      readinessNotes: 'Order value alone is not treated as evidence that an order needs attention.',
+    };
+  }
+  const order = selected.order;
+  const label = String(order?.orderNumber || order?.externalOrderId || publicEntityId('OR', order?.id || 'order'));
+  const reasons: string[] = [];
+  if (selected.explicitlyHeld) reasons.push('the WMS evidence marks it as held');
+  if (selected.exception) reasons.push(`its current status is ${selected.status.replace(/_/g, ' ')}`);
+  else if (selected.open) reasons.push(`it remains ${selected.status.replace(/_/g, ' ')}`);
+  if (selected.overdue) reasons.push(`its ship-by date of ${humanizeCortexTimestamp(order.shipByDate)} has passed`);
+  if (selected.staleDays != null && selected.staleDays > 1) reasons.push(`it has not changed for ${selected.staleDays} days`);
+  if (selected.missingTrackingAfterShipment) reasons.push('shipment status is present but tracking evidence is missing');
+  const missingEvidence = [
+    !order?.shipByDate ? 'ship-by date' : null,
+    !order?.serviceLevel ? 'service level' : null,
+    !order?.trackingNumber ? 'tracking number' : null,
+  ].filter(Boolean);
+  const lines = [
+    `${label} needs attention first because ${reasons.join('; ')}.`,
+    `Current evidence: ${String(order?.channel || 'unknown')} channel, ${selected.status.replace(/_/g, ' ')} status${number(order?.total) > 0 ? `, $${money(order.total).toFixed(2)} recorded order value` : ', no reliable order value recorded'}.`,
+    'What can improve: release time, backlog age, and fulfillment SLA can be measured once the hold or exception is resolved.',
+    missingEvidence.length
+      ? `Missing evidence: ${missingEvidence.join(', ')}.`
+      : 'The core timing and tracking evidence is present.',
+  ];
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{ source: 'oms_orders', count: ranked.length, selectedOrder: label }],
+    tasks: chatRequestsActions(message) ? [{
+      title: `Review ${label}`,
+      priority: 'high',
+      screen: 'orders',
+      actionTarget: 'orders',
+      actionLabel: 'Open order',
+      entityId: order.id,
+    }] : [],
+    confidence: 0.96,
+    readinessNotes: null,
+  };
+}
+
+function rankedWarehouseRiskCandidates(context: any, focusContext?: any) {
+  const warehouses = Array.isArray(focusContext?.warehouses) && focusContext.warehouses.length
+    ? focusContext.warehouses
+    : Array.isArray(context?.samples?.warehouses) ? context.samples.warehouses : [];
+  return warehouses.map((warehouse: any, index: number) => {
+    const status = String(warehouse?.status || 'unknown').toLowerCase().replace(/[\s-]+/g, '_');
+    const inventoryUnits = number(warehouse?.inventoryUnits);
+    const activeSkus = number(warehouse?.activeSkus);
+    const orders = number(warehouse?.orders);
+    const asns = number(warehouse?.asns);
+    const lastEvent = warehouse?.lastWmsEventAt || warehouse?.lastWmsEvent;
+    const disconnected = !['connected', 'active', 'healthy'].includes(status);
+    const inboundWithoutInventoryTruth = asns > 0 && inventoryUnits <= 0 && activeSkus <= 0;
+    const score = (disconnected ? 120 : 0)
+      + (!lastEvent ? 45 : Math.min(30, ageInDays(lastEvent) || 0))
+      + (inboundWithoutInventoryTruth ? 80 : 0)
+      + (inventoryUnits <= 0 ? 15 : 0)
+      + (activeSkus <= 0 ? 10 : 0)
+      + (orders <= 0 && asns > 0 ? 8 : 0);
+    return { warehouse, status, inventoryUnits, activeSkus, orders, asns, lastEvent, disconnected, inboundWithoutInventoryTruth, score, index };
+  }).sort((a: any, b: any) => b.score - a.score || a.index - b.index);
+}
+
+function buildGroundedWarehouseRiskResponse(message: string, context: any, focusContext?: any) {
+  const ranked = rankedWarehouseRiskCandidates(context, focusContext);
+  const selected = ranked[0];
+  if (!selected) {
+    return {
+      answer: 'I cannot rank warehouse risk because this account has no connected warehouse evidence.',
+      sources: [{ source: 'oms_warehouses', count: 0 }],
+      tasks: [],
+      confidence: 0.95,
+      readinessNotes: 'Connect a warehouse before asking Cortex to compare warehouse operations.',
+    };
+  }
+  const warehouse = selected.warehouse;
+  const code = String(warehouse?.warehouseCode || warehouse?.warehouse_code || warehouse?.code || 'Warehouse');
+  const name = String(warehouse?.name || warehouse?.facilityName || '').trim();
+  const reasons: string[] = [];
+  if (selected.disconnected) reasons.push(`its connection state is ${selected.status.replace(/_/g, ' ')}`);
+  if (!selected.lastEvent) reasons.push('no WMS event timestamp is available');
+  if (selected.inboundWithoutInventoryTruth) reasons.push(`${selected.asns} ASN${selected.asns === 1 ? '' : 's'} are associated with it while inventory and active SKU counts are both zero`);
+  else {
+    if (selected.inventoryUnits <= 0) reasons.push('no inventory units are reported');
+    if (selected.activeSkus <= 0) reasons.push('no active SKUs are reported');
+  }
+  if (!reasons.length) reasons.push('it has the weakest recency and activity evidence among the connected warehouses');
+  const lines = [
+    `${code}${name ? ` (${name})` : ''} has the highest evidence-backed monitoring risk among ${ranked.length} connected warehouse${ranked.length === 1 ? '' : 's'}.`,
+    `Why: ${reasons.join('; ')}.`,
+    `Current evidence: ${selected.inventoryUnits} inventory units, ${selected.activeSkus} active SKUs, ${selected.orders} related orders, and ${selected.asns} ASN${selected.asns === 1 ? '' : 's'}.`,
+    'This is a reconciliation warning, not proof that the warehouse is offline. Confirm the latest WMS event and inbound receipt state before changing routing or inventory placement.',
+  ];
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{ source: 'oms_warehouses', count: ranked.length, selectedWarehouse: code }],
+    tasks: chatRequestsActions(message) ? [{
+      title: `Review ${code}`,
+      priority: selected.disconnected ? 'high' : 'normal',
+      screen: 'warehouses',
+      actionTarget: 'warehouses',
+      actionLabel: 'Open warehouse',
+      entityId: code,
+    }] : [],
+    confidence: 0.96,
+    readinessNotes: null,
+  };
+}
+
 function buildLocalCortexChatFallback(message: string, context: any, focusContext?: any, intentMessage = message): {
   answer: string;
   sources: any[];
@@ -3581,6 +3766,12 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
   const q = String(message || '').toLowerCase();
   if (chatRequestsSkuOpportunityRanking(message)) {
     return buildGroundedSkuOpportunityResponse(message, context, focusContext);
+  }
+  if (chatRequestsOrderPriority(message)) {
+    return buildGroundedOrderPriorityResponse(intentMessage, context, focusContext);
+  }
+  if (chatRequestsWarehouseRisk(message)) {
+    return buildGroundedWarehouseRiskResponse(intentMessage, context, focusContext);
   }
   const readiness = context?.readiness || {};
   const counts = readiness.counts || {};
@@ -3986,6 +4177,22 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       normalized.readinessNotes = groundedSkuOpportunity.readinessNotes;
     }
   }
+  if (chatRequestsOrderPriority(focusQuery)) {
+    const groundedOrderPriority = buildGroundedOrderPriorityResponse(message, context, focusContext);
+    normalized.answer = groundedOrderPriority.answer;
+    normalized.sources = groundedOrderPriority.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedOrderPriority.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedOrderPriority.confidence;
+    normalized.readinessNotes = groundedOrderPriority.readinessNotes;
+  }
+  if (chatRequestsWarehouseRisk(focusQuery)) {
+    const groundedWarehouseRisk = buildGroundedWarehouseRiskResponse(message, context, focusContext);
+    normalized.answer = groundedWarehouseRisk.answer;
+    normalized.sources = groundedWarehouseRisk.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedWarehouseRisk.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedWarehouseRisk.confidence;
+    normalized.readinessNotes = groundedWarehouseRisk.readinessNotes;
+  }
   if (String(focusContext?.topic || '') === 'marketplace_apps') {
     const apps = Array.isArray(focusContext?.apps) ? focusContext.apps : [];
     const enabledApps = apps.filter((app: any) => Boolean(app?.isEnabled));
@@ -4057,6 +4264,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     }
     normalized.tasks = normalized.tasks.map((action: any) => {
       const actionTarget = String(action.actionTarget || action.screen || '');
+      if (action.entityId && ['sku-detail', 'orders', 'warehouses'].includes(actionTarget)) return action;
       const matchingTask = contextTasks.find((task: any) => String(task.id || '') === String(action.id || ''))
         || (() => {
           const actionTokens = new Set(`${action.title || ''} ${action.actionLabel || ''}`
