@@ -18,6 +18,8 @@ type CortexPostOptions = {
   idempotencyKey?: string;
   extraHeaders?: Record<string, string>;
   allowGlobalApiKey?: boolean;
+  timeoutMs?: number;
+  maxAttempts?: number;
 };
 
 function deriveCortexUserId(payload: any, options?: CortexPostOptions): string | null {
@@ -88,11 +90,11 @@ function isForegroundPricingPath(path: string): boolean {
     || path === '/v1/oms/sku-fulfillment-economics';
 }
 
-async function fetchWithTimeout(url: string, init: any): Promise<{ res: any; text: string }> {
+async function fetchWithTimeout(url: string, init: any, timeoutMs = READ_TIMEOUT_MS): Promise<{ res: any; text: string }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), READ_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res: any = await fetch(url, { ...init, signal: controller.signal, timeout: READ_TIMEOUT_MS });
+    const res: any = await fetch(url, { ...init, signal: controller.signal, timeout: timeoutMs });
     const text = await res.text();
     return { res, text };
   } finally {
@@ -144,11 +146,17 @@ export async function postCortex(path: string, payload: any, options: CortexPost
     'Idempotency-Key': idempotencyKey,
   };
   const body = JSON.stringify(payload);
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+    ? Math.min(READ_TIMEOUT_MS, Math.max(CONNECT_TIMEOUT_MS, Number(options.timeoutMs)))
+    : READ_TIMEOUT_MS;
+  const maxAttempts = Number.isFinite(Number(options.maxAttempts))
+    ? Math.min(MAX_ATTEMPTS, Math.max(1, Math.floor(Number(options.maxAttempts))))
+    : MAX_ATTEMPTS;
 
   let lastErr: any = null;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      const { res, text } = await fetchWithTimeout(url, { method: 'POST', headers, body });
+      const { res, text } = await fetchWithTimeout(url, { method: 'POST', headers, body }, timeoutMs);
       let data: any = text;
       try {
         data = text ? JSON.parse(text) : {};
@@ -158,7 +166,7 @@ export async function postCortex(path: string, payload: any, options: CortexPost
       if (!res.ok && isRetryableStatus(res.status)) {
         breakerRecordFailure();
         lastErr = { status: res.status, data };
-        if (attempt < MAX_ATTEMPTS - 1) {
+        if (attempt < maxAttempts - 1) {
           await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[attempt]));
           continue;
         }
@@ -171,7 +179,7 @@ export async function postCortex(path: string, payload: any, options: CortexPost
       lastErr = err;
       const code = err?.code || err?.cause?.code;
       const retryable = (isRetryableError(err) || err?.name === 'AbortError') && !isForegroundPricingPath(path);
-      if (!retryable || attempt >= MAX_ATTEMPTS - 1) {
+      if (!retryable || attempt >= maxAttempts - 1) {
         breakerRecordFailure();
         return {
           ok: false,

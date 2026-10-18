@@ -3499,6 +3499,53 @@ function normalizeCortexChatResponse(cortex: any, fallback: ReturnType<typeof bu
   };
 }
 
+function buildCortexModelContext(context: any, focusContext: any) {
+  const readiness = context?.readiness || {};
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const recommendations = Array.isArray(context?.recommendations) ? context.recommendations : [];
+  return {
+    tenant: context?.tenant,
+    screen: context?.screen,
+    generatedAt: context?.generatedAt,
+    readiness: {
+      score: readiness.score,
+      posture: readiness.posture,
+      primarySource: readiness.primarySource,
+      counts: readiness.counts,
+      blockers: readiness.blockers || readiness.gaps || readiness.missing || [],
+    },
+    tasks: tasks.slice(0, 10).map((task: any) => ({
+      id: task.id,
+      title: task.title,
+      detail: task.detail,
+      priority: task.priority,
+      status: task.status,
+      source: task.source,
+      screen: task.screen,
+      actionTarget: task.actionTarget,
+      actionLabel: task.actionLabel,
+      entityType: task.entityType,
+      entityId: task.entityId,
+    })),
+    recommendations: recommendations.slice(0, 8).map((recommendation: any) => ({
+      id: recommendation.id,
+      title: recommendation.title,
+      summary: recommendation.summary,
+      status: recommendation.status,
+      scope: recommendation.scope,
+      currentState: recommendation.currentState,
+      suggestedState: recommendation.suggestedState,
+      estimatedImpact: recommendation.estimatedImpact,
+      confidence: recommendation.confidence,
+    })),
+    sourceCatalog: Array.isArray(context?.sourceCatalog) ? context.sourceCatalog : [],
+    focus: {
+      topic: focusContext?.topic,
+      requiredSource: focusContext?.requiredSource,
+    },
+  };
+}
+
 export async function createCortexChatMessage(userId: string, body: any = {}) {
   await ensureCortexWorkspaceTables();
   const screen = String(body.screen || 'command').slice(0, 80);
@@ -3548,6 +3595,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
   const focusQuery = conversationAwareChatQuery(message, threadHistory);
   const focusContext = await buildChatFocusContext(userId, focusQuery, screen, context, entityType, entityId);
+  const modelContext = buildCortexModelContext(context, focusContext);
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
@@ -3586,7 +3634,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     message,
     history: threadHistory,
     focus_context: focusContext,
-    context,
+    context: modelContext,
     response_contract: {
       answer: 'string',
       sources: 'array of cited OMS source objects when possible',
@@ -3606,7 +3654,12 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       current_vs_suggested_requires_measurable_impact: true,
       unsupported_claim_behavior: 'state what evidence is missing instead of estimating',
     },
-  }, { userId, idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}` }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
+  }, {
+    userId,
+    idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}`,
+    timeoutMs: 35_000,
+    maxAttempts: 1,
+  }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
   const actionIntent = chatRequestsActions(message);
   const normalized = accountGroundedFastPath
     ? fallback
