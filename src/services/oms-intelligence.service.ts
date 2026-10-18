@@ -1909,12 +1909,12 @@ export async function getScreenIntelligenceContext(userId: string, screen: strin
   const counts = readiness.counts || {};
   const screenLabel = String(screen || 'command').replace(/-/g, ' ');
   const defaultPrompts = [
-    'What should I work on next?',
-    'Which data is blocking higher confidence?',
+    'Summarize what is happening in my account',
+    'Where am I losing money right now?',
     'What current vs optimized decision is ready?',
   ];
   const promptMap: Record<string, string[]> = {
-    command: ['Summarize what is happening in my account', 'What should I work on next?', 'What current vs optimized decision is ready?'],
+    command: ['Summarize what is happening in my account', 'Where am I losing money right now?', 'Is the AI plan ready for approval?'],
     skus: ['Which SKUs need enrichment first?', 'What product data is blocking Cortex confidence?', 'Which SKUs have listing or warehouse-fit opportunities?'],
     'sku-detail': ['What is missing from this SKU?', 'What can improve this SKU margin or fulfillment?', 'Is this SKU ready for Amazon listing?'],
     orders: ['Which orders need fulfillment attention?', 'What can improve service speed?', 'Are there order issues Cortex can safely route?'],
