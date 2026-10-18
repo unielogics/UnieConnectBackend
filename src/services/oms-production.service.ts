@@ -1503,7 +1503,15 @@ export async function getBusinessDouble(userId: string) {
   const snapshotCurrent = snapshot?.businessDouble?.currentMetrics || snapshot?.businessDouble?.current_metrics;
   const snapshotOptimized = snapshot?.businessDouble?.optimizedMetrics || snapshot?.businessDouble?.optimized_metrics;
   const snapshotSavings = snapshot?.businessDouble?.savings;
-  const snapshotIsModeled = hasMaterialOptimizedPlan(snapshotCurrent, snapshotOptimized, snapshotSavings);
+  const recommendationVerdict = String(
+    snapshot?.businessDouble?.recommendationVerdict
+      || snapshot?.businessDouble?.recommendation_verdict
+      || snapshot?.summary?.networkRecommendation
+      || '',
+  ).trim().toLowerCase();
+  const noChangeRecommended = /^(?:no[ _-]?op|keep[ _-]current|none|no[ _-]change)$/.test(recommendationVerdict);
+  const snapshotIsModeled = hasMaterialOptimizedPlan(snapshotCurrent, snapshotOptimized, snapshotSavings)
+    || (noChangeRecommended && hasPlanPayload(snapshotCurrent) && hasPlanPayload(snapshotOptimized));
   const modelBaselineMonthlyCost = money(snapshotCurrent?.monthlyCost ?? snapshotCurrent?.estimatedMonthlyCost);
   const modelBaselineWarehouseNodes = number(snapshotCurrent?.warehouseNodes ?? snapshotCurrent?.warehouseCount);
   const observedMonthlyCost = money(localPlan.currentMetrics.monthlyCost);
@@ -1515,11 +1523,11 @@ export async function getBusinessDouble(userId: string) {
   const networkGrounded = connectedWarehouseNodes > 0
     && modelBaselineWarehouseNodes > 0
     && connectedWarehouseNodes === modelBaselineWarehouseNodes;
-  const groundingIssues = [
+  const groundingIssues = noChangeRecommended ? [] : [
     ...(!costGrounded ? ['Modeled baseline cost does not reconcile with observed 30-day billing.'] : []),
     ...(!networkGrounded ? ['Modeled baseline warehouse count does not match connected warehouse truth.'] : []),
   ];
-  const decisionReady = snapshotIsModeled && costGrounded && networkGrounded;
+  const decisionReady = snapshotIsModeled && (noChangeRecommended || (costGrounded && networkGrounded));
   const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
     ? {
         ...localPlan,
@@ -1538,8 +1546,11 @@ export async function getBusinessDouble(userId: string) {
         optimizedMetrics: snapshotIsModeled ? snapshotOptimized : localPlan.optimizedMetrics,
         savings: snapshotIsModeled ? snapshotSavings : localPlan.savings,
         modelStatus: snapshotIsModeled ? 'modeled' : 'not_modeled',
+        noChangeRecommended,
+        recommendationVerdict: recommendationVerdict || null,
+        approvalRequired: snapshotIsModeled && !noChangeRecommended && decisionReady,
         decisionReady,
-        impactStatus: decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
+        impactStatus: noChangeRecommended ? 'no_change' : decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
         grounding: {
           observedMonthlyCost,
           modelBaselineMonthlyCost,
@@ -1622,6 +1633,11 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
     error.statusCode = 409;
     throw error;
   }
+  if (plan.noChangeRecommended === true) {
+    const error: any = new Error('Cortex recommends retaining the current network. There is no material plan change to approve.');
+    error.statusCode = 409;
+    throw error;
+  }
   if (plan.decisionReady !== true) {
     const error: any = new Error(`This modeled scenario is not ready for approval. ${(plan.grounding?.issues || []).join(' ')}`.trim());
     error.statusCode = 409;
@@ -1692,6 +1708,11 @@ export async function rejectBusinessDouble(userId: string, planId: string, rejec
   }
   if (plan.modelStatus !== 'modeled' || !hasPlanPayload(plan.optimizedMetrics)) {
     const error: any = new Error('There is no executable optimized plan to deny yet.');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (plan.noChangeRecommended === true) {
+    const error: any = new Error('Cortex recommends retaining the current network. There is no material plan change to deny.');
     error.statusCode = 409;
     throw error;
   }
