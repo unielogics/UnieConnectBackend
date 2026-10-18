@@ -6,7 +6,7 @@ import PDFDocument from 'pdfkit';
 import bwipjs from 'bwip-js';
 import nodemailer from 'nodemailer';
 import { config } from '../config/env';
-import { pgQuery, isPostgresConfigured } from '../db/postgres';
+import { pgQuery, isPostgresConfigured, withPgTransaction } from '../db/postgres';
 import { publicEntityId } from '../lib/public-id';
 import { LabelAuditFinding, LabelAuditRun } from './oms-production.types';
 import { postCortex, cortexConfigStatus } from './cortex-orchestration';
@@ -4213,6 +4213,7 @@ type BillingCategoryTotals = {
   materials: number;
 };
 const BILLING_CATEGORY_KEYS = ['freight', 'storage', 'handling', 'accessorials', 'materials'];
+const BILLING_IMPORT_STATUSES = new Set(['open', 'approved', 'submitted', 'paid', 'void']);
 const emptyBillingCategoryTotals = (): BillingCategoryTotals => ({
   freight: 0,
   storage: 0,
@@ -4225,8 +4226,173 @@ const emptyBillingCategoryTotals = (): BillingCategoryTotals => ({
 // that predate periodStart being carried through, or for the estimate/status-only fallback rows.
 const BILLING_ACTIVITY_AT = `COALESCE((payload->>'periodStart')::timestamptz, created_at)`;
 
-// Shared helper: real per-category billing totals over a window, aggregated from WMS-synced
-// invoice_lines. Used by getBillingProfit (the hero/breakdown) AND the billing-plan recommendation
+export type BillingInvoiceImportRow = Record<string, unknown>;
+
+function billingImportText(row: BillingInvoiceImportRow, ...keys: string[]) {
+  for (const key of keys) {
+    const value = row?.[key];
+    if (value != null && String(value).trim()) return String(value).trim();
+  }
+  return '';
+}
+
+function normalizeBillingImportRows(inputRows: BillingInvoiceImportRow[]) {
+  if (!Array.isArray(inputRows) || !inputRows.length) throw new Error('At least one invoice row is required');
+  if (inputRows.length > 2000) throw new Error('A billing import can contain at most 2,000 rows');
+
+  const failures: Array<{ row: number; error: string }> = [];
+  const normalized = inputRows.map((raw, index) => {
+    const csvRow = index + 2;
+    const invoiceNumber = billingImportText(raw, 'invoiceNumber', 'invoice_number', 'invoice', 'invoiceId');
+    const description = billingImportText(raw, 'description', 'chargeDescription', 'lineDescription');
+    const amountText = billingImportText(raw, 'amount', 'total', 'charge');
+    const amount = money(amountText);
+    const periodStartText = billingImportText(raw, 'periodStart', 'date', 'invoiceDate', 'serviceDate');
+    const parsedDate = new Date(periodStartText);
+    const categoryInput = billingImportText(raw, 'category', 'chargeCategory').toLowerCase() || 'accessorials';
+    const statusInput = billingImportText(raw, 'status').toLowerCase() || 'open';
+    const currency = (billingImportText(raw, 'currency') || 'USD').toUpperCase();
+
+    const errors: string[] = [];
+    if (!invoiceNumber) errors.push('invoiceNumber is required');
+    if (!description) errors.push('description is required');
+    if (!amountText || !Number.isFinite(Number(amountText.replace(/[$,\s]/g, '')))) errors.push('amount must be a number');
+    if (!periodStartText || Number.isNaN(parsedDate.getTime())) errors.push('periodStart must be a valid date');
+    if (!BILLING_CATEGORY_KEYS.includes(categoryInput)) errors.push(`category must be one of ${BILLING_CATEGORY_KEYS.join(', ')}`);
+    if (!BILLING_IMPORT_STATUSES.has(statusInput)) errors.push(`status must be one of ${Array.from(BILLING_IMPORT_STATUSES).join(', ')}`);
+    if (!/^[A-Z]{3}$/.test(currency)) errors.push('currency must be a three-letter code');
+    if (errors.length) failures.push({ row: csvRow, error: errors.join('; ') });
+
+    const explicitLineId = billingImportText(raw, 'invoiceLineId', 'invoice_line_id', 'lineId', 'externalLineId');
+    const code = billingImportText(raw, 'code', 'chargeCode');
+    return {
+      csvRow,
+      externalLineId: explicitLineId || [invoiceNumber, code || description, periodStartText, index + 1].join(':'),
+      invoiceNumber,
+      description,
+      amount,
+      periodStart: Number.isNaN(parsedDate.getTime()) ? '' : parsedDate.toISOString(),
+      periodEnd: (() => {
+        const value = billingImportText(raw, 'periodEnd', 'endDate');
+        if (!value) return null;
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+          failures.push({ row: csvRow, error: 'periodEnd must be a valid date' });
+          return null;
+        }
+        return date.toISOString();
+      })(),
+      category: categoryInput,
+      status: statusInput,
+      currency,
+      warehouseCode: billingImportText(raw, 'warehouseCode', 'warehouse', 'facilityCode') || null,
+      code: code || null,
+      quantity: number(billingImportText(raw, 'quantity', 'qty'), 0),
+      unitPrice: money(billingImportText(raw, 'unitPrice', 'unit_price')),
+      shipmentPlanId: billingImportText(raw, 'shipmentPlanId', 'shipment_plan_id') || null,
+      sourceOrderId: billingImportText(raw, 'sourceOrderId', 'orderId', 'orderNumber') || null,
+      sourceAsnId: billingImportText(raw, 'sourceAsnId', 'asnId', 'asnNumber') || null,
+    };
+  });
+
+  if (failures.length) {
+    const error = new Error('Billing CSV validation failed') as Error & { failures?: typeof failures };
+    error.failures = failures;
+    throw error;
+  }
+  return normalized;
+}
+
+export async function importBillingInvoiceRows(
+  userId: string,
+  input: { filename?: string; rows?: BillingInvoiceImportRow[] },
+) {
+  const normalized = normalizeBillingImportRows(input?.rows || []);
+  const filename = String(input?.filename || 'billing-import.csv').trim().slice(0, 180) || 'billing-import.csv';
+  const shipmentPlanIds = Array.from(new Set(normalized.map((row) => row.shipmentPlanId).filter(Boolean))) as string[];
+
+  if (shipmentPlanIds.length) {
+    const owned = await rows<{ id: string }>(
+      'SELECT id FROM shipment_plans WHERE user_id = $1 AND id = ANY($2::text[])',
+      [userId, shipmentPlanIds],
+    );
+    const ownedIds = new Set(owned.map((row) => row.id));
+    const foreign = shipmentPlanIds.filter((id) => !ownedIds.has(id));
+    if (foreign.length) {
+      const error = new Error('Billing CSV validation failed') as Error & { failures?: Array<{ row: number; error: string }> };
+      error.failures = normalized
+        .filter((row) => row.shipmentPlanId && foreign.includes(row.shipmentPlanId))
+        .map((row) => ({ row: row.csvRow, error: 'shipmentPlanId was not found in this account' }));
+      throw error;
+    }
+  }
+
+  const result = await withPgTransaction(async (client) => {
+    let imported = 0;
+    let updated = 0;
+    for (const row of normalized) {
+      const existing = await client.query<{ id: string }>(
+        `SELECT id FROM invoice_lines
+          WHERE user_id = $1
+            AND payload->>'source' = 'csv_import'
+            AND payload->>'externalLineId' = $2
+          LIMIT 1`,
+        [userId, row.externalLineId],
+      );
+      const payload = {
+        source: 'csv_import',
+        externalLineId: row.externalLineId,
+        filename,
+        category: row.category,
+        warehouseCode: row.warehouseCode,
+        periodStart: row.periodStart,
+        periodEnd: row.periodEnd,
+        quantity: row.quantity,
+        unitPrice: row.unitPrice,
+        code: row.code,
+        sourceOrderId: row.sourceOrderId,
+        sourceAsnId: row.sourceAsnId,
+      };
+      if (existing.rows[0]?.id) {
+        await client.query(
+          `UPDATE invoice_lines
+              SET shipment_plan_id = $3, invoice_id = $4, description = $5, amount = $6,
+                  currency = $7, status = $8, payload = $9::jsonb, updated_at = now()
+            WHERE id = $1 AND user_id = $2`,
+          [existing.rows[0].id, userId, row.shipmentPlanId, row.invoiceNumber, row.description, row.amount, row.currency, row.status, JSON.stringify(payload)],
+        );
+        updated++;
+      } else {
+        await client.query(
+          `INSERT INTO invoice_lines
+            (id, user_id, shipment_plan_id, invoice_id, description, amount, currency, status, payload)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+          [randomUUID(), userId, row.shipmentPlanId, row.invoiceNumber, row.description, row.amount, row.currency, row.status, JSON.stringify(payload)],
+        );
+        imported++;
+      }
+    }
+    await client.query(
+      `INSERT INTO oms_execution_ledger
+        (user_id, entity_type, entity_id, event_type, source_system, summary, payload)
+       VALUES ($1, 'billing_import', $2, 'billing_csv_imported', 'user_csv', $3, $4::jsonb)`,
+      [userId, randomUUID(), `Imported ${normalized.length} billing evidence row${normalized.length === 1 ? '' : 's'} from ${filename}.`, JSON.stringify({ filename, imported, updated, rowCount: normalized.length })],
+    );
+    return { imported, updated };
+  });
+  if (!result) throw new Error('Billing storage is not configured');
+
+  return {
+    imported: result.imported,
+    updated: result.updated,
+    rowCount: normalized.length,
+    failed: [],
+    source: 'csv_invoice_evidence' as const,
+  };
+}
+
+// Shared helper: observed per-category billing totals over a window, aggregated from WMS-synced
+// and explicitly user-uploaded invoice_lines. Used by getBillingProfit AND billing recommendations
 // generator so the proposed savings reconcile exactly with what the Billing screen shows. Returns
 // only categories that actually have spend > 0 in the window (so the generator skips empty ones).
 export async function getBillingCategoryTotals(
@@ -4403,7 +4569,16 @@ export async function getBillingProfit(
       [userId],
     );
 
-  const [catRows, whRows, seriesRows, prevCatRows, everRows, refundRows, prevRefundRows, linkedWarehouses] = await Promise.all([
+  const sourceRowsFor = (windowStart: Date, windowEnd?: Date) =>
+    rows<{ source: string; count: string }>(
+      `SELECT COALESCE(NULLIF(payload->>'source', ''), 'wms') AS source, COUNT(*)::text AS count
+         FROM invoice_lines
+        WHERE user_id = $1 AND ${BILLING_ACTIVITY_AT} >= $2 AND ($3::timestamptz IS NULL OR ${BILLING_ACTIVITY_AT} < $3)
+        GROUP BY 1`,
+      [userId, windowStart, windowEnd || null],
+    );
+
+  const [catRows, whRows, seriesRows, prevCatRows, everRows, refundRows, prevRefundRows, linkedWarehouses, sourceRows] = await Promise.all([
     catRowsFor(start, end),
     whRowsFor(start, end),
     seriesRowsFor(start, end),
@@ -4412,12 +4587,15 @@ export async function getBillingProfit(
     refundRowsFor(start, end),
     refundRowsFor(prevStart, prevEnd),
     warehouseLinks(userId),
+    sourceRowsFor(start, end),
   ]);
   const hasRealInvoices = catRows.some((r) => number(r.total) > 0);
   // Distinguish "empty window on an account that HAS real invoices" from "brand-new account with no
   // invoices ever". Only the latter should show the modeled estimate — otherwise an empty window
   // (e.g. 'Today' before the nightly scheduler runs) must show honest real $0, not fabricated data.
   const hasAnyInvoicesEver = everRows[0]?.exists === true;
+  const hasCsvEvidence = sourceRows.some((row) => row.source === 'csv_import' && number(row.count) > 0);
+  const hasWmsEvidence = sourceRows.some((row) => row.source !== 'csv_import' && number(row.count) > 0);
 
   const current = emptyBillingCategoryTotals();
   if (hasRealInvoices) {
@@ -4542,9 +4720,15 @@ export async function getBillingProfit(
       appliedCategories,
     },
     forecast,
-    // 'wms_invoices' = real charges in this window; 'empty' = account has real invoices but none in
-    // this window (honest $0); 'estimate' = brand-new account, modeled figures.
-    source: hasRealInvoices ? 'wms_invoices' : hasAnyInvoicesEver ? 'empty' : 'estimate',
+    // Keep provenance explicit: user-uploaded invoice evidence must never be presented as a WMS
+    // charge feed. Mixed windows name both sources; empty windows stay honest real $0.
+    source: hasRealInvoices
+      ? hasCsvEvidence && hasWmsEvidence
+        ? 'mixed_invoice_evidence'
+        : hasCsvEvidence
+          ? 'csv_invoice_evidence'
+          : 'wms_invoices'
+      : hasAnyInvoicesEver ? 'empty' : 'estimate',
     accountHasInvoices: hasAnyInvoicesEver,
   };
 }
@@ -4653,6 +4837,8 @@ function mapBillingInvoiceRow(
   const payload = json(row.payload, {}) as Row;
   return {
     id: row.id,
+    source: payload.source === 'csv_import' ? 'csv_import' : 'wms',
+    sourceFilename: payload.source === 'csv_import' ? payload.filename || null : null,
     date: iso(payload.periodStart) || iso(row.created_at),
     invoiceNumber: row.invoice_id,
     warehouse: payload.warehouseCode || null,

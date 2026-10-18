@@ -34,6 +34,7 @@ import {
   getWarehouseDetail,
   getWarehouseOverview,
   generateShipmentPalletLabelsPdf,
+  importBillingInvoiceRows,
   retryShipmentVendorEmail,
   searchOmsEntities,
   updateOmsSkuEnrichment,
@@ -312,6 +313,22 @@ export async function omsProductionRoutes(fastify: FastifyInstance) {
       limit: q.limit ? Math.min(200, Math.max(1, Number(q.limit) || 50)) : 50,
       offset: q.offset ? Math.max(0, Number(q.offset) || 0) : 0,
     });
+  });
+
+  fastify.post('/oms/billing/invoices/import', async (req: any, reply) => {
+    const userId = requireUser(req, reply);
+    if (!userId) return;
+    try {
+      return await importBillingInvoiceRows(userId, {
+        filename: typeof req.body?.filename === 'string' ? req.body.filename : undefined,
+        rows: Array.isArray(req.body?.rows) ? req.body.rows : [],
+      });
+    } catch (error: any) {
+      return reply.code(400).send({
+        error: error?.message || 'Billing CSV import failed',
+        failures: Array.isArray(error?.failures) ? error.failures : undefined,
+      });
+    }
   });
 
   fastify.get('/oms/billing/statement.pdf', async (req: any, reply) => {

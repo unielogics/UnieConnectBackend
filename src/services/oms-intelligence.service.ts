@@ -1979,8 +1979,12 @@ function recommendationTaskTarget(rec: any) {
     if (title.includes('feed completeness') || title.includes('data completeness')) {
       return { screen: 'connections', actionLabel: 'Improve data sources' };
     }
-    const target = taskTargetFromText(`${text} ${rec?.requiredAction || ''}`);
-    return { screen: target.screen, actionLabel: target.actionLabel };
+    const actionText = `${text} ${rec?.requiredAction || ''}`;
+    const target = taskTargetFromText(actionText);
+    if (target.screen === 'billing' && /\b(csv|upload|invoice line)\b/.test(actionText)) {
+      return { screen: 'billing', actionLabel: 'Upload billing CSV', navigationPayload: 'action:upload-csv' };
+    }
+    return { screen: target.screen, actionLabel: target.actionLabel, navigationPayload: undefined };
   }
   if (entityType === 'sku' || text.includes('sku') || text.includes('listing')) {
     return rec?.entityId
@@ -2081,6 +2085,7 @@ function readinessTaskDefinition(blocker: string) {
       screen: 'skus',
       entityType: 'sku',
       actionLabel: 'Enrich SKUs',
+      navigationPayload: 'filter:missing-dimensions',
       detail: 'Add package weight plus length, width, and height in SKU item details. Cortex will detect the completed fields automatically.',
     };
   }
@@ -2090,6 +2095,7 @@ function readinessTaskDefinition(blocker: string) {
       screen: 'skus',
       entityType: 'sku',
       actionLabel: 'Add SKU costs',
+      navigationPayload: 'filter:missing-cost',
       detail: 'Add unit cost in SKU item details so margin and fulfillment comparisons use account evidence instead of assumptions.',
     };
   }
@@ -2109,6 +2115,7 @@ function readinessTaskDefinition(blocker: string) {
       screen: 'suppliers',
       entityType: 'supplier',
       actionLabel: 'Complete supplier profiles',
+      navigationPayload: 'filter:missing-pickup',
       detail: 'Add pickup hours and origin details to incomplete supplier profiles so shipment routing has a valid starting point.',
     };
   }
@@ -2285,6 +2292,7 @@ export async function refreshCortexTasks(userId: string) {
         confidence: rec.confidence,
         recommendationType: rec.recommendationType,
         approvalState: rec.approvalState,
+        navigationPayload: 'navigationPayload' in target ? target.navigationPayload : undefined,
       },
     });
   }
