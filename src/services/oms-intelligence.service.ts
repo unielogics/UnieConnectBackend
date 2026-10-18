@@ -2096,9 +2096,10 @@ function readinessTaskDefinition(blocker: string) {
   if (value.includes('wms') || value.includes('warehouse')) {
     return {
       key: 'warehouse-wms-truth',
-      screen: 'warehouses',
+      screen: 'connections',
       entityType: 'warehouse',
       actionLabel: 'Connect warehouse',
+      navigationPayload: 'action:connect:wms',
       detail: 'Connect at least one working warehouse or WMS feed so inventory and physical execution can be verified.',
     };
   }
@@ -2144,6 +2145,7 @@ function readinessTaskDefinition(blocker: string) {
       screen: 'connections',
       entityType: 'connection',
       actionLabel: 'Connect marketplace',
+      navigationPayload: 'action:connect:shopify',
       detail: 'Connect a marketplace feed or import product and sales CSV data so Cortex has demand evidence to analyze.',
     };
   }
@@ -2249,7 +2251,12 @@ export async function refreshCortexTasks(userId: string) {
       priority: priorityForTask(blocker, readiness.score),
       actionLabel: definition.actionLabel,
       actionTarget: definition.screen,
-      evidence: { readinessScore: readiness.score, posture: readiness.posture, counts: readiness.counts },
+      evidence: {
+        readinessScore: readiness.score,
+        posture: readiness.posture,
+        counts: readiness.counts,
+        navigationPayload: definition.navigationPayload,
+      },
     });
   }
 
@@ -2318,12 +2325,18 @@ export async function refreshCortexTasks(userId: string) {
           ? `The ${channel} connection is ${connectionState === 'needs authorization' ? 'waiting for authorization' : connectionState}.`
           : `${degradedNames.join(', ')} data is degraded or reporting an error. Open Connections to review the provider evidence and repair the feed.`,
       priority: 'high',
-      actionLabel: missingShopifyLocations ? 'Repair Shopify access' : 'Open Connections',
+      actionLabel: missingShopifyLocations
+        ? 'Repair Shopify access'
+        : disconnected && ['shopify', 'amazon', 'ebay'].includes(channel)
+          ? `Authorize ${channel.charAt(0).toUpperCase()}${channel.slice(1)}`
+          : 'Open Connections',
       actionTarget: 'connections',
       evidence: {
         channel,
         connectionStatus: connection.status,
-        navigationPayload: missingShopifyLocations ? `action:repair:${connection.id}` : undefined,
+        navigationPayload: (missingShopifyLocations || (disconnected && ['shopify', 'amazon', 'ebay'].includes(channel)))
+          ? `action:repair:${connection.id}`
+          : undefined,
         missingScopes: missingShopifyLocations ? ['read_locations'] : [],
         degradedEntities: degradedEntries.map(([entity, state]) => ({
           entity,
@@ -3011,7 +3024,14 @@ function normalizeChatAction(value: any) {
     || (dedupeKey === 'readiness:sku-dimensions-weight' ? 'filter:missing-dimensions' : null)
     || (dedupeKey === 'readiness:supplier-pickup-profiles' ? 'filter:missing-pickup' : null)
     || (actionTarget === 'labels' && /upload.*csv/i.test(String(value.actionLabel || title)) ? 'action:upload-csv' : null)
+    || (actionTarget === 'suppliers' && /add supplier/i.test(String(value.actionLabel || title)) ? 'action:create-supplier' : null)
+    || (actionTarget === 'connections' && /connect warehouse/i.test(String(value.actionLabel || title)) ? 'action:connect:wms' : null)
+    || (actionTarget === 'connections' && /connect amazon/i.test(String(value.actionLabel || title)) ? 'action:connect:amazon' : null)
+    || (actionTarget === 'connections' && /connect marketplace/i.test(String(value.actionLabel || title)) ? 'action:connect:shopify' : null)
     || (actionTarget === 'connections' && /repair shopify/i.test(String(value.actionLabel || title)) && value.entityId
+      ? `action:repair:${String(value.entityId)}`
+      : null)
+    || (actionTarget === 'connections' && /authorize (?:shopify|amazon|ebay)/i.test(String(value.actionLabel || title)) && value.entityId
       ? `action:repair:${String(value.entityId)}`
       : null);
   return {
@@ -4106,7 +4126,7 @@ function buildGroundedSupplierGuidance(context: any) {
           actionTarget: 'suppliers',
           actionLabel: incomplete.length ? 'Complete supplier profiles' : 'Add supplier',
           entityType: 'supplier',
-          navigationPayload: incomplete.length ? 'filter:missing-pickup' : undefined,
+          navigationPayload: incomplete.length ? 'filter:missing-pickup' : 'action:create-supplier',
         }
       : null;
   return {
@@ -4278,6 +4298,9 @@ function buildGroundedAmazonReadiness(context: any) {
         actionLabel: !connected ? (amazon ? 'Authorize Amazon' : 'Connect Amazon') : matchingTask.actionLabel,
         entityType: matchingTask.entityType,
         entityId: matchingTask.entityId,
+        navigationPayload: !connected
+          ? (amazon?.id ? `action:repair:${amazon.id}` : 'action:connect:amazon')
+          : matchingTask.navigationPayload,
       }
     : !connected
       ? {
@@ -4288,6 +4311,7 @@ function buildGroundedAmazonReadiness(context: any) {
           actionLabel: amazon ? 'Authorize Amazon' : 'Connect Amazon',
           entityType: 'marketplace_connection',
           entityId: amazon?.id,
+          navigationPayload: amazon?.id ? `action:repair:${amazon.id}` : 'action:connect:amazon',
         }
       : chatCount(counts.amazonProfiles) === 0
         ? {
