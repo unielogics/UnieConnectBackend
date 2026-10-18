@@ -2953,7 +2953,7 @@ function normalizeChatAction(value: any) {
 }
 
 function chatRequestsPriority(message: string) {
-  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first (?:thing|action|step)|next action|where (?:should|do|can) i start|what (?:should|do) i do first|focus on)\b/i.test(message);
+  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first (?:thing|action|step)|next action|where (?:should|do|can) i start|what (?:should|do|can) i (?:do|fix|address|handle|resolve|work on) first|focus on)\b/i.test(message);
 }
 
 function chatRequestsAccountSnapshot(message: string) {
@@ -4440,7 +4440,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     && /(should|recommend|prioriti[sz]e|next|best|most value|worth)/i.test(message);
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
-  const accountPriorityQuestion = priorityIntent && /\b(account|operational|issue|blocker|risk)\b/i.test(message);
+  const accountPriorityQuestion = priorityIntent
+    && (screen === 'command' || /\b(account|operational|issue|blocker|risk)\b/i.test(message));
   const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
   const connectionScreenHealthQuestion = screen === 'connections'
     && ['shopify', 'amazon', 'ebay'].some((channel) => focusQuery.toLowerCase().includes(channel))
