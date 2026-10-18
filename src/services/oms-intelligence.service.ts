@@ -2235,7 +2235,7 @@ export async function refreshCortexTasks(userId: string) {
         AND recommendation_type IN ('data_enrichment', 'data_readiness')`,
     [userId],
   ).catch(() => null);
-  const [readiness, recs, marketplaceConnections, businessDouble] = await Promise.all([
+  const [readiness, recs, marketplaceConnections, businessDouble, billingCsvEvidence] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { status: 'open', limit: 100 }),
     rows(
@@ -2253,6 +2253,15 @@ export async function refreshCortexTasks(userId: string) {
       [userId],
     ).catch(() => []),
     getBusinessDouble(userId).catch(() => null),
+    one<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1
+           FROM invoice_lines
+          WHERE user_id = $1
+            AND payload->>'source' = 'csv_import'
+       ) AS exists`,
+      [userId],
+    ).catch(() => null),
   ]);
   const activeKeys = new Set<string>();
 
@@ -2280,6 +2289,39 @@ export async function refreshCortexTasks(userId: string) {
   }
 
   for (const rec of (recs.recommendations || []).filter(recommendationBelongsInTaskInbox) as any[]) {
+    const currentValue = json(rec.currentValue, {});
+    const evidencePath = String(currentValue.evidencePath || '').toLowerCase();
+    if (evidencePath === 'upload_opportunities') {
+      // Cortex can suggest several data sources in one recommendation, but the
+      // task inbox only exposes work with a real destination and a verifiable
+      // completion signal. Warehouse profile and staffing inputs do not yet
+      // have user-facing capture flows, so do not bundle them into Billing.
+      if (!billingCsvEvidence?.exists) {
+        const dedupeKey = 'work:billing-invoice-evidence';
+        activeKeys.add(dedupeKey);
+        await upsertCortexTask(userId, {
+          dedupeKey,
+          source: 'readiness',
+          screen: 'billing',
+          entityType: 'billing',
+          title: 'Upload billing evidence for cost intelligence',
+          detail: 'Upload an invoice-line CSV in Billing so Cortex can compare observed freight, storage, handling, and accessorial costs. This task closes automatically after a successful import.',
+          priority: 'normal',
+          actionLabel: 'Upload billing CSV',
+          actionTarget: 'billing',
+          recommendationId: rec.id,
+          evidence: {
+            readinessScore: readiness.score,
+            recommendationType: rec.recommendationType,
+            evidencePath,
+            completionSignal: 'invoice_lines.csv_import',
+            navigationPayload: 'action:upload-csv',
+          },
+        });
+      }
+      continue;
+    }
+
     const dedupeKey = `work:${taskDedupeSlug(`${rec.entityType || rec.recommendationType}:${rec.entityId || ''}:${rec.title}`)}`;
     activeKeys.add(dedupeKey);
     const target = recommendationTaskTarget(rec);
