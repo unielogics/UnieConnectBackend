@@ -1,9 +1,23 @@
 import assert from 'node:assert/strict';
 import {
+  cortexChatDeliveryState,
   humanizeInternalLanguage,
   polishCortexChatText,
   scrubVendorLanguage,
 } from '../src/services/oms-intelligence.service';
+
+assert.deepEqual(cortexChatDeliveryState('live'), {
+  available: true,
+  integrated: true,
+  live: true,
+  mode: 'live',
+  reason: 'live_chat_available',
+});
+assert.equal(cortexChatDeliveryState('account_grounded').available, true);
+assert.equal(cortexChatDeliveryState('account_grounded').reason, 'account_grounded_answer');
+assert.equal(cortexChatDeliveryState('fallback').available, false);
+assert.equal(cortexChatDeliveryState('account_scoped').available, false);
+assert.equal(cortexChatDeliveryState('unavailable').integrated, false);
 
 const vendorAnswer = scrubVendorLanguage('NVIDIA NIM uses NVIDIA GPU drivers for inference.');
 assert.equal(vendorAnswer.includes('NVIDIA'), false);

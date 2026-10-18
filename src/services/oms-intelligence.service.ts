@@ -5228,6 +5228,20 @@ function buildCortexRequestFocusContext(focusContext: any) {
   return compact;
 }
 
+export function cortexChatDeliveryState(status: string) {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'live') {
+    return { available: true, integrated: true, live: true, mode: 'live', reason: 'live_chat_available' } as const;
+  }
+  if (normalized === 'account_grounded') {
+    return { available: true, integrated: true, live: false, mode: 'account_grounded', reason: 'account_grounded_answer' } as const;
+  }
+  if (normalized === 'fallback' || normalized === 'account_scoped') {
+    return { available: false, integrated: true, live: false, mode: 'fallback', reason: 'live_chat_unavailable' } as const;
+  }
+  return { available: false, integrated: false, live: false, mode: 'unavailable', reason: 'cortex_not_configured' } as const;
+}
+
 export async function createCortexChatMessage(userId: string, body: any = {}) {
   await ensureCortexWorkspaceTables();
   const screen = String(body.screen || 'command').slice(0, 80);
@@ -5254,7 +5268,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       [userId, clientRequestId, screen, entityType, entityId],
     ).catch(() => null);
     if (!stored) return null;
-    const available = stored.cortex_status !== 'unavailable';
+    const delivery = cortexChatDeliveryState(String(stored.cortex_status || 'unavailable'));
     return {
       thread: mapCortexThread({
         id: stored.thread_id,
@@ -5270,15 +5284,15 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       message: mapCortexMessage(stored),
       context: { screen },
       cortex: {
-        ok: available,
-        status: available ? 200 : 503,
+        ok: delivery.available,
+        status: delivery.available ? 200 : 503,
         health: {
-          available,
-          chatIntegrated: available,
-          status: available ? 200 : 503,
-          reason: 'replayed_request',
-          mode: stored.cortex_status === 'live' ? 'live' : available ? 'account_scoped' : 'unavailable',
-          liveRouteAvailable: stored.cortex_status === 'live',
+          available: delivery.available,
+          chatIntegrated: delivery.integrated,
+          status: delivery.available ? 200 : 503,
+          reason: delivery.reason,
+          mode: delivery.mode,
+          liveRouteAvailable: delivery.live,
         },
       },
     };
@@ -5797,19 +5811,23 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   // A tenant credential can remain valid even when the global bootstrap key is
   // absent. A successful tenant route is authoritative for chat availability.
   const accountChatConfigured = context.readiness?.cortex?.configured !== false;
-  const chatAvailable = accountGroundedFastPath || liveRouteAvailable || accountChatConfigured;
+  const deliveryStatus = accountGroundedFastPath
+    ? 'account_grounded'
+    : liveRouteAvailable
+      ? 'live'
+      : accountChatConfigured
+        ? 'fallback'
+        : 'unavailable';
+  const delivery = cortexChatDeliveryState(deliveryStatus);
+  const chatAvailable = delivery.available;
   const cortexHealth = {
-    // The visible status represents whether the user can receive an account-
-    // scoped answer. Live-route diagnostics remain available separately.
     available: chatAvailable,
-    chatIntegrated: accountChatConfigured || liveRouteAvailable,
+    chatIntegrated: delivery.integrated || accountChatConfigured,
     tenantConfigured: Boolean(context.readiness?.cortex?.tenantConfigured),
     bootstrapConfigured: Boolean(context.readiness?.cortex?.bootstrapConfigured),
     status: chatAvailable ? 200 : 503,
-    reason: accountGroundedFastPath
-      ? 'account_grounded_answer'
-      : liveRouteAvailable ? 'live_chat_available' : accountChatConfigured ? 'account_scoped_chat_available' : 'cortex_not_configured',
-    mode: liveRouteAvailable ? 'live' : accountChatConfigured ? 'account_scoped' : 'unavailable',
+    reason: delivery.reason,
+    mode: delivery.mode,
     liveRouteAvailable,
     liveRouteStatus: cortex?.status || 503,
     liveRouteReason: accountGroundedFastPath
@@ -5841,7 +5859,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       JSON.stringify(normalized.tasks),
       normalized.confidence,
       normalized.readinessNotes,
-      liveRouteAvailable ? 'live' : accountChatConfigured ? 'account_scoped' : 'unavailable',
+      deliveryStatus,
       JSON.stringify({ ...(cortex || {}), clientRequestId }),
       clientRequestId,
     ],
@@ -5853,7 +5871,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   await pgQuery(
     `INSERT INTO oms_copilot_events (user_id, screen, prompt, response)
      VALUES ($1, $2, $3, $4::jsonb)`,
-    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: liveRouteAvailable ? 'live' : accountChatConfigured ? 'account_scoped' : 'unavailable', cortexHealth })],
+    [userId, screen, message, JSON.stringify({ threadId: thread?.id, answer: normalized.answer, cortexStatus: deliveryStatus, cortexHealth })],
   ).catch(() => null);
   return {
     thread: mapCortexThread(thread),
@@ -5898,18 +5916,15 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
       },
     };
   }
-  const accountScopedAvailable = configured;
-  const chatAvailable = liveRouteAvailable || accountScopedAvailable;
+  const chatAvailable = liveRouteAvailable;
   const health = {
     available: chatAvailable,
     chatIntegrated: configured || liveRouteAvailable,
     tenantConfigured,
     bootstrapConfigured,
     status: chatAvailable ? 200 : 503,
-    reason: liveRouteAvailable
-      ? 'live_chat_available'
-      : accountScopedAvailable ? 'account_scoped_chat_available' : 'live_chat_unavailable',
-    mode: liveRouteAvailable ? 'live' : 'account_scoped',
+    reason: liveRouteAvailable ? 'live_chat_available' : 'live_chat_unavailable',
+    mode: liveRouteAvailable ? 'live' : configured ? 'fallback' : 'unavailable',
     liveRouteAvailable,
     liveRouteStatus: Number(live?.status || 503),
     liveRouteReason: liveRouteAvailable
