@@ -275,6 +275,21 @@ export async function getDataReadiness(userId: string) {
              jsonb_typeof(metadata->'pickupProfile'->'loadingDock') = 'boolean'
              OR jsonb_typeof(metadata->'loadingDock') = 'boolean'
            ))::int AS suppliers_with_pickup,
+       (SELECT COUNT(*)
+          FROM suppliers
+         WHERE user_id = $1
+           AND BTRIM(COALESCE(metadata->'pickupProfile'->>'hoursOfOperation', metadata->>'hoursOfOperation', '')) = '')::int AS suppliers_missing_pickup_hours,
+       (SELECT COUNT(*)
+          FROM suppliers
+         WHERE user_id = $1
+           AND BTRIM(COALESCE(metadata->'pickupProfile'->>'maxVehicleSize', metadata->>'maxVehicleSize', '')) = '')::int AS suppliers_missing_vehicle_limit,
+       (SELECT COUNT(*)
+          FROM suppliers
+         WHERE user_id = $1
+           AND NOT (
+             COALESCE(jsonb_typeof(metadata->'pickupProfile'->'loadingDock') = 'boolean', false)
+             OR COALESCE(jsonb_typeof(metadata->'loadingDock') = 'boolean', false)
+           ))::int AS suppliers_missing_loading_dock,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND (weight IS NULL OR weight <= 0 OR COALESCE(dimensions->>'length','') = '' OR COALESCE(dimensions->>'width','') = '' OR COALESCE(dimensions->>'height','') = ''))::int AS missing_dimensions,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND COALESCE(attributes->>'cost', metadata->>'cost', '') = '')::int AS missing_cost,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND wms_inventory <> '{}'::jsonb)::int AS wms_inventory_items`,
@@ -342,6 +357,11 @@ export async function getDataReadiness(userId: string) {
       wmsLinks: number(counts?.wms_links),
       suppliers: number(counts?.suppliers),
       suppliersWithPickup: number(counts?.suppliers_with_pickup),
+      supplierPickupGaps: {
+        hoursOfOperation: number(counts?.suppliers_missing_pickup_hours),
+        maxVehicleSize: number(counts?.suppliers_missing_vehicle_limit),
+        loadingDock: number(counts?.suppliers_missing_loading_dock),
+      },
       missingDimensions: number(counts?.missing_dimensions),
       missingCost: number(counts?.missing_cost),
       wmsInventoryItems: number(counts?.wms_inventory_items),
@@ -2124,7 +2144,18 @@ function taskDedupeSlug(text: string) {
     .slice(0, 120) || 'task';
 }
 
-function readinessTaskDefinition(blocker: string) {
+function supplierPickupTaskDetail(readiness: any) {
+  const gaps = readiness?.counts?.supplierPickupGaps || {};
+  const missing = [
+    number(gaps.hoursOfOperation) > 0 ? `${number(gaps.hoursOfOperation)} missing operating hours` : '',
+    number(gaps.maxVehicleSize) > 0 ? `${number(gaps.maxVehicleSize)} missing maximum vehicle size` : '',
+    number(gaps.loadingDock) > 0 ? `${number(gaps.loadingDock)} missing a loading-dock answer` : '',
+  ].filter(Boolean);
+  const evidence = missing.length ? ` Current gaps: ${missing.join('; ')}.` : '';
+  return `Complete operating hours, maximum vehicle size, and loading-dock availability for each supplier.${evidence} Cortex will close this task automatically when every profile is complete.`;
+}
+
+function readinessTaskDefinition(blocker: string, readiness?: any) {
   const value = String(blocker || '').toLowerCase();
   if (value.includes('missing dimensions') || value.includes('dimensions or weight')) {
     return {
@@ -2163,7 +2194,7 @@ function readinessTaskDefinition(blocker: string) {
       entityType: 'supplier',
       actionLabel: 'Complete supplier profiles',
       navigationPayload: 'filter:missing-pickup',
-      detail: 'Add pickup hours and origin details to incomplete supplier profiles so shipment routing has a valid starting point.',
+      detail: supplierPickupTaskDetail(readiness),
     };
   }
   if (value.includes('amazon') && value.includes('item sync')) {
@@ -2301,7 +2332,7 @@ export async function refreshCortexTasks(userId: string) {
   const activeKeys = new Set<string>();
 
   for (const blocker of (readiness.blockers || []).filter(Boolean) as string[]) {
-    const definition = readinessTaskDefinition(blocker);
+    const definition = readinessTaskDefinition(blocker, readiness);
     const dedupeKey = `readiness:${definition.key}`;
     activeKeys.add(dedupeKey);
     await upsertCortexTask(userId, {
