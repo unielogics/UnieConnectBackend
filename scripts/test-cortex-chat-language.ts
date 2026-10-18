@@ -39,12 +39,20 @@ assert.equal(
   'add warehouse square footage to the warehouse profile.',
 );
 assert.equal(
+  humanizeInternalLanguage('Grant read_locations before using oms_marketplace_connections.'),
+  'Grant Shopify location inventory access before using marketplace connections.',
+);
+assert.equal(
   polishCortexChatText('Confidence: 0.80\n\nSources: oms_orders'),
   'Confidence: 80%',
 );
 assert.equal(
   polishCortexChatText('NVIDIA NIM identified freight as the largest cost driver.'),
   'Cortex identified freight as the largest cost driver.',
+);
+assert.equal(
+  polishCortexChatText('```json\n{"answer":"Reconnect Shopify and approve read_locations.","confidence":0.8}\n```'),
+  'Reconnect Shopify and approve Shopify location inventory access.',
 );
 
 console.log('Cortex chat language contract passed.');

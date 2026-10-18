@@ -2988,6 +2988,8 @@ export function scrubVendorLanguage(text: string) {
 
 export function humanizeInternalLanguage(text: unknown) {
   return scrubVendorLanguage(String(text || ''))
+    .replace(/\boms_marketplace_connections\b/gi, 'marketplace connections')
+    .replace(/\boms_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\b/gi, (_match, value) => String(value).replace(/_/g, ' '))
     .replace(/\bnetwork[-_ ]context\s+facility[-_ ]profile\b/gi, 'warehouse profile')
     .replace(/\bfacility[_ ]sqft\b/gi, 'warehouse square footage')
     .replace(/\bheadcount[_ ]reported\b/gi, 'team size')
@@ -3007,9 +3009,25 @@ export function humanizeInternalLanguage(text: unknown) {
     .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
     .replace(/\bprovide team size or staff roster\b/gi, 'add your team size or upload a staff roster')
     .replace(/\breconnect Shopify with (?:read[_ ]locations scope|Shopify location inventory permission)\b/gi, 'Reconnect Shopify and approve location inventory access')
-    .replace(/\bread[_ ]locations scope\b/gi, 'Shopify location inventory permission')
+    .replace(/\bread[_ ]locations(?: scope)?\b/gi, 'Shopify location inventory access')
     .replace(/\bprioritize:\s*/gi, 'Start with: ')
     .replace(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/gi, (value) => value.replace(/_/g, ' '));
+}
+
+function cortexAnswerText(text: string) {
+  const original = String(text || '').trim();
+  const candidate = original
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!candidate.startsWith('{') || !candidate.endsWith('}')) return original;
+  try {
+    const parsed = JSON.parse(candidate);
+    const answer = parsed?.answer ?? parsed?.summary ?? parsed?.message;
+    return typeof answer === 'string' && answer.trim() ? answer.trim() : original;
+  } catch {
+    return original;
+  }
 }
 
 function humanizeCortexTimestamp(value: string) {
@@ -3023,7 +3041,7 @@ function humanizeCortexTimestamp(value: string) {
 }
 
 export function polishCortexChatText(text: string) {
-  const proseOnly = String(text || '').split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence|The readiness notes are|The confidence(?: in [^\n]+)? is):?/i, 1)[0] || '';
+  const proseOnly = cortexAnswerText(text).split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence|The readiness notes are|The confidence(?: in [^\n]+)? is):?/i, 1)[0] || '';
   return humanizeInternalLanguage(proseOnly)
     .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
     .replace(/Cortex response unavailable; used scoped OMS fallback\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
