@@ -266,7 +266,15 @@ export async function getDataReadiness(userId: string) {
        (SELECT COUNT(DISTINCT warehouse_code) FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected' AND COALESCE(metadata->>'source', '') <> 'demo')::int AS facilities,
        (SELECT COUNT(*) FROM oms_warehouse_links WHERE user_id = $1 AND status = 'connected')::int AS wms_links,
        (SELECT COUNT(*) FROM suppliers WHERE user_id = $1)::int AS suppliers,
-       (SELECT COUNT(*) FROM suppliers WHERE user_id = $1 AND COALESCE(metadata->'pickupProfile'->>'hoursOfOperation', metadata->>'hoursOfOperation', '') <> '')::int AS suppliers_with_pickup,
+       (SELECT COUNT(*)
+          FROM suppliers
+         WHERE user_id = $1
+           AND BTRIM(COALESCE(metadata->'pickupProfile'->>'hoursOfOperation', metadata->>'hoursOfOperation', '')) <> ''
+           AND BTRIM(COALESCE(metadata->'pickupProfile'->>'maxVehicleSize', metadata->>'maxVehicleSize', '')) <> ''
+           AND (
+             jsonb_typeof(metadata->'pickupProfile'->'loadingDock') = 'boolean'
+             OR jsonb_typeof(metadata->'loadingDock') = 'boolean'
+           ))::int AS suppliers_with_pickup,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND (weight IS NULL OR weight <= 0 OR COALESCE(dimensions->>'length','') = '' OR COALESCE(dimensions->>'width','') = '' OR COALESCE(dimensions->>'height','') = ''))::int AS missing_dimensions,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND COALESCE(attributes->>'cost', metadata->>'cost', '') = '')::int AS missing_cost,
        (SELECT COUNT(*) FROM catalog_items WHERE user_id = $1 AND wms_inventory <> '{}'::jsonb)::int AS wms_inventory_items`,
@@ -4207,7 +4215,10 @@ function buildGroundedSupplierGuidance(context: any) {
   const hasPickupProfile = (supplier: any) => {
     const metadata = json(supplier?.metadata, {});
     const pickup = json(metadata?.pickupProfile, {});
-    return Boolean(String(pickup?.hoursOfOperation || metadata?.hoursOfOperation || '').trim());
+    const hoursOfOperation = String(pickup?.hoursOfOperation || metadata?.hoursOfOperation || '').trim();
+    const maxVehicleSize = String(pickup?.maxVehicleSize || metadata?.maxVehicleSize || '').trim();
+    const loadingDock = pickup?.loadingDock ?? metadata?.loadingDock;
+    return Boolean(hoursOfOperation && maxVehicleSize && typeof loadingDock === 'boolean');
   };
   const incomplete = suppliers.filter((supplier: any) => !hasPickupProfile(supplier));
   const active = suppliers.filter((supplier: any) => !['inactive', 'archived', 'disabled'].includes(String(supplier?.status || '').toLowerCase()));
@@ -4216,9 +4227,9 @@ function buildGroundedSupplierGuidance(context: any) {
         `This account has ${chatPlural(suppliers.length, 'supplier')}; ${active.length} ${active.length === 1 ? 'is' : 'are'} active.`,
         incomplete.length
           ? `${chatPlural(incomplete.length, 'supplier')} ${incomplete.length === 1 ? 'is' : 'are'} missing a complete pickup profile: ${incomplete.map((supplier: any) => supplier.name || 'Unnamed supplier').join(', ')}.`
-          : 'Every supplier has pickup hours recorded, so no pickup-profile setup gap is currently detected.',
+          : 'Every supplier has complete pickup hours, vehicle limits, and loading-dock information.',
         incomplete.length
-          ? 'Next action: add pickup hours and origin details so shipment routing and truck booking start from verified supplier information.'
+          ? 'Next action: add pickup hours, maximum vehicle size, and loading-dock availability so shipment routing and truck booking use verified supplier constraints.'
           : 'No supplier setup action is required unless contact, origin, or pickup information has changed.',
       ]
     : [
