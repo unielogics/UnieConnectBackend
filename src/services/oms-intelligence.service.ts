@@ -3874,9 +3874,18 @@ function buildGroundedOperationalRoadmap(context: any) {
   ];
 
   const priorityRank: Record<string, number> = { high: 0, normal: 1, low: 2 };
+  const stageRank = (task: any) => {
+    const target = String(task?.actionTarget || task?.screen || '');
+    if (!marketplaceReady && target === 'connections') return 0;
+    if (!catalogCount && ['skus', 'product-research'].includes(target)) return 1;
+    if (!warehouseReady && ['warehouses', 'connections'].includes(target)) return 2;
+    if (!supplierCount && target === 'suppliers') return 3;
+    return 4;
+  };
   const actions = [...tasks]
     .filter((task: any) => task?.status === 'open')
-    .sort((a: any, b: any) => (priorityRank[String(a?.priority || '').toLowerCase()] ?? 3) - (priorityRank[String(b?.priority || '').toLowerCase()] ?? 3))
+    .sort((a: any, b: any) => stageRank(a) - stageRank(b)
+      || (priorityRank[String(a?.priority || '').toLowerCase()] ?? 3) - (priorityRank[String(b?.priority || '').toLowerCase()] ?? 3))
     .slice(0, 3)
     .map((task: any) => ({
       id: task.id,
@@ -4547,7 +4556,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.answer = fallback.answer;
   }
   const requiredFocusSource = normalizeChatSource({ source: focusContext?.requiredSource });
-  if (requiredFocusSource) {
+  if (requiredFocusSource && !chatRequestsOperationalRoadmap(focusQuery)) {
     const focusedSources = normalized.sources.filter((source: any) => source?.source === requiredFocusSource.source);
     normalized.sources = focusedSources.length ? focusedSources : [requiredFocusSource];
   }
