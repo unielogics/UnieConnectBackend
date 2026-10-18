@@ -3754,6 +3754,74 @@ function buildGroundedFinancialLeakage(context: any) {
   };
 }
 
+function buildGroundedAccountSnapshot(context: any) {
+  const readiness = context?.readiness || {};
+  const counts = readiness.counts || {};
+  const samples = context?.samples || {};
+  const connections = Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections : [];
+  const orders = Array.isArray(samples.orders) ? samples.orders : [];
+  const warehouses = Array.isArray(samples.warehouses) ? samples.warehouses : [];
+  const billing = json(samples.billing, {});
+  const categoryTotals = json(billing.categoryTotals30d, {});
+  const operatingCost = money(
+    number(categoryTotals.freight)
+    + number(categoryTotals.storage)
+    + number(categoryTotals.handling)
+    + number(categoryTotals.accessorials)
+    + number(categoryTotals.materials)
+    - number(categoryTotals.refundsCaptured),
+  );
+  const degradedConnections = connections.filter((connection: any) => Object.values(json(connection?.sync, {})).some((state: any) => (
+    state?.status === 'error' || Boolean(state?.error) || Boolean(state?.metadata?.degraded)
+  )));
+  const pendingOrders = orders.filter((order: any) => ![
+    'completed', 'complete', 'delivered', 'fulfilled', 'cancelled', 'canceled', 'closed', 'refunded',
+  ].includes(String(order?.status || '').toLowerCase()));
+  const warehouseInventoryUnits = warehouses.reduce((sum: number, warehouse: any) => (
+    sum + number(warehouse?.inventoryUnits ?? warehouse?.inventory_units)
+  ), 0);
+  const warehouseAsns = warehouses.reduce((sum: number, warehouse: any) => (
+    sum + number(warehouse?.asns ?? warehouse?.asnCount ?? warehouse?.asn_count)
+  ), 0);
+  const gaps = [
+    chatCount(counts.missingDimensions) ? `${chatPlural(chatCount(counts.missingDimensions), 'SKU')} missing dimensions or weight` : null,
+    chatCount(counts.missingCost) ? `${chatPlural(chatCount(counts.missingCost), 'SKU')} missing unit cost` : null,
+    !chatCount(counts.wmsLinks) ? 'no connected warehouse or WMS truth' : null,
+    chatCount(counts.amazonBlockedItems) ? `${chatPlural(chatCount(counts.amazonBlockedItems), 'Amazon SKU')} blocked for listing readiness` : null,
+  ].filter(Boolean);
+  const marketplaceNames = connections
+    .map((connection: any) => String(connection?.display_name || connection?.shop_domain || connection?.channel || '').trim())
+    .filter(Boolean);
+  const lines = [
+    'Account snapshot',
+    `Connected operations: ${chatPlural(chatCount(counts.catalogItems), 'SKU')}, ${chatPlural(chatCount(counts.orders), 'order')}, ${chatPlural(connections.length, 'marketplace connection')}, ${chatPlural(chatCount(counts.wmsLinks), 'warehouse link')}, and ${chatPlural(chatCount(counts.suppliers), 'supplier')}.`,
+    connections.length
+      ? `Marketplace health: ${marketplaceNames.join(', ')} ${connections.length === 1 ? 'is' : 'are'} connected${degradedConnections.length ? `; ${chatPlural(degradedConnections.length, 'connection')} has a degraded data area that needs review` : ' with no recorded sync degradation'}.`
+      : 'Marketplace health: no marketplace connection is active, so product and order synchronization is unavailable.',
+    `Order flow: ${chatPlural(orders.length || chatCount(counts.orders), 'order')} in the current account view; ${chatPlural(pendingOrders.length, 'order')} not yet in a completed, delivered, fulfilled, cancelled, closed, or refunded state.`,
+    warehouses.length
+      ? `Warehouse evidence: ${chatPlural(warehouses.length, 'connected warehouse')} reporting ${warehouseInventoryUnits.toLocaleString('en-US')} inventory units and ${chatPlural(warehouseAsns, 'ASN')}.`
+      : 'Warehouse evidence: no connected warehouse record is available.',
+    operatingCost > 0
+      ? `Financial evidence: ${`$${operatingCost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} in net operating charges recorded during the last 30 days.`
+      : 'Financial evidence: no category-level operating charges are recorded for the last 30 days.',
+    `Intelligence readiness: ${Math.max(0, Math.min(100, Math.round(number(readiness.score))))}% (${readablePosture(readiness.posture)}). ${gaps.length ? `The main evidence gaps are ${gaps.join('; ')}.` : 'No major evidence gap is currently recorded.'}`,
+  ];
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [
+      { source: 'oms_marketplace_connections', count: connections.length, degraded: degradedConnections.length },
+      { source: 'oms_orders', count: orders.length || chatCount(counts.orders), pending: pendingOrders.length },
+      { source: 'oms_warehouses', count: warehouses.length, inventoryUnits: warehouseInventoryUnits, asns: warehouseAsns },
+      { source: 'oms_billing', window: '30d', netOperatingCost: operatingCost },
+      { source: 'oms_data_readiness', readinessScore: readiness.score, posture: readiness.posture },
+    ],
+    tasks: [],
+    confidence: 0.99,
+    readinessNotes: null,
+  };
+}
+
 function buildGroundedMarginGuidance(context: any) {
   const readiness = context?.readiness || {};
   const counts = readiness.counts || {};
@@ -4738,6 +4806,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const normalized = accountGroundedFastPath
     ? fallback
     : normalizeCortexChatResponse(cortex, fallback, actionIntent);
+  if (accountSnapshotQuestion) {
+    const groundedAccountSnapshot = buildGroundedAccountSnapshot(context);
+    normalized.answer = groundedAccountSnapshot.answer;
+    normalized.sources = groundedAccountSnapshot.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = [];
+    normalized.confidence = groundedAccountSnapshot.confidence;
+    normalized.readinessNotes = groundedAccountSnapshot.readinessNotes;
+  }
   if (chatRequestsSkuOpportunityRanking(focusQuery)) {
     const directSkuRankingQuestion = chatRequestsSkuOpportunityRanking(message);
     const groundedSkuOpportunity = directSkuRankingQuestion
