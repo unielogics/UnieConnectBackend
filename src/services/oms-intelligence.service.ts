@@ -5535,7 +5535,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || financialLeakageQuestion
     || shipmentReadinessQuestion
     || priorActionFollowup;
-  const cortex = accountGroundedFastPath ? {
+  const cortex: any = accountGroundedFastPath ? {
     ok: false,
     status: 200,
     data: { reason: 'account_grounded_answer' },
@@ -5919,6 +5919,9 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     mode: delivery.mode,
     liveRouteAvailable,
     liveRouteStatus: cortex?.status || 503,
+    latencyMs: Number.isFinite(Number(cortex?.duration_ms)) ? Number(cortex.duration_ms) : undefined,
+    attempts: Number.isFinite(Number(cortex?.attempts)) ? Number(cortex.attempts) : undefined,
+    checkedAt: new Date().toISOString(),
     liveRouteReason: accountGroundedFastPath
       ? 'not_required_for_account_fact'
       : cortex?.ok
@@ -5979,7 +5982,7 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
   const tenantConfigured = Boolean(tenantCredential?.secret_enc);
   const bootstrapConfigured = Boolean(globalConfig.configured);
   const configured = tenantConfigured || bootstrapConfigured;
-  const live = await postCortex('/v1/orchestration/oms/chat/health', {
+  const live: any = await postCortex('/v1/orchestration/oms/chat/health', {
     tenant_id: userId,
     userId,
   }, {
@@ -6001,6 +6004,9 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
         mode: 'unavailable',
         liveRouteAvailable: false,
         liveRouteStatus: Number(live?.status || 503),
+        latencyMs: Number.isFinite(Number(live?.duration_ms)) ? Number(live.duration_ms) : undefined,
+        attempts: Number.isFinite(Number(live?.attempts)) ? Number(live.attempts) : undefined,
+        checkedAt: new Date().toISOString(),
         liveRouteReason: live?.data?.error || live?.data?.detail || 'cortex_chat_unavailable',
       },
     };
@@ -6016,6 +6022,9 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
     mode: liveRouteAvailable ? 'live' : configured ? 'fallback' : 'unavailable',
     liveRouteAvailable,
     liveRouteStatus: Number(live?.status || 503),
+    latencyMs: Number.isFinite(Number(live?.duration_ms)) ? Number(live.duration_ms) : undefined,
+    attempts: Number.isFinite(Number(live?.attempts)) ? Number(live.attempts) : undefined,
+    checkedAt: new Date().toISOString(),
     liveRouteReason: liveRouteAvailable
       ? 'live_chat_available'
       : live?.status === 404
