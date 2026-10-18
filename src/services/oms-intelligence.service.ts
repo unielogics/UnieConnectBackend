@@ -2931,8 +2931,14 @@ function normalizeChatAction(value: any) {
   const inferred = taskTargetFromText(`${title} ${value.detail || value.summary || ''}`);
   const actionTarget = CORTEX_CHAT_SCREENS.has(requestedTarget) ? requestedTarget : inferred.screen;
   const entityType = value.entityType ? String(value.entityType).trim().toLowerCase().slice(0, 80) : undefined;
+  const dedupeKey = value.dedupeKey ? String(value.dedupeKey).slice(0, 180) : undefined;
+  const navigationPayload = value.navigationPayload
+    || (dedupeKey === 'readiness:sku-unit-cost' ? 'filter:missing-cost' : null)
+    || (dedupeKey === 'readiness:sku-dimensions-weight' ? 'filter:missing-dimensions' : null)
+    || (dedupeKey === 'readiness:supplier-pickup-profiles' ? 'filter:missing-pickup' : null);
   return {
     id: value.id ? String(value.id).slice(0, 160) : undefined,
+    dedupeKey,
     title,
     priority: ['high', 'normal', 'low'].includes(String(value.priority || '').toLowerCase())
       ? String(value.priority).toLowerCase()
@@ -2942,6 +2948,7 @@ function normalizeChatAction(value: any) {
     actionLabel: humanizeInternalLanguage(value.actionLabel || value.label || title).trim().slice(0, 120),
     entityType,
     entityId: entityType === 'account' || !value.entityId ? undefined : String(value.entityId).slice(0, 160),
+    navigationPayload: navigationPayload ? String(navigationPayload).slice(0, 180) : undefined,
   };
 }
 
@@ -3507,6 +3514,61 @@ function chatRequestsSkuOpportunityRanking(message: string) {
   const asksForRanking = /\b(strongest|biggest|best|top|first|highest|most|which|identify|rank|prioriti[sz]e)\b/.test(q);
   const asksForImprovement = /\b(opportunity|improve|improvement|optimi[sz](?:e|ation)|work on|fix|enrich)\b/.test(q);
   return namesCatalogItem && asksForRanking && asksForImprovement;
+}
+
+function chatRequestsMarginGuidance(message: string) {
+  const q = String(message || '').toLowerCase();
+  return /\b(gross margin|unit margin|margin|profitability)\b/.test(q)
+    && /\b(improve|increase|raise|optimi[sz]e|better|what|how|opportunity|action|next)\b/.test(q);
+}
+
+function buildGroundedMarginGuidance(context: any) {
+  const readiness = context?.readiness || {};
+  const counts = readiness.counts || {};
+  const skus = Array.isArray(context?.samples?.skus) ? context.samples.skus : [];
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const catalogCount = chatCount(counts.catalogItems || skus.length);
+  const missingCost = chatCount(counts.missingCost);
+  const missingPrice = skus.filter((sku: any) => number(sku?.price) <= 0).length;
+  const missingDimensions = chatCount(counts.missingDimensions);
+  const costTask = tasks.find((task: any) => task?.dedupeKey === 'readiness:sku-unit-cost');
+  const dimensionsTask = tasks.find((task: any) => task?.dedupeKey === 'readiness:sku-dimensions-weight');
+  const measurableSkuCount = skus.filter((sku: any) => number(sku?.cost) > 0 && number(sku?.price) > 0).length;
+  const lines = [
+    missingCost || missingPrice
+      ? `A reliable gross-margin improvement cannot be ranked yet because ${missingCost || 'some'} of ${catalogCount || skus.length} SKUs are missing unit cost${missingPrice ? ` and ${missingPrice} are missing selling price` : ''}.`
+      : `${measurableSkuCount || catalogCount} SKUs have the cost and selling-price evidence needed for a margin baseline.`,
+    missingCost || missingPrice
+      ? 'First action: complete unit cost and selling price. Those fields establish current gross margin dollars and margin percentage before Cortex recommends a price, purchasing, or fulfillment change.'
+      : 'First action: compare current unit margin against purchasing, pricing, and fulfillment cost evidence before approving a change.',
+    missingDimensions
+      ? `Second action: complete dimensions and weight for ${missingDimensions} SKUs so fulfillment and freight cost can be included after product margin is measurable.`
+      : 'Package dimensions and weight are available for the fulfillment-cost comparison.',
+    'Cortex will not invent a savings or margin-uplift figure while the baseline inputs are incomplete.',
+  ];
+  const actionTasks = [costTask, dimensionsTask].filter(Boolean).map((task: any) => ({
+    id: task.id,
+    dedupeKey: task.dedupeKey,
+    title: task.title,
+    priority: task.priority,
+    screen: task.screen,
+    actionTarget: task.actionTarget || task.screen,
+    actionLabel: task.actionLabel,
+    entityType: task.entityType,
+    entityId: task.entityId,
+  }));
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [
+      { source: 'oms_skus', count: catalogCount || skus.length },
+      { source: 'oms_billing' },
+    ],
+    tasks: actionTasks,
+    confidence: 0.96,
+    readinessNotes: missingCost || missingPrice
+      ? 'Cost and selling-price evidence must be complete before margin impact is measurable.'
+      : null,
+  };
 }
 
 function skuDimensionsComplete(sku: any) {
@@ -4174,6 +4236,7 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
     tasks: actionIntent || includeMarketplaceRepair
       ? responseTasks.slice(0, marketplaceConnectionIntent || priorityIntent ? 1 : 3).map((task: any) => ({
           id: task.id,
+          dedupeKey: task.dedupeKey,
           title: task.title,
           priority: task.priority,
           screen: task.screen,
@@ -4452,6 +4515,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       normalized.readinessNotes = groundedSkuOpportunity.readinessNotes;
     }
   }
+  if (chatRequestsMarginGuidance(message)) {
+    const groundedMargin = buildGroundedMarginGuidance(context);
+    normalized.answer = groundedMargin.answer;
+    normalized.sources = groundedMargin.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedMargin.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedMargin.confidence;
+    normalized.readinessNotes = groundedMargin.readinessNotes;
+  }
   if (chatRequestsOrderPriority(focusQuery)) {
     const groundedOrderPriority = buildGroundedOrderPriorityResponse(message, context, focusContext);
     normalized.answer = groundedOrderPriority.answer;
@@ -4541,6 +4612,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         .slice(0, 3)
         .map((task: any) => normalizeChatAction({
           id: task.id,
+          dedupeKey: task.dedupeKey,
           title: task.title,
           priority: task.priority,
           screen: task.screen,
@@ -4582,6 +4654,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       return matchingTask
         ? normalizeChatAction({
             id: matchingTask.id,
+            dedupeKey: matchingTask.dedupeKey,
             title: matchingTask.title,
             priority: matchingTask.priority,
             screen: matchingTask.screen,
