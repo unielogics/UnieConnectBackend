@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'unieconnect-backend',
       cwd: __dirname,
-      script: 'dist/server.js',
+      script: '.current/dist/server.js',
       instances: 1,
       autorestart: true,
       watch: false,

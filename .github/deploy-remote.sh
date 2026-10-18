@@ -38,18 +38,7 @@ fi
 
 COMMIT=$(git rev-parse --short=12 HEAD)
 RELEASE_DIR="$RELEASES_DIR/$(date -u +%Y%m%d%H%M%S)-$COMMIT"
-OLD_RELEASE=$(pm2 jlist 2>/dev/null | node -e '
-  let body = "";
-  process.stdin.on("data", (chunk) => { body += chunk; });
-  process.stdin.on("end", () => {
-    try {
-      const app = JSON.parse(body).find((item) => item.name === "unieconnect-backend");
-      process.stdout.write(app?.pm2_env?.pm_cwd || "");
-    } catch (_) {
-      process.stdout.write("");
-    }
-  });
-')
+OLD_RELEASE=$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)
 OLD_RELEASE=${OLD_RELEASE:-$APP_DIR}
 
 echo "Building release $RELEASE_DIR while $OLD_RELEASE remains live"
@@ -68,11 +57,17 @@ npm run build
 npm prune --omit=dev
 
 echo "Switching PM2 to release $COMMIT"
-pm2 startOrReload "$RELEASE_DIR/ecosystem.config.js" --update-env
+ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
+if pm2 describe unieconnect-backend 2>/dev/null | grep -Fq "$CURRENT_LINK/dist/server.js"; then
+  pm2 reload "$APP_DIR/ecosystem.config.js" --update-env
+else
+  # One-time migration from the former in-place process path to the stable release symlink.
+  pm2 delete unieconnect-backend >/dev/null 2>&1 || true
+  pm2 start "$APP_DIR/ecosystem.config.js" --update-env
+fi
 
 for attempt in $(seq 1 20); do
   if curl --fail --silent --show-error http://127.0.0.1:4000/api/v1/ready >/dev/null; then
-    ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
     pm2 save
     find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
       | sort -nr \
@@ -91,6 +86,12 @@ echo "Backend readiness check failed after deployment."
 pm2 logs unieconnect-backend --err --lines 80 --nostream || true
 if [ -f "$OLD_RELEASE/ecosystem.config.js" ]; then
   echo "Rolling back to $OLD_RELEASE"
-  pm2 startOrReload "$OLD_RELEASE/ecosystem.config.js" --update-env || true
+  if [ "$OLD_RELEASE" = "$APP_DIR" ]; then
+    pm2 delete unieconnect-backend >/dev/null 2>&1 || true
+    pm2 start "$APP_DIR/dist/server.js" --name unieconnect-backend --cwd "$APP_DIR" -i 1 --max-memory-restart 512M || true
+  else
+    ln -sfn "$OLD_RELEASE" "$CURRENT_LINK"
+    pm2 reload "$APP_DIR/ecosystem.config.js" --update-env || true
+  fi
 fi
 exit 1
