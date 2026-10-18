@@ -4322,7 +4322,7 @@ export async function getBillingProfit(
       [userId],
     );
 
-  const [catRows, whRows, seriesRows, prevCatRows, everRows, refundRows, prevRefundRows] = await Promise.all([
+  const [catRows, whRows, seriesRows, prevCatRows, everRows, refundRows, prevRefundRows, linkedWarehouses] = await Promise.all([
     catRowsFor(start, end),
     whRowsFor(start, end),
     seriesRowsFor(start, end),
@@ -4330,6 +4330,7 @@ export async function getBillingProfit(
     everRowsFor(),
     refundRowsFor(start, end),
     refundRowsFor(prevStart, prevEnd),
+    warehouseLinks(userId),
   ]);
   const hasRealInvoices = catRows.some((r) => number(r.total) > 0);
   // Distinguish "empty window on an account that HAS real invoices" from "brand-new account with no
@@ -4411,11 +4412,24 @@ export async function getBillingProfit(
   // only (no category split), so we apply the blended cost-reduction ratio (overall optimized/
   // current). With nothing approved this ratio is 1 → optimized == current → $0 savings, honest.
   const blendedRatio = currentTotal > 0 ? optimizedTotal / currentTotal : 1;
+  const warehouseIdentity = new Map(
+    linkedWarehouses.map((warehouse) => {
+      const mapped = mapWarehouseLink(warehouse);
+      return [mapped.code.toUpperCase(), mapped] as const;
+    }),
+  );
   const perWarehouse = whRows
     .filter((r) => r.code && number(r.total) > 0)
     .map((r) => {
       const cur = money(number(r.total));
-      return { code: r.code, current: cur, optimized: money(cur * blendedRatio) };
+      const identity = warehouseIdentity.get(String(r.code).toUpperCase());
+      return {
+        code: r.code,
+        name: identity?.name || identity?.facilityName || r.code,
+        region: identity?.region || null,
+        current: cur,
+        optimized: money(cur * blendedRatio),
+      };
     })
     .sort((a, b) => b.current - a.current);
 
