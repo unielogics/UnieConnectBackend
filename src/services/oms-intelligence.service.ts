@@ -3109,6 +3109,23 @@ function buildGroundedAiPlanApprovalResponse(context: any, focusContext: any) {
     ].includes(String(task?.dedupeKey || '')))
     .sort((a: any, b: any) => String(a.dedupeKey).localeCompare(String(b.dedupeKey)));
 
+  if (plan?.noChangeRecommended === true || String(plan?.impactStatus || '') === 'no_change') {
+    return {
+      answer: [
+        'The AI Plan is complete, but there is nothing to approve. Cortex recommends retaining the current warehouse network because the latest model did not find a material, traceable improvement.',
+        'Keep the current plan in place. Run Business Double again when demand, warehouse capacity, service levels, or observed operating costs change enough to support a different decision.',
+      ].join('\n\n'),
+      sources: [
+        { source: 'oms_business_double' },
+        { source: 'oms_billing' },
+        { source: 'oms_warehouses' },
+      ],
+      tasks: [],
+      confidence: 1,
+      readinessNotes: null,
+    };
+  }
+
   if (plan?.decisionReady === true) {
     return {
       answer: [
