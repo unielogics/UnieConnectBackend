@@ -2921,17 +2921,18 @@ function compactTaskLine(task: any, index: number) {
   return `${index}. ${title}. ${action}.`;
 }
 
-function scrubVendorLanguage(text: string) {
+export function scrubVendorLanguage(text: string) {
   return String(text || '')
+    .replace(/\bNVIDIA(?:\s+NIM)?\s+(?:GPU\s+)?drivers?\b/gi, 'Cortex runtime')
+    .replace(/\b(?:GPU|model|inference)\s+drivers?\b/gi, 'Cortex runtime')
     .replace(/\bNVIDIA\s*NIM\b/gi, 'Cortex')
     .replace(/\bNIM\b/g, 'Cortex')
     .replace(/\bNVIDIA\b/gi, 'Cortex')
     .replace(/\blive Cortex\b/gi, 'Cortex')
-    .replace(/\bCortex\/Cortex\b/gi, 'Cortex')
-    .replace(/\bdrivers?\b/gi, 'runtime');
+    .replace(/\bCortex\/Cortex\b/gi, 'Cortex');
 }
 
-function humanizeInternalLanguage(text: unknown) {
+export function humanizeInternalLanguage(text: unknown) {
   return scrubVendorLanguage(String(text || ''))
     .replace(/\bnetwork[-_ ]context\s+facility[-_ ]profile\b/gi, 'warehouse profile')
     .replace(/\bfacility[_ ]sqft\b/gi, 'warehouse square footage')
@@ -2967,7 +2968,7 @@ function humanizeCortexTimestamp(value: string) {
   }).format(parsed)} UTC`;
 }
 
-function polishCortexChatText(text: string) {
+export function polishCortexChatText(text: string) {
   const proseOnly = String(text || '').split(/\n{1,2}(?:Sources|Suggested actions|Readiness notes|Confidence|The readiness notes are|The confidence(?: in [^\n]+)? is):?/i, 1)[0] || '';
   return humanizeInternalLanguage(proseOnly)
     .replace(/(?:Note:\s*)?Cortex did not respond, so this answer was generated from this account'?s scoped OMS data only\.?/gi, 'Answer generated from this account\u2019s scoped OMS data.')
