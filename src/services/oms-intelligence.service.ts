@@ -3045,6 +3045,25 @@ function chatRequestsRecentActivity(message: string) {
   return /\b(what changed|changes? today|what happened|happened today|recent activity|latest changes|latest activity)\b/i.test(message);
 }
 
+function chatRequestsSupplierGuidance(message: string, screen?: string) {
+  return screen === 'suppliers'
+    && /\b(what should|what can|need|missing|incomplete|pickup|setup|status|how (?:are|is)|which supplier|suppliers?)\b/i.test(message);
+}
+
+function chatRequestsLabelAuditStatus(message: string, screen?: string) {
+  return (screen === 'labels' || screen === 'audits')
+    && /\b(issue|issues|problem|problems|finding|findings|audit|refund|claim|status|how (?:are|is)|anything)\b/i.test(message);
+}
+
+function chatRequestsInventoryRisk(message: string) {
+  return /\b(?:where|which|what).{0,24}\binventory.{0,16}\b(?:risk|at risk|stockout|reorder)|\binventory at risk\b/i.test(message);
+}
+
+function chatRequestsAmazonReadiness(message: string) {
+  return /\bamazon\b/i.test(message)
+    && /\b(readiness|ready|blocking|blocked|listing|fba|fbm|authorize|authorization|connect|sync)\b/i.test(message);
+}
+
 function chatRequestsActions(message: string) {
   return chatRequestsPriority(message)
     || /(what (?:should|can)(?: i)?|what i (?:should|can)|how (?:do|can|should)|next step|what to do|action|recommend|help me|fix|repair|improve|resolve|\bstep\b|set up|get started)/i.test(message);
@@ -4035,6 +4054,268 @@ function buildGroundedRecentActivity(context: any) {
   };
 }
 
+function buildGroundedSupplierGuidance(context: any) {
+  const suppliers = Array.isArray(context?.samples?.suppliers) ? context.samples.suppliers : [];
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const supplierTask = tasks.find((task: any) => String(task?.dedupeKey || '') === 'readiness:supplier-pickup-profiles');
+  const hasPickupProfile = (supplier: any) => {
+    const metadata = json(supplier?.metadata, {});
+    const pickup = json(metadata?.pickupProfile, {});
+    return Boolean(String(pickup?.hoursOfOperation || metadata?.hoursOfOperation || '').trim());
+  };
+  const incomplete = suppliers.filter((supplier: any) => !hasPickupProfile(supplier));
+  const active = suppliers.filter((supplier: any) => !['inactive', 'archived', 'disabled'].includes(String(supplier?.status || '').toLowerCase()));
+  const lines = suppliers.length
+    ? [
+        `This account has ${chatPlural(suppliers.length, 'supplier')}; ${active.length} ${active.length === 1 ? 'is' : 'are'} active.`,
+        incomplete.length
+          ? `${chatPlural(incomplete.length, 'supplier')} ${incomplete.length === 1 ? 'is' : 'are'} missing a complete pickup profile: ${incomplete.map((supplier: any) => supplier.name || 'Unnamed supplier').join(', ')}.`
+          : 'Every supplier has pickup hours recorded, so no pickup-profile setup gap is currently detected.',
+        incomplete.length
+          ? 'Next action: add pickup hours and origin details so shipment routing and truck booking start from verified supplier information.'
+          : 'No supplier setup action is required unless contact, origin, or pickup information has changed.',
+      ]
+    : [
+        'No supplier is configured on this account.',
+        'Add a supplier before creating an inbound shipment plan, then assign the supplier to the SKUs it provides.',
+      ];
+  const action = supplierTask
+    ? {
+        id: supplierTask.id,
+        dedupeKey: supplierTask.dedupeKey,
+        title: supplierTask.title,
+        priority: supplierTask.priority,
+        screen: supplierTask.screen,
+        actionTarget: supplierTask.actionTarget || supplierTask.screen,
+        actionLabel: supplierTask.actionLabel,
+        entityType: supplierTask.entityType,
+        entityId: supplierTask.entityId,
+      }
+    : incomplete.length || !suppliers.length
+      ? {
+          title: incomplete.length ? 'Complete supplier pickup profiles' : 'Add a supplier',
+          priority: incomplete.length ? 'normal' : 'high',
+          screen: 'suppliers',
+          actionTarget: 'suppliers',
+          actionLabel: incomplete.length ? 'Complete supplier profiles' : 'Add supplier',
+          entityType: 'supplier',
+          navigationPayload: incomplete.length ? 'filter:missing-pickup' : undefined,
+        }
+      : null;
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{ source: 'oms_suppliers', count: suppliers.length, active: active.length, incompletePickupProfiles: incomplete.length }],
+    tasks: action ? [action] : [],
+    confidence: 0.99,
+    readinessNotes: incomplete.length ? `${incomplete.length} supplier pickup profile${incomplete.length === 1 ? '' : 's'} remain incomplete.` : null,
+  };
+}
+
+function buildGroundedLabelAuditStatus(context: any) {
+  const runs = Array.isArray(context?.samples?.labelAuditRuns) ? context.samples.labelAuditRuns : [];
+  const findings = Array.isArray(context?.samples?.labelAuditFindings) ? context.samples.labelAuditFindings : [];
+  const latest = runs[0];
+  if (!latest) {
+    return {
+      answer: polishCortexChatText([
+        'No carrier label audit has been run for this account, so there is not enough evidence to say that there are no issues.',
+        'Upload a carrier or order-label CSV to check late delivery, refundable charges, dimensional-weight mismatches, service mismatches, and missing claim evidence.',
+      ].join('\n\n')),
+      sources: [{ source: 'oms_label_audits', runs: 0, findings: 0 }],
+      tasks: [{
+        title: 'Run the first carrier label audit',
+        priority: 'normal',
+        screen: 'labels',
+        actionTarget: 'labels',
+        actionLabel: 'Upload audit CSV',
+        entityType: 'label_audit',
+      }],
+      confidence: 1,
+      readinessNotes: 'No audit evidence is available until a CSV run is completed.',
+    };
+  }
+  const openFindings = findings.filter((finding: any) => !['resolved', 'closed', 'dismissed', 'refunded'].includes(String(finding?.status || '').toLowerCase()));
+  const highFindings = openFindings.filter((finding: any) => ['high', 'critical'].includes(String(finding?.severity || '').toLowerCase()));
+  const refundOpportunity = openFindings.reduce((sum: number, finding: any) => sum + money(finding?.refundAmount), 0);
+  const lines = [
+    `The latest label audit analyzed ${chatPlural(chatCount(latest?.row_count), 'row')} from ${latest?.filename || 'the uploaded CSV'} and created ${chatPlural(chatCount(latest?.findings_count), 'finding')}.`,
+    openFindings.length
+      ? `${chatPlural(openFindings.length, 'finding')} remain open${highFindings.length ? `, including ${chatPlural(highFindings.length, 'high-priority finding')}` : ''}.`
+      : 'No open finding remains from the recorded audit evidence.',
+    refundOpportunity > 0
+      ? `Observed refundable candidates total $${refundOpportunity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Review the supporting evidence before submitting a claim.`
+      : 'No open refundable amount is recorded. This does not rule out issues outside the uploaded rows.',
+  ];
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{ source: 'oms_label_audits', runs: runs.length, findings: findings.length, openFindings: openFindings.length }],
+    tasks: openFindings.length ? [{
+      title: `Review ${chatPlural(openFindings.length, 'open label finding')}`,
+      priority: highFindings.length ? 'high' : 'normal',
+      screen: 'labels',
+      actionTarget: 'labels',
+      actionLabel: 'Review findings',
+      entityType: 'label_audit',
+      entityId: latest.id,
+    }] : [],
+    confidence: 0.99,
+    readinessNotes: null,
+  };
+}
+
+function buildGroundedInventoryRisk(context: any, focusContext: any) {
+  const inventoryPlan = focusContext?.inventoryPlan || {};
+  const skus = Array.isArray(inventoryPlan?.skus) ? inventoryPlan.skus : [];
+  const riskRank: Record<string, number> = { high: 0, medium: 1, low: 2, needs_sales_data: 3, unknown: 4 };
+  const ranked = skus
+    .map((sku: any) => ({
+      ...sku,
+      risk: String(sku?.risk || 'unknown').toLowerCase(),
+      available: number(sku?.networkOnHand ?? sku?.available),
+      velocity30d: number(sku?.velocity30d),
+      daysOfCover: number(sku?.daysOfCover),
+      reorderNeeded: sku?.reorderNeeded === true,
+    }))
+    .filter((sku: any) => sku.reorderNeeded || ['high', 'medium'].includes(sku.risk))
+    .sort((a: any, b: any) => Number(b.reorderNeeded) - Number(a.reorderNeeded)
+      || (riskRank[a.risk] ?? 5) - (riskRank[b.risk] ?? 5)
+      || a.daysOfCover - b.daysOfCover
+      || b.velocity30d - a.velocity30d);
+  const missingDemand = skus.filter((sku: any) => String(sku?.risk || '').toLowerCase() === 'needs_sales_data');
+  if (!ranked.length) {
+    return {
+      answer: polishCortexChatText([
+        'No evidence-backed stockout or reorder risk is currently ranked from the inventory plan.',
+        missingDemand.length
+          ? `${chatPlural(missingDemand.length, 'SKU')} lack recent sales velocity, so Cortex cannot calculate days of cover for them. That is missing demand evidence, not proof that those items are at risk.`
+          : 'Current SKU inventory and demand evidence does not identify a high- or medium-risk item.',
+        'Next action: reconcile marketplace orders and warehouse inventory, then rerun optimization when new demand or inventory arrives.',
+      ].join('\n\n')),
+      sources: [{ source: 'oms_inventory_plan', evaluatedSkus: skus.length, rankedRisks: 0, missingDemand: missingDemand.length }],
+      tasks: [],
+      confidence: 0.98,
+      readinessNotes: missingDemand.length ? 'Sales velocity is missing for part of the catalog.' : null,
+    };
+  }
+  const top = ranked.slice(0, 3);
+  const first = top[0];
+  const lines = [
+    `${first.sku} is the highest evidence-backed inventory risk among ${chatPlural(ranked.length, 'at-risk SKU')}.`,
+    ...top.map((sku: any, index: number) => `${index + 1}. ${sku.sku}: ${sku.available} units available, ${sku.velocity30d} units sold in 30 days, ${sku.daysOfCover} days of cover${sku.reorderNeeded && sku.suggestedReorderQty ? `; suggested reorder ${Math.round(number(sku.suggestedReorderQty))} units` : ''}.`),
+    missingDemand.length
+      ? `${chatPlural(missingDemand.length, 'additional SKU')} lack sales velocity and are excluded from the risk ranking.`
+      : 'All evaluated SKUs have enough demand evidence for this ranking.',
+  ];
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{ source: 'oms_inventory_plan', evaluatedSkus: skus.length, rankedRisks: ranked.length, selectedSku: first.sku }],
+    tasks: [{
+      title: `Review inventory for ${first.sku}`,
+      priority: first.risk === 'high' || first.reorderNeeded ? 'high' : 'normal',
+      screen: 'sku-detail',
+      actionTarget: 'sku-detail',
+      actionLabel: 'Open SKU details',
+      entityType: 'sku',
+      entityId: first.id,
+    }],
+    confidence: 0.98,
+    readinessNotes: missingDemand.length ? `${missingDemand.length} SKUs are excluded because sales velocity is unavailable.` : null,
+  };
+}
+
+function buildGroundedAmazonReadiness(context: any) {
+  const readiness = context?.readiness || {};
+  const counts = readiness?.counts || {};
+  const connections = Array.isArray(context?.samples?.marketplaceConnections) ? context.samples.marketplaceConnections : [];
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const amazon = connections.find((connection: any) => String(connection?.channel || '').toLowerCase() === 'amazon');
+  const status = String(amazon?.status || 'not connected').toLowerCase();
+  const statusLabel = status === 'needs_authorization'
+    ? 'waiting for authorization'
+    : status.replace(/_/g, ' ');
+  const connected = ['connected', 'active', 'synced'].includes(status);
+  const matchingTask = tasks.find((task: any) => {
+    const text = `${task?.dedupeKey || ''} ${task?.title || ''} ${task?.detail || ''}`.toLowerCase();
+    return (String(task?.source || '') === 'connection_health' || text.includes('amazon')) && text.includes('amazon');
+  });
+  const lines = !amazon
+    ? [
+        'Amazon readiness is blocked because no Amazon marketplace connection exists on this account.',
+        'Authorize Amazon before expecting catalog, listing, FBA, FBM, order, or inventory readiness checks.',
+      ]
+    : !connected
+      ? [
+          `Amazon readiness is blocked because the connection is ${statusLabel}.`,
+          'Complete Amazon authorization first. Catalog and listing requirements cannot be verified until the provider connection is active.',
+        ]
+      : chatCount(counts.amazonProfiles) === 0
+        ? [
+            'Amazon is connected, but no Amazon item profiles have been synchronized.',
+            'Run the Amazon catalog sync to classify listed, FBA, FBM, and incomplete SKUs before reviewing item readiness.',
+          ]
+        : [
+            `Amazon catalog readiness: ${chatPlural(chatCount(counts.amazonProfiles), 'profile')} synchronized, ${chatPlural(chatCount(counts.amazonListedItems), 'listed item')}, and ${chatPlural(chatCount(counts.amazonFbaEligibleItems), 'FBA-ready item')}.`,
+            chatCount(counts.amazonBlockedItems)
+              ? `${chatPlural(chatCount(counts.amazonBlockedItems), 'SKU')} remain blocked by listing or FBA requirements. Open those SKU details to complete the fields shown in the Amazon action drawer.`
+              : 'No Amazon SKU is currently recorded as blocked for listing or FBA readiness.',
+          ];
+  const action = matchingTask
+    ? {
+        id: matchingTask.id,
+        dedupeKey: matchingTask.dedupeKey,
+        title: matchingTask.title,
+        priority: matchingTask.priority,
+        screen: matchingTask.screen,
+        actionTarget: matchingTask.actionTarget || matchingTask.screen,
+        actionLabel: !connected ? (amazon ? 'Authorize Amazon' : 'Connect Amazon') : matchingTask.actionLabel,
+        entityType: matchingTask.entityType,
+        entityId: matchingTask.entityId,
+      }
+    : !connected
+      ? {
+          title: 'Authorize Amazon marketplace connection',
+          priority: 'high',
+          screen: 'connections',
+          actionTarget: 'connections',
+          actionLabel: amazon ? 'Authorize Amazon' : 'Connect Amazon',
+          entityType: 'marketplace_connection',
+          entityId: amazon?.id,
+        }
+      : chatCount(counts.amazonProfiles) === 0
+        ? {
+            title: 'Synchronize Amazon catalog',
+            priority: 'high',
+            screen: 'connections',
+            actionTarget: 'connections',
+            actionLabel: 'Sync Amazon catalog',
+            entityType: 'marketplace_connection',
+            entityId: amazon?.id,
+          }
+        : chatCount(counts.amazonBlockedItems)
+          ? {
+              title: `Review ${chatPlural(chatCount(counts.amazonBlockedItems), 'blocked Amazon SKU')}`,
+              priority: 'high',
+              screen: 'skus',
+              actionTarget: 'skus',
+              actionLabel: 'Review Amazon SKUs',
+              entityType: 'sku',
+            }
+          : null;
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [{
+      source: 'oms_marketplace_connections',
+      channel: 'amazon',
+      status,
+      profiles: chatCount(counts.amazonProfiles),
+      blockedItems: chatCount(counts.amazonBlockedItems),
+    }],
+    tasks: action ? [action] : [],
+    confidence: 0.99,
+    readinessNotes: !connected ? 'Amazon data is unavailable until authorization is completed.' : null,
+  };
+}
+
 function buildGroundedMarginGuidance(context: any) {
   const readiness = context?.readiness || {};
   const counts = readiness.counts || {};
@@ -4968,6 +5249,10 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
   const recentActivityQuestion = chatRequestsRecentActivity(focusQuery);
+  const supplierGuidanceQuestion = chatRequestsSupplierGuidance(message, screen);
+  const labelAuditStatusQuestion = chatRequestsLabelAuditStatus(message, screen);
+  const inventoryRiskQuestion = chatRequestsInventoryRisk(focusQuery);
+  const amazonReadinessQuestion = chatRequestsAmazonReadiness(focusQuery);
   const accountPriorityQuestion = priorityIntent
     && (screen === 'command' || /\b(account|operational|issue|blocker|risk)\b/i.test(message));
   const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
@@ -4986,6 +5271,10 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || marketplaceInstalledRecommendation
     || accountSnapshotQuestion
     || recentActivityQuestion
+    || supplierGuidanceQuestion
+    || labelAuditStatusQuestion
+    || inventoryRiskQuestion
+    || amazonReadinessQuestion
     || accountPriorityQuestion
     || operationalRoadmapQuestion
     || aiPlanApprovalQuestion
@@ -5052,6 +5341,38 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.tasks = groundedRecentActivity.tasks.map(normalizeChatAction).filter(Boolean);
     normalized.confidence = groundedRecentActivity.confidence;
     normalized.readinessNotes = groundedRecentActivity.readinessNotes;
+  }
+  if (supplierGuidanceQuestion) {
+    const groundedSupplierGuidance = buildGroundedSupplierGuidance(context);
+    normalized.answer = groundedSupplierGuidance.answer;
+    normalized.sources = groundedSupplierGuidance.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedSupplierGuidance.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedSupplierGuidance.confidence;
+    normalized.readinessNotes = groundedSupplierGuidance.readinessNotes;
+  }
+  if (labelAuditStatusQuestion) {
+    const groundedLabelAudit = buildGroundedLabelAuditStatus(context);
+    normalized.answer = groundedLabelAudit.answer;
+    normalized.sources = groundedLabelAudit.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedLabelAudit.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedLabelAudit.confidence;
+    normalized.readinessNotes = groundedLabelAudit.readinessNotes;
+  }
+  if (inventoryRiskQuestion) {
+    const groundedInventoryRisk = buildGroundedInventoryRisk(context, focusContext);
+    normalized.answer = groundedInventoryRisk.answer;
+    normalized.sources = groundedInventoryRisk.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedInventoryRisk.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedInventoryRisk.confidence;
+    normalized.readinessNotes = groundedInventoryRisk.readinessNotes;
+  }
+  if (amazonReadinessQuestion) {
+    const groundedAmazonReadiness = buildGroundedAmazonReadiness(context);
+    normalized.answer = groundedAmazonReadiness.answer;
+    normalized.sources = groundedAmazonReadiness.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedAmazonReadiness.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedAmazonReadiness.confidence;
+    normalized.readinessNotes = groundedAmazonReadiness.readinessNotes;
   }
   if (chatRequestsSkuOpportunityRanking(focusQuery)) {
     const directSkuRankingQuestion = chatRequestsSkuOpportunityRanking(message);
@@ -5224,7 +5545,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   if (normalized.tasks.length) {
     const contextTasks = Array.isArray(context?.tasks) ? context.tasks : [];
     const requestedChannel = ['shopify', 'amazon', 'ebay'].find((channel) => message.toLowerCase().includes(channel));
-    if (requestedChannel) {
+    if (requestedChannel && !amazonReadinessQuestion) {
       normalized.tasks = contextTasks
         .filter((task: any) => {
           const text = `${task.dedupeKey || ''} ${task.title || ''} ${task.detail || ''}`.toLowerCase();
@@ -5246,7 +5567,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     }
     normalized.tasks = normalized.tasks.map((action: any) => {
       const actionTarget = String(action.actionTarget || action.screen || '');
-      if (shipmentReadinessQuestion || recentActivityQuestion || priorActionFollowup) return action;
+      if (shipmentReadinessQuestion || recentActivityQuestion || supplierGuidanceQuestion || labelAuditStatusQuestion || inventoryRiskQuestion || amazonReadinessQuestion || priorActionFollowup) return action;
       if (action.entityId && ['sku-detail', 'orders', 'warehouses'].includes(actionTarget)) return action;
       const matchingTask = contextTasks.find((task: any) => String(task.id || '') === String(action.id || ''))
         || (() => {
@@ -5293,7 +5614,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       if (seenActions.has(key)) return false;
       seenActions.add(key);
       return true;
-    }).slice(0, priorityIntent || accountSnapshotQuestion || recentActivityQuestion || priorActionFollowup ? 1 : 3);
+    }).slice(0, priorityIntent || accountSnapshotQuestion || recentActivityQuestion || supplierGuidanceQuestion || labelAuditStatusQuestion || inventoryRiskQuestion || amazonReadinessQuestion || priorActionFollowup ? 1 : 3);
   }
   if (actionIntent && normalized.tasks.length) {
     const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
