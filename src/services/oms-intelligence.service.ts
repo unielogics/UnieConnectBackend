@@ -6076,6 +6076,10 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
   }, {
     userId,
     idempotencyKey: `oms-cortex-chat-health-${userId}-${Math.floor(Date.now() / 60_000)}`,
+    // Header and drawer polling must resolve quickly when Cortex is unreachable.
+    // Full chat keeps its longer reasoning window and idempotent recovery path.
+    timeoutMs: 5_000,
+    maxAttempts: 1,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex health check failed' } }));
   const liveRouteAvailable = Boolean(live?.ok && live?.data?.available !== false);
   if (!configured && !liveRouteAvailable) {
