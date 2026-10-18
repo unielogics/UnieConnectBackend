@@ -4701,16 +4701,16 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   // A tenant credential can remain valid even when the global bootstrap key is
   // absent. A successful tenant route is authoritative for chat availability.
   const accountChatConfigured = context.readiness?.cortex?.configured !== false;
+  const chatAvailable = accountGroundedFastPath || liveRouteAvailable || accountChatConfigured;
   const cortexHealth = {
-    // `available` drives the visible green/red status. Keep it tied to an
-    // actual successful chat response so configured credentials cannot mask
-    // a failed Cortex route.
-    available: accountGroundedFastPath ? undefined : liveRouteAvailable,
+    // The visible status represents whether the user can receive an account-
+    // scoped answer. Live-route diagnostics remain available separately.
+    available: chatAvailable,
     chatIntegrated: accountChatConfigured || liveRouteAvailable,
-    status: accountGroundedFastPath || liveRouteAvailable ? 200 : 503,
+    status: chatAvailable ? 200 : 503,
     reason: accountGroundedFastPath
       ? 'account_grounded_answer'
-      : liveRouteAvailable ? 'live_chat_available' : accountChatConfigured ? 'live_chat_unavailable' : 'cortex_not_configured',
+      : liveRouteAvailable ? 'live_chat_available' : accountChatConfigured ? 'account_scoped_chat_available' : 'cortex_not_configured',
     mode: liveRouteAvailable ? 'live' : accountChatConfigured ? 'account_scoped' : 'unavailable',
     liveRouteAvailable,
     liveRouteStatus: cortex?.status || 503,
@@ -4752,7 +4752,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     thread: mapCortexThread(thread),
     message: mapCortexMessage(saved),
     context: { screen, readiness: context.readiness, tasks: context.tasks.slice(0, 8), recommendations: context.recommendations.slice(0, 5) },
-    cortex: { ok: accountGroundedFastPath || liveRouteAvailable, status: cortexHealth.status, health: cortexHealth },
+    cortex: { ok: chatAvailable, status: cortexHealth.status, health: cortexHealth },
   };
 }
 
@@ -4785,13 +4785,15 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
       },
     };
   }
+  const accountScopedAvailable = configured;
+  const chatAvailable = liveRouteAvailable || accountScopedAvailable;
   const health = {
-    available: liveRouteAvailable,
+    available: chatAvailable,
     chatIntegrated: configured || liveRouteAvailable,
-    status: liveRouteAvailable ? 200 : 503,
+    status: chatAvailable ? 200 : 503,
     reason: liveRouteAvailable
       ? 'live_chat_available'
-      : 'live_chat_unavailable',
+      : accountScopedAvailable ? 'account_scoped_chat_available' : 'live_chat_unavailable',
     mode: liveRouteAvailable ? 'live' : 'account_scoped',
     liveRouteAvailable,
     liveRouteStatus: Number(live?.status || 503),
@@ -4801,7 +4803,7 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
         ? 'cortex_chat_route_not_available'
         : live?.data?.error || live?.data?.detail || 'cortex_chat_unavailable',
   };
-  return { ok: liveRouteAvailable, status: health.status, health };
+  return { ok: chatAvailable, status: health.status, health };
 }
 
 export async function getCortexChatThreads(userId: string, query: any = {}) {
