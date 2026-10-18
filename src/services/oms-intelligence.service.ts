@@ -2710,7 +2710,7 @@ function humanizeInternalLanguage(text: unknown) {
     .replace(/\bupload billing\s*\/\s*invoice line CSV\b/gi, 'upload a billing or invoice-line CSV')
     .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
     .replace(/\bprovide team size or staff roster\b/gi, 'add your team size or upload a staff roster')
-    .replace(/\breconnect Shopify with (?:read[_ ]locations scope|Shopify location inventory permission)\b/gi, 'reconnect Shopify and approve location inventory access')
+    .replace(/\breconnect Shopify with (?:read[_ ]locations scope|Shopify location inventory permission)\b/gi, 'Reconnect Shopify and approve location inventory access')
     .replace(/\bread[_ ]locations scope\b/gi, 'Shopify location inventory permission')
     .replace(/\bprioritize:\s*/gi, 'Start with: ')
     .replace(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/gi, (value) => value.replace(/_/g, ' '));
@@ -3898,7 +3898,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       }
     : buildLocalCortexChatFallback(focusQuery, context, focusContext);
   const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
-    && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
+    && (/(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message) || focusQuery !== message);
   const marketplaceAppStateQuestion = String(focusContext?.topic || '') === 'marketplace_apps'
     && /(installed|available|gated|active|activated|activation|status|what (?:does|is)|which apps? (?:are|is))/i.test(message)
     && !/(should|recommend|best|most value|worth|priority|prioritize)/i.test(message);
