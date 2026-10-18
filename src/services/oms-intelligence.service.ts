@@ -2,7 +2,7 @@ import { pgQuery, isPostgresConfigured } from '../db/postgres';
 import { config } from '../config/env';
 import { publicEntityId } from '../lib/public-id';
 import { cortexConfigStatus, postCortex } from './cortex-orchestration';
-import { getCortexCredentialHeaders } from './cortex-credentials.service';
+import { getCortexCredential, getCortexCredentialHeaders } from './cortex-credentials.service';
 import { getBusinessDouble, getInventoryPlan, getWarehouseOverview, writeOmsLedgerEvent, getBillingCategoryTotals, getStorageBillingSignal } from './oms-production.service';
 import { lookupProductByIdentifier, type KeepaLookupResult } from './keepa-lookup.service';
 import fetch from 'node-fetch';
@@ -242,6 +242,8 @@ async function completeRun(params: {
 
 export async function getDataReadiness(userId: string) {
   const hasAmazonItemProfiles = await tableExists('amazon_item_profiles');
+  const tenantCortexCredential = await getCortexCredential(userId).catch(() => null);
+  const globalCortexConfig = cortexConfigStatus();
   const [counts] = await rows(
     `SELECT
        (SELECT COUNT(*) FROM marketplace_connections WHERE user_id = $1 AND status IN ('connected','active','synced'))::int AS marketplace_connections,
@@ -333,7 +335,12 @@ export async function getDataReadiness(userId: string) {
     },
     blockers,
     sourcePriority: ['marketplace_connections', 'csv_uploads', 'manual_records', 'wms_truth'],
-    cortex: cortexConfigStatus(),
+    cortex: {
+      ...globalCortexConfig,
+      configured: Boolean(tenantCortexCredential?.secret_enc || globalCortexConfig.configured),
+      tenantConfigured: Boolean(tenantCortexCredential?.secret_enc),
+      bootstrapConfigured: Boolean(globalCortexConfig.configured),
+    },
     persistence: isPostgresConfigured() ? 'aurora_postgres' : 'aurora_postgres_unconfigured',
   };
 }
@@ -5745,7 +5752,11 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
   // Health polling runs continuously in the top bar and drawer. It must not
   // build the full OMS context bundle (orders, SKUs, tasks, warehouses) every
   // minute; the real chat request performs that grounding when the user asks.
-  const configured = cortexConfigStatus().configured;
+  const globalConfig = cortexConfigStatus();
+  const tenantCredential = await getCortexCredential(userId).catch(() => null);
+  const tenantConfigured = Boolean(tenantCredential?.secret_enc);
+  const bootstrapConfigured = Boolean(globalConfig.configured);
+  const configured = tenantConfigured || bootstrapConfigured;
   const live = await postCortex('/v1/orchestration/oms/chat/health', {
     tenant_id: userId,
     userId,
@@ -5761,6 +5772,8 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
       health: {
         available: false,
         chatIntegrated: false,
+        tenantConfigured,
+        bootstrapConfigured,
         status: 503,
         reason: 'cortex_not_configured',
         mode: 'unavailable',
@@ -5775,6 +5788,8 @@ export async function getCortexChatHealth(userId: string, screen = 'command') {
   const health = {
     available: chatAvailable,
     chatIntegrated: configured || liveRouteAvailable,
+    tenantConfigured,
+    bootstrapConfigured,
     status: chatAvailable ? 200 : 503,
     reason: liveRouteAvailable
       ? 'live_chat_available'
