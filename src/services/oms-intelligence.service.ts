@@ -2563,6 +2563,7 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     shipmentPlans,
     asns,
     billing,
+    billingCategories,
   ] = await Promise.all([
     getDataReadiness(userId),
     getRecommendations(userId, { screen, status: 'open', limit: 10 }),
@@ -2708,6 +2709,10 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
          FROM invoice_lines WHERE user_id = $1`,
       [userId],
     ).catch(() => null),
+    getBillingCategoryTotals(userId, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)).catch(() => ({
+      totals: { freight: 0, storage: 0, handling: 0, accessorials: 0, refundsCaptured: 0, materials: 0 },
+      hasReal: false,
+    })),
   ]);
   return {
     tenant: { userId, accountScope: 'authenticated_oms_account' },
@@ -2839,6 +2844,8 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
         openCount: number(billing.open_count),
         totalAmount: money(billing.total_amount),
         openAmount: money(billing.open_amount),
+        categoryTotals30d: billingCategories.totals,
+        hasObservedCategorySpend30d: billingCategories.hasReal,
       } : { lineCount: 0, openCount: 0, totalAmount: 0, openAmount: 0 },
     },
     sourceCatalog: [
@@ -3675,6 +3682,76 @@ function chatRequestsMarginGuidance(message: string) {
   const q = String(message || '').toLowerCase();
   return /\b(gross margin|unit margin|margin|profitability)\b/.test(q)
     && /\b(improve|increase|raise|optimi[sz]e|better|what|how|opportunity|action|next)\b/.test(q);
+}
+
+function chatRequestsFinancialLeakage(message: string) {
+  const q = String(message || '').toLowerCase();
+  return /\b(where|how|why|what)\b/.test(q)
+    && /\b(losing money|money (?:is )?going|cost drivers?|largest costs?|biggest costs?|spend concentration|operating spend|expense concentration)\b/.test(q);
+}
+
+function buildGroundedFinancialLeakage(context: any) {
+  const billing = json(context?.samples?.billing, {});
+  const categoryTotals = json(billing.categoryTotals30d, {});
+  const costCategories = [
+    ['freight', money(categoryTotals.freight)],
+    ['storage', money(categoryTotals.storage)],
+    ['handling', money(categoryTotals.handling)],
+    ['accessorials', money(categoryTotals.accessorials)],
+    ['materials', money(categoryTotals.materials)],
+  ] as Array<[string, number]>;
+  const rankedCosts = costCategories.filter(([, value]) => value > 0).sort((a, b) => b[1] - a[1]);
+  const refundsCaptured = money(categoryTotals.refundsCaptured);
+  const grossOperatingCost = money(costCategories.reduce((sum, [, value]) => sum + value, 0));
+  const netOperatingCost = money(Math.max(0, grossOperatingCost - refundsCaptured));
+  const readiness = context?.readiness || {};
+  const counts = readiness.counts || {};
+  const catalogCount = chatCount(counts.catalogItems);
+  const missingCost = chatCount(counts.missingCost);
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const billingTask = tasks.find((task: any) => task?.dedupeKey === 'business-double:billing-baseline');
+  const skuCostTask = tasks.find((task: any) => task?.dedupeKey === 'readiness:sku-unit-cost');
+  const formatUsd = (value: number) => `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const categorySummary = rankedCosts.slice(0, 3).map(([category, amount]) => {
+    const share = grossOperatingCost > 0 ? Math.round((amount / grossOperatingCost) * 1000) / 10 : 0;
+    return `${category.charAt(0).toUpperCase()}${category.slice(1)} ${formatUsd(amount)}${share ? ` (${share.toFixed(1)}%)` : ''}`;
+  }).join('; ');
+  const lines = rankedCosts.length ? [
+    `Observed cost: the account recorded ${formatUsd(grossOperatingCost)} in operating charges during the last 30 days${refundsCaptured > 0 ? ` and ${formatUsd(refundsCaptured)} in captured refunds, for ${formatUsd(netOperatingCost)} net cost` : ''}.`,
+    `Cost concentration: ${categorySummary}.`,
+    'What this means: these figures show where recorded spend is concentrated; they do not by themselves prove that a charge is avoidable or incorrect.',
+  ] : [
+    'Observed cost: no category-level operating charges were recorded in the last 30 days, so Cortex cannot rank current freight, storage, handling, accessorial, or material spend.',
+  ];
+  if (missingCost > 0) {
+    lines.push(`Profitability blind spot: ${missingCost} of ${catalogCount || missingCost} SKUs are missing unit cost, so product-level gross margin and loss cannot be measured reliably yet.`);
+    lines.push('Next steps: review the recorded billing categories, then complete SKU unit costs so Cortex can separate high spend from actual margin leakage.');
+  } else {
+    lines.push('Next step: review the highest recorded category against invoices, service levels, and approved rates before treating any amount as recoverable savings.');
+  }
+  const actionTasks = [billingTask, skuCostTask].filter(Boolean).map((task: any) => ({
+    id: task.id,
+    dedupeKey: task.dedupeKey,
+    title: task.title,
+    priority: task.priority,
+    screen: task.screen,
+    actionTarget: task.actionTarget || task.screen,
+    actionLabel: task.actionLabel,
+    entityType: task.entityType,
+    entityId: task.entityId,
+  }));
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [
+      { source: 'oms_billing', window: '30d', grossOperatingCost, refundsCaptured, netOperatingCost },
+      { source: 'oms_skus', count: catalogCount, missingCost },
+    ],
+    tasks: actionTasks,
+    confidence: rankedCosts.length ? 0.99 : 0.9,
+    readinessNotes: missingCost > 0
+      ? 'SKU unit costs are incomplete, so product-level loss and gross margin remain partially unmeasurable.'
+      : null,
+  };
 }
 
 function buildGroundedMarginGuidance(context: any) {
@@ -4600,6 +4677,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     && (screen === 'command' || /\b(account|operational|issue|blocker|risk)\b/i.test(message));
   const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
   const aiPlanApprovalQuestion = chatRequestsAiPlanApproval(focusQuery);
+  const financialLeakageQuestion = chatRequestsFinancialLeakage(focusQuery);
   const connectionScreenHealthQuestion = screen === 'connections'
     && ['shopify', 'amazon', 'ebay'].some((channel) => focusQuery.toLowerCase().includes(channel))
     && /(working|works?|healthy|health|down|degraded|status|happening|exactly|what does not)/i.test(message);
@@ -4613,7 +4691,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || accountSnapshotQuestion
     || accountPriorityQuestion
     || operationalRoadmapQuestion
-    || aiPlanApprovalQuestion;
+    || aiPlanApprovalQuestion
+    || financialLeakageQuestion;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
@@ -4681,6 +4760,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.tasks = groundedMargin.tasks.map(normalizeChatAction).filter(Boolean);
     normalized.confidence = groundedMargin.confidence;
     normalized.readinessNotes = groundedMargin.readinessNotes;
+  }
+  if (financialLeakageQuestion) {
+    const groundedFinancialLeakage = buildGroundedFinancialLeakage(context);
+    normalized.answer = groundedFinancialLeakage.answer;
+    normalized.sources = groundedFinancialLeakage.sources.map(normalizeChatSource).filter(Boolean);
+    normalized.tasks = groundedFinancialLeakage.tasks.map(normalizeChatAction).filter(Boolean);
+    normalized.confidence = groundedFinancialLeakage.confidence;
+    normalized.readinessNotes = groundedFinancialLeakage.readinessNotes;
   }
   if (chatRequestsOrderPriority(focusQuery)) {
     const groundedOrderPriority = buildGroundedOrderPriorityResponse(message, context, focusContext);
