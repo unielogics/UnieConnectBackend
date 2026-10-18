@@ -2321,6 +2321,13 @@ export async function refreshCortexTasks(userId: string) {
       }
       continue;
     }
+    if (evidencePath === 'audit_sharpness_metrics.overall_readiness') {
+      // This recommendation summarizes the same readiness gaps already emitted
+      // below as concrete SKU, connection, supplier, and billing tasks. Keeping
+      // the aggregate row creates duplicate work with no unique completion
+      // signal, so it remains available as intelligence but not as an inbox task.
+      continue;
+    }
 
     const dedupeKey = `work:${taskDedupeSlug(`${rec.entityType || rec.recommendationType}:${rec.entityId || ''}:${rec.title}`)}`;
     activeKeys.add(dedupeKey);
