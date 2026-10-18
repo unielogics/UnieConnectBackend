@@ -2946,6 +2946,7 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       })
     : [];
   const responseTasks = marketplaceIntent ? marketplaceTasks : sortedTasks;
+  const includeMarketplaceRepair = marketplaceIntent && marketplaceTasks.length > 0;
 
   if (chatRequestsDecision(message)) {
     const decision = decisionRecommendations[0];
@@ -3049,7 +3050,17 @@ function buildLocalCortexChatFallback(message: string, context: any): {
       { source: 'oms_recommendations', count: recommendations.length },
       { source: 'oms_context_samples', skus: skuCount, orders: orderCount, warehouses: warehouseCount, suppliers: supplierCount, labelAuditRuns: labelRunCount },
     ],
-    tasks: actionIntent ? responseTasks.slice(0, priorityIntent ? 1 : 3).map((task: any) => ({ id: task.id, title: task.title, priority: task.priority, screen: task.screen, actionTarget: task.actionTarget, actionLabel: task.actionLabel, entityId: task.entityId })) : [],
+    tasks: actionIntent || includeMarketplaceRepair
+      ? responseTasks.slice(0, marketplaceIntent || priorityIntent ? 1 : 3).map((task: any) => ({
+          id: task.id,
+          title: task.title,
+          priority: task.priority,
+          screen: task.screen,
+          actionTarget: task.actionTarget,
+          actionLabel: task.actionLabel,
+          entityId: task.entityId,
+        }))
+      : [],
     confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
     readinessNotes: null,
   };
