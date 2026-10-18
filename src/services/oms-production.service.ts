@@ -1578,6 +1578,10 @@ export async function getBusinessDouble(userId: string) {
           LIMIT 1
        ) version ON true
       WHERE bp.user_id = $1 AND bp.status IN ('approved', 'rejected')
+        AND NOT (
+          COALESCE(bp.approved_by, '') = 'oms-admin@unieconnect.local'
+          AND COALESCE(version.snapshot->>'id', '') = 'generated-000000000000000000000001'
+        )
       ORDER BY COALESCE(bp.approved_at, bp.created_at) DESC
       LIMIT 20`,
     [userId],
