@@ -3824,6 +3824,92 @@ function buildGroundedWarehouseRiskResponse(message: string, context: any, focus
   };
 }
 
+function chatRequestsOperationalRoadmap(message: string) {
+  const q = String(message || '').toLowerCase();
+  const asksForOrder = /\b(sequence|roadmap|timeline|which (?:comes|goes) first|what (?:comes|should come) first|order of operations|over the next|next (?:week|two weeks|month)|days? 1|week 1|week one)\b/.test(q);
+  const operationalArea = /\b(marketplace|connection|catalog|sku|enrichment|warehouse|wms|supplier|onboarding|operations?)\b/.test(q);
+  return asksForOrder && operationalArea && !/\b(six[- ]month|business double)\b/.test(q);
+}
+
+function operationalRoadmapPassesQuality(answer: string) {
+  const text = String(answer || '');
+  const hasTimeline = /\b(days?\s*\d|week\s*(?:1|2|one|two)|first\s+week|second\s+week)\b/i.test(text);
+  const hasSequence = /\b(first|then|after|before|sequence|stage|phase)\b/i.test(text);
+  const hasTradeoff = /\b(tradeoff|trade-off|faster|speed|accuracy|confidence|risk|cost|rework|evidence)\b/i.test(text);
+  return hasTimeline && hasSequence && hasTradeoff;
+}
+
+function buildGroundedOperationalRoadmap(context: any) {
+  const readiness = context?.readiness || {};
+  const counts = readiness.counts || {};
+  const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
+  const marketplaceReady = chatCount(counts.marketplaceConnections) > 0;
+  const catalogCount = chatCount(counts.catalogItems);
+  const warehouseReady = chatCount(counts.wmsLinks) > 0;
+  const supplierCount = chatCount(counts.suppliers);
+  const missingCatalogFields = chatCount(counts.missingDimensions) + chatCount(counts.missingCost);
+
+  const stageOne: string[] = [];
+  if (!marketplaceReady) stageOne.push('connect the primary marketplace or import the first product and order CSV so demand evidence starts flowing');
+  else stageOne.push(`verify the ${chatPlural(chatCount(counts.marketplaceConnections), 'marketplace connection')} and reconcile product, order, and inventory sync warnings`);
+  if (!catalogCount) stageOne.push('create or import the SKU catalog immediately after the data source is connected');
+  else if (missingCatalogFields) stageOne.push(`complete the cost, weight, and dimension gaps on the ${chatPlural(missingCatalogFields, 'affected SKU')}`);
+
+  const stageTwo: string[] = [];
+  if (!warehouseReady) stageTwo.push('connect one real warehouse or WMS feed and verify inventory against the catalog before enabling physical execution');
+  else stageTwo.push(`validate the ${chatPlural(chatCount(counts.wmsLinks), 'connected warehouse')} against SKU inventory and recent WMS events`);
+  if (!supplierCount) stageTwo.push('add suppliers and pickup origins before creating inbound shipment plans');
+  else stageTwo.push(`complete pickup profiles for the ${chatPlural(supplierCount, 'supplier')} used by inbound SKUs`);
+  stageTwo.push('rerun Seller Optimization only after the marketplace, catalog, and warehouse evidence reconcile cleanly');
+
+  const tradeoffs = [
+    !marketplaceReady
+      ? 'Starting with warehouse configuration may look faster, but without demand and catalog evidence Cortex cannot justify placement or replenishment.'
+      : 'Keeping the marketplace feed first preserves demand recency, but provider warnings should be repaired before treating inventory as warehouse truth.',
+    !catalogCount
+      ? 'A minimal catalog gets the account moving sooner; completing cost, weight, and dimensions before optimization avoids low-confidence savings or routing suggestions.'
+      : missingCatalogFields
+        ? 'Optimizing before enrichment is faster, but the missing cost and package fields prevent reliable margin, dimensional-weight, and pallet comparisons.'
+        : 'The catalog baseline is usable, so warehouse reconciliation is now more valuable than adding more descriptive fields.',
+  ];
+
+  const priorityRank: Record<string, number> = { high: 0, normal: 1, low: 2 };
+  const actions = [...tasks]
+    .filter((task: any) => task?.status === 'open')
+    .sort((a: any, b: any) => (priorityRank[String(a?.priority || '').toLowerCase()] ?? 3) - (priorityRank[String(b?.priority || '').toLowerCase()] ?? 3))
+    .slice(0, 3)
+    .map((task: any) => ({
+      id: task.id,
+      title: task.title,
+      priority: task.priority,
+      screen: task.screen,
+      actionTarget: task.actionTarget || task.screen,
+      actionLabel: task.actionLabel,
+      entityType: task.entityType,
+      entityId: task.entityId,
+    }));
+
+  const answer = [
+    'Recommended two-week sequence',
+    `Days 1-3: ${stageOne.join('; ')}.`,
+    `Days 4-7: ${stageTwo.slice(0, 2).join('; ')}.`,
+    `Week 2: ${stageTwo.slice(2).join('; ')}.`,
+    `Why this order: ${tradeoffs.join(' ')}`,
+    `Decision gate: readiness is ${Math.max(0, Math.min(100, Math.round(number(readiness.score))))}%. Do not approve inventory placement, shipment, or savings decisions until their current values and projected impact are traceable to synchronized account evidence.`,
+  ].join('\n\n');
+
+  return {
+    answer: polishCortexChatText(answer),
+    sources: [
+      { source: 'oms_data_readiness', readinessScore: readiness.score, posture: readiness.posture },
+      { source: 'oms_cortex_tasks', count: tasks.length },
+    ],
+    tasks: actions,
+    confidence: 0.94,
+    readinessNotes: null,
+  };
+}
+
 function buildLocalCortexChatFallback(message: string, context: any, focusContext?: any, intentMessage = message): {
   answer: string;
   sources: any[];
@@ -3840,6 +3926,9 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
   }
   if (chatRequestsWarehouseRisk(message)) {
     return buildGroundedWarehouseRiskResponse(intentMessage, context, focusContext);
+  }
+  if (chatRequestsOperationalRoadmap(message)) {
+    return buildGroundedOperationalRoadmap(context);
   }
   const readiness = context?.readiness || {};
   const counts = readiness.counts || {};
@@ -4023,6 +4112,7 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
           actionTarget: task.actionTarget,
           actionLabel: task.actionLabel,
           entityId: task.entityId,
+          entityType: task.entityType,
         }))
       : [],
     confidence: readiness.score != null ? Math.max(0.4, Math.min(0.88, Number(readiness.score) / 100)) : 0.45,
@@ -4308,6 +4398,18 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     normalized.confidence = groundedWarehouseRisk.confidence;
     normalized.readinessNotes = groundedWarehouseRisk.readinessNotes;
   }
+  if (chatRequestsOperationalRoadmap(focusQuery)) {
+    const groundedRoadmap = buildGroundedOperationalRoadmap(context);
+    if (!operationalRoadmapPassesQuality(normalized.answer)) {
+      normalized.answer = groundedRoadmap.answer;
+      normalized.sources = groundedRoadmap.sources.map(normalizeChatSource).filter(Boolean);
+      normalized.tasks = actionIntent
+        ? groundedRoadmap.tasks.map(normalizeChatAction).filter(Boolean)
+        : [];
+      normalized.confidence = groundedRoadmap.confidence;
+      normalized.readinessNotes = groundedRoadmap.readinessNotes;
+    }
+  }
   if (String(focusContext?.topic || '') === 'marketplace_apps') {
     const apps = Array.isArray(focusContext?.apps) ? focusContext.apps : [];
     const enabledApps = apps.filter((app: any) => Boolean(app?.isEnabled));
@@ -4341,6 +4443,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             screen: connectionRepair.screen,
             actionTarget: connectionRepair.actionTarget || connectionRepair.screen,
             actionLabel: connectionRepair.actionLabel,
+            entityType: connectionRepair.entityType,
             entityId: connectionRepair.entityId,
           })].filter(Boolean)
         : [];
@@ -4373,6 +4476,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
           screen: task.screen,
           actionTarget: task.actionTarget,
           actionLabel: task.actionLabel,
+          entityType: task.entityType,
           entityId: task.entityId,
         }))
         .filter(Boolean);
@@ -4413,6 +4517,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
             screen: matchingTask.screen,
             actionTarget: matchingTask.actionTarget || matchingTask.screen,
             actionLabel: matchingTask.actionLabel,
+            entityType: matchingTask.entityType,
             entityId: matchingTask.entityId,
           })
         : action;
