@@ -2323,6 +2323,7 @@ export async function refreshCortexTasks(userId: string) {
       evidence: {
         channel,
         connectionStatus: connection.status,
+        navigationPayload: missingShopifyLocations ? `action:repair:${connection.id}` : undefined,
         missingScopes: missingShopifyLocations ? ['read_locations'] : [],
         degradedEntities: degradedEntries.map(([entity, state]) => ({
           entity,
@@ -3008,7 +3009,11 @@ function normalizeChatAction(value: any) {
   const navigationPayload = value.navigationPayload
     || (dedupeKey === 'readiness:sku-unit-cost' ? 'filter:missing-cost' : null)
     || (dedupeKey === 'readiness:sku-dimensions-weight' ? 'filter:missing-dimensions' : null)
-    || (dedupeKey === 'readiness:supplier-pickup-profiles' ? 'filter:missing-pickup' : null);
+    || (dedupeKey === 'readiness:supplier-pickup-profiles' ? 'filter:missing-pickup' : null)
+    || (actionTarget === 'labels' && /upload.*csv/i.test(String(value.actionLabel || title)) ? 'action:upload-csv' : null)
+    || (actionTarget === 'connections' && /repair shopify/i.test(String(value.actionLabel || title)) && value.entityId
+      ? `action:repair:${String(value.entityId)}`
+      : null);
   return {
     id: value.id ? String(value.id).slice(0, 160) : undefined,
     dedupeKey,
@@ -4022,6 +4027,7 @@ function buildGroundedRecentActivity(context: any) {
         actionLabel: shopifyTask.actionLabel,
         entityType: shopifyTask.entityType,
         entityId: shopifyTask.entityId,
+        navigationPayload: shopifyTask.navigationPayload,
       }
     : shopifyInventoryDegraded
       ? {
@@ -4032,6 +4038,7 @@ function buildGroundedRecentActivity(context: any) {
           actionLabel: 'Repair Shopify access',
           entityType: 'marketplace_connection',
           entityId: shopify?.id,
+          navigationPayload: shopify?.id ? `action:repair:${shopify.id}` : undefined,
         }
       : null;
 
@@ -4129,6 +4136,7 @@ function buildGroundedLabelAuditStatus(context: any) {
         actionTarget: 'labels',
         actionLabel: 'Upload audit CSV',
         entityType: 'label_audit',
+        navigationPayload: 'action:upload-csv',
       }],
       confidence: 1,
       readinessNotes: 'No audit evidence is available until a CSV run is completed.',
@@ -5914,6 +5922,7 @@ function mapRecommendation(row: any) {
 
 function mapCortexTask(row: any) {
   if (!row) return null;
+  const evidence = json(row.evidence, {});
   return {
     id: row.id,
     publicId: publicEntityId('CT', row.id),
@@ -5928,7 +5937,8 @@ function mapCortexTask(row: any) {
     status: row.status,
     actionLabel: humanizeInternalLanguage(row.action_label),
     actionTarget: row.action_target,
-    evidence: json(row.evidence, {}),
+    navigationPayload: evidence.navigationPayload || undefined,
+    evidence,
     recommendationId: row.recommendation_id,
     completedAt: iso(row.completed_at),
     dismissedAt: iso(row.dismissed_at),
