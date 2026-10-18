@@ -2710,6 +2710,8 @@ function humanizeInternalLanguage(text: unknown) {
     .replace(/\bupload billing\s*\/\s*invoice line CSV\b/gi, 'upload a billing or invoice-line CSV')
     .replace(/\bset warehouse square footage in (?:the )?warehouse profile\b/gi, 'add warehouse square footage to the warehouse profile')
     .replace(/\bprovide team size or staff roster\b/gi, 'add your team size or upload a staff roster')
+    .replace(/\breconnect Shopify with (?:read[_ ]locations scope|Shopify location inventory permission)\b/gi, 'reconnect Shopify and approve location inventory access')
+    .replace(/\bread[_ ]locations scope\b/gi, 'Shopify location inventory permission')
     .replace(/\bprioritize:\s*/gi, 'Start with: ')
     .replace(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/gi, (value) => value.replace(/_/g, ' '));
 }
@@ -2830,7 +2832,7 @@ function conversationAwareChatQuery(message: string, history: Array<{ role?: str
   const words = current.split(/\s+/).filter(Boolean);
   const standaloneTopic = /\b(shopify|amazon|ebay|marketplace|connection|sync|inventory|sku|product|listing|order|shipment|asn|warehouse|wms|supplier|billing|invoice|cost|margin|profit|label|audit|return|customer|task|readiness|decision|optimization|plan)\b/i.test(current);
   const contextualFollowup = words.length <= 16 && (
-    /^(why|how|what about|and what|then what|what next|what (?:should|can|do) (?:i|we)|should (?:i|we)|where|when|which one|can you explain|explain that|tell me more)\b/i.test(current)
+    /^(why|how|what about|what exactly|and what|then what|what next|what (?:should|can|do) (?:i|we)|should (?:i|we)|where|when|which one|can you explain|explain that|tell me more)\b/i.test(current)
     || /\b(this|that|it|those|these|them|they|same issue|about that|about it)\b/i.test(current)
   );
   if (standaloneTopic || !contextualFollowup) return current;
