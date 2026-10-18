@@ -1999,7 +1999,12 @@ function taskTargetFromText(text: string) {
   if (value.includes('wms') || value.includes('warehouse') || value.includes('facility')) return { screen: 'warehouses', entityType: 'warehouse', actionLabel: 'Connect warehouse' };
   if (value.includes('amazon') || value.includes('listing') || value.includes('asin') || value.includes('fba') || value.includes('fbm')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Open listings' };
   if (value.includes('dimension') || value.includes('weight') || value.includes('cost') || value.includes('sku') || value.includes('title') || value.includes('description')) return { screen: 'skus', entityType: 'sku', actionLabel: 'Enrich SKUs' };
-  if (value.includes('csv') || value.includes('upload')) return { screen: 'product-research', entityType: 'csv', actionLabel: 'Upload CSV' };
+  if (value.includes('csv') || value.includes('upload')) return {
+    screen: 'product-research',
+    entityType: 'csv',
+    actionLabel: 'Upload CSV',
+    navigationPayload: 'action:upload-csv',
+  };
   if (value.includes('marketplace') || value.includes('connect') || value.includes('feed')) return { screen: 'connections', entityType: 'connection', actionLabel: 'Open connections' };
   return { screen: 'command', entityType: 'account', actionLabel: 'Open Command Center' };
 }
