@@ -2741,7 +2741,7 @@ function normalizeChatAction(value: any) {
 }
 
 function chatRequestsPriority(message: string) {
-  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first thing|focus on)\b/i.test(message);
+  return /\b(most important|highest priority|top priority|prioriti[sz]e|biggest (?:issue|blocker|risk)|first (?:thing|action|step)|next action|where (?:should|do|can) i start|what (?:should|do) i do first|focus on)\b/i.test(message);
 }
 
 function chatRequestsAccountSnapshot(message: string) {
