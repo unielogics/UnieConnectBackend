@@ -2476,6 +2476,7 @@ export async function refreshCortexTasks(userId: string) {
           modelBaselineMonthlyCost,
           costVariancePct: grounding.costVariancePct ?? null,
           impactStatus: plan.impactStatus,
+          navigationPayload: 'action:review-cost-baseline',
         },
       });
     }
