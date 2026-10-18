@@ -4925,7 +4925,10 @@ export async function getOmsAsn(userId: string, asnId: string) {
      LEFT JOIN shipment_plans sp ON sp.id = a.shipment_plan_id AND sp.user_id = a.user_id
      LEFT JOIN suppliers s ON s.id = sp.supplier_id AND s.user_id = a.user_id
      LEFT JOIN facilities f ON f.id = sp.facility_id
-     WHERE a.user_id = $1 AND a.id = $2
+     WHERE a.user_id = $1
+       AND (a.id = $2 OR a.shipment_plan_id = $2 OR lower(a.asn_number) = lower($2))
+     ORDER BY CASE WHEN a.id = $2 THEN 0 WHEN a.shipment_plan_id = $2 THEN 1 ELSE 2 END,
+              a.updated_at DESC
      LIMIT 1`,
     [userId, asnId],
   );
