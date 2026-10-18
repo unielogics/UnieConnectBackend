@@ -5337,6 +5337,36 @@ export function cortexChatDeliveryState(status: string) {
   return { available: false, integrated: false, live: false, mode: 'unavailable', reason: 'cortex_not_configured' } as const;
 }
 
+function cortexThreadTitle(value: unknown, screen = 'command', entityType?: string | null, entityId?: string | null) {
+  const title = humanizeInternalLanguage(String(value || ''))
+    .replace(/\s+/g, ' ')
+    .replace(/[?.!]+$/, '')
+    .trim();
+  const normalized = title.toLowerCase();
+  const entity = String(entityType || '').replace(/[-_]+/g, ' ').trim();
+  const entityLabel = ({ sku: 'SKU', asn: 'ASN', wms: 'WMS' } as Record<string, string>)[entity.toLowerCase()]
+    || (entity ? entity.replace(/\b\w/g, (letter) => letter.toUpperCase()) : '');
+  const entityKey = String(entityId || '').trim();
+  if (entityLabel && entityKey) {
+    const compactId = entityKey.length > 28 ? `${entityKey.slice(0, 25)}...` : entityKey;
+    return `${entityLabel}: ${compactId}`;
+  }
+  if (/\bshopify\b/.test(normalized)) return 'Shopify connection health';
+  if (/\bamazon\b/.test(normalized)) return 'Amazon marketplace readiness';
+  if (/\bebay\b/.test(normalized)) return 'eBay connection health';
+  if (/\b(business double|ai plan|six[- ]month (?:operating )?plan)\b/.test(normalized)) return 'AI plan readiness';
+  if (/\b(label audit|carrier labels?|refund opportunities)\b/.test(normalized)) return 'Carrier label audit';
+  if (/\bproduct research\b/.test(normalized)) return 'Product research';
+  if (/\b(summarize|account (?:status|snapshot|overview)|what(?:'s| is) happening in (?:my|the) account)\b/.test(normalized)) return 'Account operating snapshot';
+  if (/\b(first action|next action|next priorit|what (?:should|can|do) i do|where (?:should|do|can) i start)\b/.test(normalized)) return 'Next account priorities';
+
+  const fallback = title || `${String(screen || 'Cortex').replace(/[-_]+/g, ' ')} conversation`;
+  if (fallback.length <= 52) return fallback;
+  const candidate = fallback.slice(0, 49);
+  const boundary = candidate.lastIndexOf(' ');
+  return `${candidate.slice(0, boundary >= 32 ? boundary : candidate.length).trimEnd()}...`;
+}
+
 export async function createCortexChatMessage(userId: string, body: any = {}) {
   await ensureCortexWorkspaceTables();
   const screen = String(body.screen || 'command').slice(0, 80);
@@ -5431,7 +5461,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     thread = await one(
       `INSERT INTO oms_cortex_chat_threads (user_id, screen, entity_type, entity_id, title, last_message_at)
        VALUES ($1, $2, $3, $4, $5, now()) RETURNING *`,
-      [userId, screen, entityType, entityId, message.slice(0, 64) || 'Cortex chat'],
+      [userId, screen, entityType, entityId, cortexThreadTitle(message, screen, entityType, entityId)],
     );
   }
 
@@ -6243,7 +6273,7 @@ function mapCortexThread(row: any) {
     screen: row.screen,
     entityType: row.entity_type,
     entityId: row.entity_id,
-    title: row.title,
+    title: cortexThreadTitle(row.title, row.screen, row.entity_type, row.entity_id),
     status: row.status,
     lastMessageAt: iso(row.last_message_at),
     createdAt: iso(row.created_at),
