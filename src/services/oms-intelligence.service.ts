@@ -1936,6 +1936,28 @@ function recommendationTaskTarget(rec: any) {
   return { screen: 'command', actionLabel: 'Review in Command Center' };
 }
 
+function recommendationTaskEntityId(rec: any, userId: string, targetScreen: string) {
+  const entityId = String(rec?.entityId || '').trim();
+  if (!entityId || entityId === userId) return null;
+
+  const entityType = String(rec?.entityType || '').toLowerCase();
+  const supported: Record<string, string[]> = {
+    'sku-detail': ['sku', 'catalog_item'],
+    skus: ['sku', 'catalog_item'],
+    suppliers: ['supplier'],
+    customers: ['customer'],
+    orders: ['order'],
+    shipments: ['shipment_plan', 'asn'],
+    warehouses: ['warehouse'],
+    returns: ['return'],
+    labels: ['label_audit_run'],
+    billing: ['invoice'],
+    support: ['support_ticket'],
+    connections: ['marketplace_connection', 'connection'],
+  };
+  return supported[targetScreen]?.includes(entityType) ? entityId : null;
+}
+
 function recommendationBelongsInTaskInbox(rec: any) {
   const state = String(rec?.approvalState || '').toLowerCase();
 
@@ -2181,7 +2203,7 @@ export async function refreshCortexTasks(userId: string) {
       source: 'readiness',
       screen: target.screen,
       entityType: rec.entityType || rec.recommendationType,
-      entityId: rec.entityId || rec.id,
+      entityId: recommendationTaskEntityId(rec, userId, target.screen),
       title: rec.title,
       detail: recommendationTaskDetail(rec, readiness),
       priority: Number(rec.confidence || 0) >= 0.8 ? 'normal' : 'low',
@@ -2853,6 +2875,7 @@ function normalizeChatAction(value: any) {
   const requestedTarget = String(value.actionTarget || value.screen || '').trim();
   const inferred = taskTargetFromText(`${title} ${value.detail || value.summary || ''}`);
   const actionTarget = CORTEX_CHAT_SCREENS.has(requestedTarget) ? requestedTarget : inferred.screen;
+  const entityType = value.entityType ? String(value.entityType).trim().toLowerCase().slice(0, 80) : undefined;
   return {
     id: value.id ? String(value.id).slice(0, 160) : undefined,
     title,
@@ -2862,7 +2885,8 @@ function normalizeChatAction(value: any) {
     screen: actionTarget,
     actionTarget,
     actionLabel: humanizeInternalLanguage(value.actionLabel || value.label || title).trim().slice(0, 120),
-    entityId: value.entityId ? String(value.entityId).slice(0, 160) : undefined,
+    entityType,
+    entityId: entityType === 'account' || !value.entityId ? undefined : String(value.entityId).slice(0, 160),
   };
 }
 
