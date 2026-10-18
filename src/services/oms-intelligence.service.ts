@@ -2386,7 +2386,50 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     getRecommendations(userId, { screen, status: 'open', limit: 10 }),
     getCortexTasks(userId, { status: 'open', limit: 20, refresh: options.refreshTasks }),
     rows(`SELECT entity_type, entity_id, event_type, source_system, summary, confidence, created_at FROM oms_execution_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]).catch(() => []),
-    rows(`SELECT id, sku, title, weight, dimensions, attributes, metadata, wms_inventory FROM catalog_items WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(
+      `SELECT ci.id, ci.sku, ci.title,
+              COALESCE(ci.metadata->>'subtitle', ci.metadata->>'subTitle', ci.attributes->>'subtitle', ci.sub_category) AS subtitle,
+              COALESCE(ci.metadata->>'brand', ci.attributes->>'brand') AS brand,
+              ci.description,
+              COALESCE(ci.metadata->>'size', ci.attributes->>'size') AS size,
+              ci.weight, ci.dimensions, ci.upc, ci.ean, ci.asin, ci.image, ci.images,
+              ci.attributes, ci.metadata, ci.wms_inventory, ci.supplier_id,
+              s.name AS supplier_name,
+              CASE
+                WHEN COALESCE(NULLIF(ci.attributes->>'cost', ''), NULLIF(ci.metadata->>'cost', ''), '') ~ '^-?[0-9]+(?:\.[0-9]+)?$'
+                  THEN COALESCE(NULLIF(ci.attributes->>'cost', ''), NULLIF(ci.metadata->>'cost', ''))::numeric
+                ELSE NULL
+              END AS unit_cost,
+              CASE
+                WHEN COALESCE(
+                  NULLIF(ci.attributes->>'price', ''), NULLIF(ci.metadata->>'price', ''),
+                  NULLIF(ci.metadata->>'sellingPrice', ''), NULLIF(ci.metadata->>'shopifyPrice', ''), ''
+                ) ~ '^-?[0-9]+(?:\.[0-9]+)?$'
+                  THEN COALESCE(
+                    NULLIF(ci.attributes->>'price', ''), NULLIF(ci.metadata->>'price', ''),
+                    NULLIF(ci.metadata->>'sellingPrice', ''), NULLIF(ci.metadata->>'shopifyPrice', '')
+                  )::numeric
+                ELSE NULL
+              END AS selling_price,
+              COALESCE(oa.units_sold, 0)::numeric AS units_sold,
+              COALESCE(oa.revenue, 0)::numeric AS sales_revenue,
+              COALESCE(oa.order_line_count, 0)::int AS order_line_count
+         FROM catalog_items ci
+         LEFT JOIN suppliers s ON s.id = ci.supplier_id AND s.user_id = ci.user_id
+         LEFT JOIN (
+           SELECT user_id, sku,
+                  COALESCE(sum(quantity), 0) AS units_sold,
+                  COALESCE(sum(COALESCE(total_price, unit_price * quantity, 0)), 0) AS revenue,
+                  count(*)::int AS order_line_count
+             FROM order_lines
+            WHERE user_id = $1
+            GROUP BY user_id, sku
+         ) oa ON oa.user_id = ci.user_id AND oa.sku = ci.sku
+        WHERE ci.user_id = $1 AND COALESCE(ci.archived, false) = false
+        ORDER BY ci.updated_at DESC NULLS LAST, ci.created_at DESC
+        LIMIT 250`,
+      [userId],
+    ).catch(() => []),
     rows(`SELECT id, order_number, channel, status, totals, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT warehouse_code, status, facility_id, metadata, connected_at FROM oms_warehouse_links WHERE user_id = $1 ORDER BY connected_at DESC NULLS LAST LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, name, status, email, metadata, updated_at FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
@@ -2484,7 +2527,26 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     tasks: tasksRes.tasks,
     ledger,
     samples: {
-      skus: skus.map((r) => ({ id: r.id, sku: r.sku, title: r.title, weight: r.weight, dimensions: json(r.dimensions, {}), source: r.metadata?.source || r.metadata?.importSource || null })),
+      skus: skus.map((r) => ({
+        id: r.id,
+        sku: r.sku,
+        title: r.title,
+        subtitle: r.subtitle,
+        brand: r.brand,
+        description: r.description,
+        size: r.size,
+        weight: r.weight == null ? null : number(r.weight),
+        dimensions: json(r.dimensions, {}),
+        identifiers: { upc: r.upc, ean: r.ean, asin: r.asin },
+        imageCount: Array.isArray(r.images) ? r.images.length : r.image ? 1 : 0,
+        supplier: r.supplier_id ? { id: r.supplier_id, name: r.supplier_name } : null,
+        cost: r.unit_cost == null ? null : money(r.unit_cost),
+        price: r.selling_price == null ? null : money(r.selling_price),
+        unitsSold: number(r.units_sold),
+        salesRevenue: money(r.sales_revenue),
+        orderLineCount: number(r.order_line_count),
+        source: r.metadata?.source || r.metadata?.importSource || null,
+      })),
       orders: orders.map((r) => ({
         id: r.id,
         orderNumber: r.order_number,
@@ -3281,7 +3343,167 @@ function readablePosture(value: any) {
   return posture || 'not fully scored';
 }
 
-function buildLocalCortexChatFallback(message: string, context: any): {
+function chatRequestsSkuOpportunityRanking(message: string) {
+  const q = String(message || '').toLowerCase();
+  const namesCatalogItem = /\b(sku|skus|product|products|item|items)\b/.test(q);
+  const asksForRanking = /\b(strongest|biggest|best|top|first|highest|most|which|identify|rank|prioriti[sz]e)\b/.test(q);
+  const asksForImprovement = /\b(opportunity|improve|improvement|optimi[sz](?:e|ation)|work on|fix|enrich)\b/.test(q);
+  return namesCatalogItem && asksForRanking && asksForImprovement;
+}
+
+function skuDimensionsComplete(sku: any) {
+  const dimensions = json(sku?.dimensions, {});
+  return number(dimensions?.length ?? dimensions?.l) > 0
+    && number(dimensions?.width ?? dimensions?.w) > 0
+    && number(dimensions?.height ?? dimensions?.h) > 0;
+}
+
+function skuOpportunityMissingFields(sku: any) {
+  const identifiers = json(sku?.identifiers, {});
+  return [
+    !String(sku?.title || '').trim() ? 'title' : null,
+    !String(sku?.description || '').trim() ? 'description' : null,
+    !String(sku?.brand || '').trim() ? 'brand' : null,
+    !String(sku?.size || '').trim() ? 'size' : null,
+    number(sku?.weight) <= 0 ? 'weight' : null,
+    !skuDimensionsComplete(sku) ? 'dimensions' : null,
+    number(sku?.cost) <= 0 ? 'unit cost' : null,
+    number(sku?.price) <= 0 ? 'selling price' : null,
+    number(sku?.imageCount) <= 0 ? 'images' : null,
+    !String(identifiers?.upc || identifiers?.ean || identifiers?.asin || '').trim() ? 'UPC, EAN, or ASIN' : null,
+    !sku?.supplier?.id ? 'supplier' : null,
+  ].filter(Boolean) as string[];
+}
+
+function rankedSkuOpportunityCandidates(context: any, focusContext?: any) {
+  const candidates = Array.isArray(focusContext?.skus) && focusContext.skus.length
+    ? focusContext.skus
+    : Array.isArray(context?.samples?.skus) ? context.samples.skus : [];
+  return candidates
+    .filter((sku: any) => String(sku?.sku || '').trim())
+    .map((sku: any, index: number) => {
+      const missing = skuOpportunityMissingFields(sku);
+      const dimensionsMissing = missing.includes('dimensions');
+      const weightMissing = missing.includes('weight');
+      const costMissing = missing.includes('unit cost');
+      const priceMissing = missing.includes('selling price');
+      const operationalGapScore = (costMissing ? 24 : 0)
+        + (priceMissing ? 20 : 0)
+        + (dimensionsMissing ? 18 : 0)
+        + (weightMissing ? 16 : 0)
+        + (missing.includes('description') ? 8 : 0)
+        + (missing.includes('images') ? 8 : 0)
+        + (missing.includes('supplier') ? 7 : 0)
+        + (missing.includes('UPC, EAN, or ASIN') ? 6 : 0)
+        + (missing.includes('brand') ? 4 : 0)
+        + (missing.includes('size') ? 3 : 0);
+      const demandEvidenceScore = Math.min(24, Math.log2(Math.max(1, number(sku?.unitsSold) + 1)) * 6);
+      return { sku, missing, score: operationalGapScore + demandEvidenceScore, index };
+    })
+    .sort((a: any, b: any) => b.score - a.score
+      || number(b.sku?.unitsSold) - number(a.sku?.unitsSold)
+      || number(b.sku?.salesRevenue) - number(a.sku?.salesRevenue)
+      || a.index - b.index);
+}
+
+function buildGroundedSkuOpportunityResponse(message: string, context: any, focusContext?: any) {
+  const ranked = rankedSkuOpportunityCandidates(context, focusContext);
+  const selected = ranked[0];
+  if (!selected) {
+    return {
+      answer: 'I cannot rank a SKU opportunity because this account does not contain a catalog item with usable SKU evidence yet.',
+      sources: [{ source: 'oms_skus', count: 0 }],
+      tasks: [],
+      confidence: 0.95,
+      readinessNotes: 'Add or import at least one SKU before asking Cortex to rank product opportunities.',
+      selectedSku: null,
+    };
+  }
+
+  const sku = selected.sku;
+  const skuCode = String(sku.sku);
+  const missing = selected.missing;
+  const unitsSold = number(sku.unitsSold);
+  const salesRevenue = money(sku.salesRevenue);
+  const cost = money(sku.cost);
+  const price = money(sku.price);
+  const hasMargin = cost > 0 && price > 0;
+  const marginDollars = hasMargin ? Math.round((price - cost) * 100) / 100 : null;
+  const marginPercent = hasMargin && price > 0 ? Math.round(((price - cost) / price) * 1000) / 10 : null;
+  const reasons: string[] = [];
+  if (unitsSold > 0) {
+    reasons.push(`${unitsSold} sold unit${unitsSold === 1 ? '' : 's'}${salesRevenue > 0 ? ` and $${salesRevenue.toFixed(2)} in recorded sales` : ''} give this item real demand evidence`);
+  }
+  if (missing.includes('unit cost') || missing.includes('selling price')) {
+    reasons.push('its margin cannot be measured completely until cost and selling-price evidence are present');
+  }
+  if (missing.includes('dimensions') || missing.includes('weight')) {
+    reasons.push('its fulfillment economics cannot be measured completely until dimensions and weight are complete');
+  }
+  if (!reasons.length && hasMargin) {
+    reasons.push(`its recorded unit margin is $${marginDollars!.toFixed(2)} (${marginPercent!.toFixed(1)}%), giving Cortex a concrete financial baseline to compare`);
+  }
+  if (!reasons.length) reasons.push('it has the largest traceable enrichment gap in the available catalog evidence');
+
+  const outcomes: string[] = [];
+  if (missing.includes('unit cost') || missing.includes('selling price')) {
+    outcomes.push('gross margin dollars and margin percentage');
+  } else if (hasMargin) {
+    outcomes.push(`unit margin from the current $${cost.toFixed(2)} cost and $${price.toFixed(2)} selling price`);
+  }
+  if (missing.includes('dimensions') || missing.includes('weight')) {
+    outcomes.push('dimensional weight, warehouse fit, pallet fill, and freight cost');
+  }
+  if (unitsSold > 0) outcomes.push('demand, replenishment, and stockout exposure');
+  if (!outcomes.length) outcomes.push('listing completeness and marketplace readiness');
+
+  const cannotQuantify = missing.includes('unit cost')
+    || missing.includes('selling price')
+    || missing.includes('dimensions')
+    || missing.includes('weight');
+  const lines = [
+    `${skuCode} is the strongest evidence-backed SKU to improve first among ${ranked.length} catalog item${ranked.length === 1 ? '' : 's'} evaluated.`,
+    `Why it ranks first: ${reasons.join('; ')}.`,
+    `What becomes measurable: ${outcomes.join('; ')}.`,
+    missing.length ? `Missing inputs: ${missing.join(', ')}.` : 'Missing inputs: none in the core product baseline.',
+    cannotQuantify
+      ? 'No savings or revenue-upside figure is shown yet because the inputs needed to calculate it are incomplete.'
+      : 'Cortex has a usable baseline, but it still needs a compared operating scenario before claiming an improvement.',
+    `Next step: open ${skuCode}, complete the missing fields, and rerun the SKU optimization so the result can show a traceable current-versus-suggested impact.`,
+  ];
+  const actionIntent = chatRequestsActions(message) || /\b(first|improve|work on|fix|enrich)\b/i.test(message);
+  return {
+    answer: polishCortexChatText(lines.join('\n\n')),
+    sources: [
+      { source: 'oms_skus', count: ranked.length, selectedSku: skuCode },
+      ...(unitsSold > 0 ? [{ source: 'oms_orders', sku: skuCode, unitsSold, salesRevenue }] : []),
+    ],
+    tasks: actionIntent ? [{
+      title: `Improve ${skuCode}`,
+      priority: 'normal',
+      screen: 'sku-detail',
+      actionTarget: 'sku-detail',
+      actionLabel: 'Open SKU details',
+      entityId: sku.id || skuCode,
+    }] : [],
+    confidence: 0.96,
+    readinessNotes: cannotQuantify ? 'The ranking is supported by account data, but financial impact remains unquantified until the listed inputs are complete.' : null,
+    selectedSku: sku,
+  };
+}
+
+function skuOpportunityAnswerPassesQuality(answer: string, grounded: ReturnType<typeof buildGroundedSkuOpportunityResponse>) {
+  const text = String(answer || '');
+  const selectedCode = String(grounded.selectedSku?.sku || '').toLowerCase();
+  if (!selectedCode || !text.toLowerCase().includes(selectedCode)) return false;
+  if (/because (?:it|the (?:sku|product)) has a weight of\b/i.test(text)) return false;
+  const explainsReason = /\b(because|why|ranks|priority|evidence)\b/i.test(text);
+  const namesOutcome = /\b(margin|profit|revenue|cost|dimensional|freight|pallet|warehouse fit|demand|replenishment|stockout|marketplace readiness)\b/i.test(text);
+  const statesEvidenceLimit = /\b(missing|incomplete|cannot|not enough|requires?|need(?:s|ed)?|no savings|unquantified)\b/i.test(text);
+  return explainsReason && namesOutcome && statesEvidenceLimit;
+}
+
+function buildLocalCortexChatFallback(message: string, context: any, focusContext?: any): {
   answer: string;
   sources: any[];
   tasks: any[];
@@ -3289,6 +3511,9 @@ function buildLocalCortexChatFallback(message: string, context: any): {
   readinessNotes: string | null;
 } {
   const q = String(message || '').toLowerCase();
+  if (chatRequestsSkuOpportunityRanking(message)) {
+    return buildGroundedSkuOpportunityResponse(message, context, focusContext);
+  }
   const readiness = context?.readiness || {};
   const counts = readiness.counts || {};
   const tasks = Array.isArray(context?.tasks) ? context.tasks : [];
@@ -3604,7 +3829,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         confidence: 0.35,
         readinessNotes: 'Cortex is not configured for this account.',
       }
-    : buildLocalCortexChatFallback(focusQuery, context);
+    : buildLocalCortexChatFallback(focusQuery, context, focusContext);
   const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
     && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
   const marketplaceAppStateQuestion = String(focusContext?.topic || '') === 'marketplace_apps'
@@ -3659,6 +3884,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       never_name_model_vendor_or_runtime: true,
       never_expose_internal_field_names: true,
       current_vs_suggested_requires_measurable_impact: true,
+      sku_opportunity_requires_business_outcome_and_missing_inputs: true,
       unsupported_claim_behavior: 'state what evidence is missing instead of estimating',
     },
   }, {
@@ -3671,6 +3897,18 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const normalized = accountGroundedFastPath
     ? fallback
     : normalizeCortexChatResponse(cortex, fallback, actionIntent);
+  if (chatRequestsSkuOpportunityRanking(focusQuery)) {
+    const groundedSkuOpportunity = buildGroundedSkuOpportunityResponse(focusQuery, context, focusContext);
+    if (!skuOpportunityAnswerPassesQuality(normalized.answer, groundedSkuOpportunity)) {
+      normalized.answer = groundedSkuOpportunity.answer;
+      normalized.sources = groundedSkuOpportunity.sources.map(normalizeChatSource).filter(Boolean);
+      normalized.tasks = actionIntent
+        ? groundedSkuOpportunity.tasks.map(normalizeChatAction).filter(Boolean)
+        : [];
+      normalized.confidence = groundedSkuOpportunity.confidence;
+      normalized.readinessNotes = groundedSkuOpportunity.readinessNotes;
+    }
+  }
   if (String(focusContext?.topic || '') === 'marketplace_apps') {
     const apps = Array.isArray(focusContext?.apps) ? focusContext.apps : [];
     const enabledApps = apps.filter((app: any) => Boolean(app?.isEnabled));
