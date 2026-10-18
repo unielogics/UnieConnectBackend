@@ -2769,9 +2769,9 @@ function chatEntityLookupTerms(message: string) {
 
 async function resolveChatEntities(userId: string, message: string) {
   const terms = chatEntityLookupTerms(message);
-  if (!terms.length) return { terms: [], skus: [], orders: [], asns: [] };
+  if (!terms.length) return { terms: [], skus: [], orders: [], asns: [], customers: [], returns: [], suppliers: [], warehouses: [], supportTickets: [] };
 
-  const [skus, orders, asns] = await Promise.all([
+  const [skus, orders, asns, customers, returns, suppliers, warehouses, supportTickets] = await Promise.all([
     rows(
       `SELECT ci.id, ci.sku, ci.title,
               COALESCE(ci.metadata->>'subtitle', ci.metadata->>'subTitle', ci.attributes->>'subtitle', ci.sub_category) AS subtitle,
@@ -2838,6 +2838,81 @@ async function resolveChatEntities(userId: string, message: string) {
         LIMIT 10`,
       [userId, terms],
     ).catch(() => []),
+    rows(
+      `SELECT c.id, c.name, c.company, c.channel, c.updated_at,
+              count(o.id)::int AS order_count,
+              COALESCE(sum(CASE
+                WHEN COALESCE(o.totals->>'total', o.totals->>'grandTotal', '') ~ '^-?[0-9]+(?:\\.[0-9]+)?$'
+                  THEN COALESCE(o.totals->>'total', o.totals->>'grandTotal')::numeric
+                ELSE 0
+              END), 0)::numeric AS lifetime_value,
+              max(COALESCE(o.placed_at, o.created_at)) AS last_order_at
+         FROM customers c
+         LEFT JOIN orders o ON o.user_id = c.user_id AND o.customer_id = c.id
+        WHERE c.user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(c.id) = term
+                OR lower(COALESCE(c.external_customer_id, '')) = term
+          )
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+    rows(
+      `SELECT id, rma_number, status, payload, created_at, updated_at
+         FROM returns
+        WHERE user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(id) = term
+                OR lower(COALESCE(rma_number, '')) = term
+                OR lower(COALESCE(rma_number, '')) LIKE '%' || term || '%'
+          )
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+    rows(
+      `SELECT id, name, status, email, metadata, updated_at
+         FROM suppliers
+        WHERE user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(id) = term
+                OR lower(COALESCE(metadata->>'supplierCode', '')) = term
+          )
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+    rows(
+      `SELECT warehouse_code, status, facility_id, metadata, connected_at
+         FROM oms_warehouse_links
+        WHERE user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(warehouse_code) = term
+                OR lower(COALESCE(facility_id, '')) = term
+          )
+        ORDER BY connected_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
+    rows(
+      `SELECT id, subject, entity_type, entity_id, priority, status, owner, updated_at
+         FROM support_tickets
+        WHERE user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) AS term
+             WHERE lower(id) = term
+                OR lower(COALESCE(entity_id, '')) = term
+          )
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 10`,
+      [userId, terms],
+    ).catch(() => []),
   ]);
 
   return {
@@ -2881,6 +2956,51 @@ async function resolveChatEntities(userId: string, message: string) {
       payload: json(asn.payload, {}),
       createdAt: iso(asn.created_at),
       updatedAt: iso(asn.updated_at),
+    })),
+    customers: customers.map((customer: any) => ({
+      id: customer.id,
+      name: customer.name,
+      company: customer.company,
+      channel: customer.channel,
+      orderCount: number(customer.order_count),
+      lifetimeValue: money(customer.lifetime_value),
+      lastOrderAt: iso(customer.last_order_at),
+      updatedAt: iso(customer.updated_at),
+    })),
+    returns: returns.map((item: any) => ({
+      id: item.id,
+      rmaNumber: item.rma_number,
+      status: item.status,
+      reason: item.payload?.reason || item.payload?.returnReason || null,
+      orderId: item.payload?.orderId || item.payload?.order_id || null,
+      payload: json(item.payload, {}),
+      createdAt: iso(item.created_at),
+      updatedAt: iso(item.updated_at),
+    })),
+    suppliers: suppliers.map((supplier: any) => ({
+      id: supplier.id,
+      name: supplier.name,
+      status: supplier.status,
+      email: supplier.email,
+      metadata: json(supplier.metadata, {}),
+      updatedAt: iso(supplier.updated_at),
+    })),
+    warehouses: warehouses.map((warehouse: any) => ({
+      warehouseCode: warehouse.warehouse_code,
+      status: warehouse.status,
+      facilityId: warehouse.facility_id,
+      metadata: json(warehouse.metadata, {}),
+      connectedAt: iso(warehouse.connected_at),
+    })),
+    supportTickets: supportTickets.map((ticket: any) => ({
+      id: ticket.id,
+      subject: ticket.subject,
+      entityType: ticket.entity_type,
+      entityId: ticket.entity_id,
+      priority: ticket.priority,
+      status: ticket.status,
+      owner: ticket.owner,
+      updatedAt: iso(ticket.updated_at),
     })),
   };
 }
@@ -2940,32 +3060,44 @@ async function buildChatFocusContext(
   if (screen === 'suppliers' || /\b(supplier|vendor|pickup profile)\b/.test(q)) {
     return {
       topic: 'suppliers',
-      instruction: 'Answer from the account supplier records first. Distinguish missing supplier setup from an actual supplier performance issue.',
-      suppliers: samples.suppliers || [],
+      instruction: resolvedEntities.suppliers.length
+        ? 'Answer from the exact account-scoped supplier match first. Do not substitute another supplier.'
+        : 'Answer from the account supplier records first. Distinguish missing supplier setup from an actual supplier performance issue.',
+      suppliers: resolvedEntities.suppliers.length ? resolvedEntities.suppliers : samples.suppliers || [],
+      resolvedEntities,
       requiredSource: 'oms_suppliers',
     };
   }
   if (screen === 'returns' || /\b(return|returns|rma|restock)\b/.test(q)) {
     return {
       topic: 'returns',
-      instruction: 'Answer from account return and RMA records first. State the status, reason, linked order when available, and the next operational action.',
-      returns: samples.returns || [],
+      instruction: resolvedEntities.returns.length
+        ? 'Answer from the exact account-scoped return or RMA match first. Do not substitute another return.'
+        : 'Answer from account return and RMA records first. State the status, reason, linked order when available, and the next operational action.',
+      returns: resolvedEntities.returns.length ? resolvedEntities.returns : samples.returns || [],
+      resolvedEntities,
       requiredSource: 'oms_returns',
     };
   }
   if (screen === 'customers' || /\b(customer|customers|buyer|lifetime value|ltv)\b/.test(q)) {
     return {
       topic: 'customers',
-      instruction: 'Answer from account customer and order-history summaries first. Do not infer customer value or service risk when the supporting orders are absent.',
-      customers: samples.customers || [],
+      instruction: resolvedEntities.customers.length
+        ? 'Answer from the exact account-scoped customer match first. Do not substitute another customer.'
+        : 'Answer from account customer and order-history summaries first. Do not infer customer value or service risk when the supporting orders are absent.',
+      customers: resolvedEntities.customers.length ? resolvedEntities.customers : samples.customers || [],
+      resolvedEntities,
       requiredSource: 'oms_customers',
     };
   }
   if (screen === 'support' || /\b(support ticket|support tickets|ticket|tickets)\b/.test(q)) {
     return {
       topic: 'support_tickets',
-      instruction: 'Answer from account support tickets first. Prioritize open high-priority tickets and preserve the linked operational entity when available.',
-      tickets: samples.supportTickets || [],
+      instruction: resolvedEntities.supportTickets.length
+        ? 'Answer from the exact account-scoped support ticket match first. Do not substitute another ticket.'
+        : 'Answer from account support tickets first. Prioritize open high-priority tickets and preserve the linked operational entity when available.',
+      tickets: resolvedEntities.supportTickets.length ? resolvedEntities.supportTickets : samples.supportTickets || [],
+      resolvedEntities,
       requiredSource: 'oms_support_tickets',
     };
   }
@@ -3027,8 +3159,11 @@ async function buildChatFocusContext(
   if (screen === 'warehouses' || /\b(warehouse|wms|facility)\b/.test(q)) {
     return {
       topic: 'warehouses',
-      instruction: 'Answer from connected warehouse evidence first. Distinguish actual connected facilities from suggested network nodes.',
-      warehouses: samples.warehouses || [],
+      instruction: resolvedEntities.warehouses.length
+        ? 'Answer from the exact account-scoped warehouse match first. Do not substitute another warehouse or a suggested network node.'
+        : 'Answer from connected warehouse evidence first. Distinguish actual connected facilities from suggested network nodes.',
+      warehouses: resolvedEntities.warehouses.length ? resolvedEntities.warehouses : samples.warehouses || [],
+      resolvedEntities,
       requiredSource: 'oms_warehouses',
     };
   }
