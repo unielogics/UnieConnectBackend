@@ -2498,9 +2498,39 @@ export async function sqlModeRoutes(app: FastifyInstance) {
             topics: config.shopify.webhookTopics,
             log: req.log,
           });
+          await pgQuery(
+            `UPDATE marketplace_connections
+             SET metadata = (metadata - 'shopifyWebhookRegistrationError') || $3::jsonb,
+                 updated_at = now()
+             WHERE id = $1 AND user_id = $2`,
+            [
+              account.id,
+              userId,
+              JSON.stringify({
+                shopifyWebhookRegisteredAt: new Date().toISOString(),
+                shopifyWebhookReconciliation: webhookResult,
+                shopifyWebhookDelivery: shopifyWebhookHealth(),
+              }),
+            ],
+          );
         } catch (webhookError: any) {
           webhookResult = { error: webhookError?.message || 'Shopify webhook reconciliation failed' };
           req.log.warn({ err: webhookError, accountId: account.id }, 'shopify webhook reconciliation failed during refresh');
+          await pgQuery(
+            `UPDATE marketplace_connections
+             SET metadata = metadata || $3::jsonb,
+                 updated_at = now()
+             WHERE id = $1 AND user_id = $2`,
+            [
+              account.id,
+              userId,
+              JSON.stringify({
+                shopifyWebhookRegistrationError: webhookResult.error,
+                shopifyWebhookLastAttemptAt: new Date().toISOString(),
+                shopifyWebhookDelivery: shopifyWebhookHealth(),
+              }),
+            ],
+          );
         }
       } else if (account.channel === 'ebay') {
         let accessToken = account.access_token_enc;
@@ -2662,7 +2692,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       ]);
       const webhookAddress = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/shopify`;
       try {
-        await registerShopifyWebhooks({
+        const webhookResult = await registerShopifyWebhooks({
           shop,
           accessToken: tokenPayload.access_token,
           address: webhookAddress,
@@ -2671,13 +2701,14 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         });
         await pgQuery(
           `UPDATE marketplace_connections
-           SET metadata = metadata || $3::jsonb, updated_at = now()
+           SET metadata = (metadata - 'shopifyWebhookRegistrationError') || $3::jsonb, updated_at = now()
            WHERE id = $1 AND user_id = $2`,
           [
             account.id,
             saved.user_id,
             JSON.stringify({
               shopifyWebhookRegisteredAt: new Date().toISOString(),
+              shopifyWebhookReconciliation: webhookResult,
               shopifyWebhookDelivery: shopifyWebhookHealth(),
             }),
           ],
