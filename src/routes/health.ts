@@ -48,6 +48,7 @@ export async function healthRoutes(fastify: FastifyInstance) {
       amazonSpApiRegion: amazon.region,
       amazonSpApiHost: amazon.host,
       shopifyOAuthReady: shopify.oauthReady,
+      shopifyApiVersion: shopify.apiVersion,
       shopifyWebhookDeliveryMode: shopify.deliveryMode,
       shopifyWebhookUri: shopify.webhookUri,
       shopifyWebhookTopicCount: shopify.topics.length,

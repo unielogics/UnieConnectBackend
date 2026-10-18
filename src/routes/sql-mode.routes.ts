@@ -2698,6 +2698,48 @@ export async function sqlModeRoutes(app: FastifyInstance) {
           ],
         );
       }
+
+      // OAuth permission changes are not useful until the account is synchronized again.
+      // Run this after the token and webhooks are durable, without holding the provider redirect
+      // open for larger catalogs. The Connections screen polls the resulting sync state.
+      const accountId = account.id;
+      const accountUserId = saved.user_id;
+      const accessToken = tokenPayload.access_token;
+      const initialSync = !account.last_sync_at;
+      const log = req.log;
+      setImmediate(() => {
+        void (async () => {
+          const syncResult = await pullShopifySql({
+            userId: accountUserId,
+            channelAccountId: accountId,
+            shopDomain: shop,
+            accessToken,
+            initialSync,
+            log,
+          });
+          await markMarketplaceRefresh(accountId, accountUserId, syncResult);
+          await writeLedger(accountUserId, {
+            entityType: 'marketplace_connection',
+            entityId: accountId,
+            eventType: Object.keys(syncResult.errors || {}).length || Object.keys(syncResult.warnings || {}).length
+              ? 'reauthorization_sync_partial'
+              : 'reauthorization_sync_completed',
+            summary: Object.keys(syncResult.errors || {}).length || Object.keys(syncResult.warnings || {}).length
+              ? `Shopify reauthorization sync completed with provider issues for ${shop}.`
+              : `Shopify reauthorization sync completed for ${shop}.`,
+            payload: { accountId, syncResult },
+          });
+        })().catch(async (error: any) => {
+          log.warn({ err: error, accountId, shop }, 'shopify reauthorization sync failed');
+          await writeLedger(accountUserId, {
+            entityType: 'marketplace_connection',
+            entityId: accountId,
+            eventType: 'reauthorization_sync_failed',
+            summary: `Shopify reauthorization sync failed for ${shop}.`,
+            payload: { accountId, error: error?.message || 'Refresh failed' },
+          }).catch(() => null);
+        });
+      });
     }
     await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
     await writeLedger(saved.user_id, { entityType: 'marketplace_connection', entityId: account?.id, eventType: 'connected', summary: `Shopify marketplace connected for ${shop}.` });
