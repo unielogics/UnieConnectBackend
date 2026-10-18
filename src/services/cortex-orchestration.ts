@@ -105,13 +105,18 @@ async function fetchWithTimeout(url: string, init: any, timeoutMs = READ_TIMEOUT
 // ─── postCortex (resilient) ───────────────────────────────────────────────
 
 export async function postCortex(path: string, payload: any, options: CortexPostOptions = {}) {
+  const startedAt = Date.now();
+  const finish = <T extends Record<string, any>>(result: T) => ({
+    ...result,
+    duration_ms: Date.now() - startedAt,
+  });
   const userId = deriveCortexUserId(payload, options);
   const credentialHeaders = userId
     ? await getCortexCredentialHeaders(userId).catch(() => null)
     : null;
 
   if (!credentialHeaders && (!options.allowGlobalApiKey || !config.cortex.apiKey)) {
-    return {
+    return finish({
       ok: false,
       status: 503,
       data: {
@@ -119,11 +124,11 @@ export async function postCortex(path: string, payload: any, options: CortexPost
         path,
         userId,
       },
-    };
+    });
   }
 
   if (breakerShouldShortCircuit()) {
-    return {
+    return finish({
       ok: false,
       status: 503,
       data: {
@@ -132,7 +137,7 @@ export async function postCortex(path: string, payload: any, options: CortexPost
         retry_after_ms: Math.max(0, breaker.cooldownMs - (Date.now() - breaker.openedAt)),
         path,
       },
-    };
+    });
   }
 
   // Idempotency-Key persists across retries so Cortex can dedupe.
@@ -170,22 +175,22 @@ export async function postCortex(path: string, payload: any, options: CortexPost
           await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[attempt]));
           continue;
         }
-        return { ok: false, status: res.status, data, attempts: attempt + 1, idempotency_key: idempotencyKey };
+        return finish({ ok: false, status: res.status, data, attempts: attempt + 1, idempotency_key: idempotencyKey });
       }
       // 2xx OR non-retryable 4xx — return as-is and reset breaker
       if (res.ok) breakerRecordSuccess();
-      return { ok: res.ok, status: res.status, data, attempts: attempt + 1, idempotency_key: idempotencyKey };
+      return finish({ ok: res.ok, status: res.status, data, attempts: attempt + 1, idempotency_key: idempotencyKey });
     } catch (err: any) {
       lastErr = err;
       const code = err?.code || err?.cause?.code;
       const retryable = (isRetryableError(err) || err?.name === 'AbortError') && !isForegroundPricingPath(path);
       if (!retryable || attempt >= maxAttempts - 1) {
         breakerRecordFailure();
-        return {
+        return finish({
           ok: false,
           status: 503,
           data: { error: err?.message || 'Cortex call failed', code, attempts: attempt + 1, idempotency_key: idempotencyKey },
-        };
+        });
       }
       await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[attempt]));
     }
@@ -193,7 +198,7 @@ export async function postCortex(path: string, payload: any, options: CortexPost
 
   // Should be unreachable; safety net.
   breakerRecordFailure();
-  return { ok: false, status: 503, data: { error: 'Cortex retry budget exhausted', detail: String(lastErr?.message || lastErr), idempotency_key: idempotencyKey } };
+  return finish({ ok: false, status: 503, data: { error: 'Cortex retry budget exhausted', detail: String(lastErr?.message || lastErr), idempotency_key: idempotencyKey } });
 }
 
 export function cortexConfigStatus() {
