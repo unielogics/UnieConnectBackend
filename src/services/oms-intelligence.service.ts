@@ -3897,7 +3897,9 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         readinessNotes: 'Cortex is not configured for this account.',
       }
     : buildLocalCortexChatFallback(focusQuery, context, focusContext);
-  const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
+  const marketplaceHealthFocus = String(focusContext?.topic || '').endsWith('_connection_health')
+    || String(focusContext?.requiredSource || '') === 'oms_marketplace_connections';
+  const marketplaceHealthQuestion = marketplaceHealthFocus
     && (/(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message) || focusQuery !== message);
   const marketplaceAppStateQuestion = String(focusContext?.topic || '') === 'marketplace_apps'
     && /(installed|available|gated|active|activated|activation|status|what (?:does|is)|which apps? (?:are|is))/i.test(message)
