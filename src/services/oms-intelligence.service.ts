@@ -3913,10 +3913,14 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
   const accountPriorityQuestion = priorityIntent && /\b(account|operational|issue|blocker|risk)\b/i.test(message);
+  const connectionScreenHealthQuestion = screen === 'connections'
+    && ['shopify', 'amazon', 'ebay'].some((channel) => focusQuery.toLowerCase().includes(channel))
+    && /(working|works?|healthy|health|down|degraded|status|happening|exactly|what does not)/i.test(message);
   // Connection health and account snapshots are already authoritative in the tenant-scoped OMS
   // context. Answer them locally for consistent, fast guidance; open-ended analysis still flows
   // through Cortex orchestration below.
   const accountGroundedFastPath = marketplaceHealthQuestion
+    || connectionScreenHealthQuestion
     || marketplaceAppStateQuestion
     || marketplaceInstalledRecommendation
     || accountSnapshotQuestion
