@@ -2821,7 +2821,7 @@ function conversationAwareChatQuery(message: string, history: Array<{ role?: str
   const words = current.split(/\s+/).filter(Boolean);
   const standaloneTopic = /\b(shopify|amazon|ebay|marketplace|connection|sync|inventory|sku|product|listing|order|shipment|asn|warehouse|wms|supplier|billing|invoice|cost|margin|profit|label|audit|return|customer|task|readiness|decision|optimization|plan)\b/i.test(current);
   const contextualFollowup = words.length <= 16 && (
-    /^(why|how|what about|and what|then what|what next|where|when|which one|can you explain|explain that|tell me more)\b/i.test(current)
+    /^(why|how|what about|and what|then what|what next|what (?:should|can|do) (?:i|we)|should (?:i|we)|where|when|which one|can you explain|explain that|tell me more)\b/i.test(current)
     || /\b(this|that|it|those|these|them|they|same issue|about that|about it)\b/i.test(current)
   );
   if (standaloneTopic || !contextualFollowup) return current;
