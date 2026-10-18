@@ -682,6 +682,49 @@ async function getRevenueSeries(userId: string, range: RangeKey, start: Date) {
   return data.map((row) => ({ at: iso(row.at), revenue: money(row.revenue) }));
 }
 
+async function getChannelMix(userId: string, start: Date) {
+  const data = await rows<{
+    channel: string;
+    orders: string;
+    units: string;
+    revenue: string;
+    refunds: string;
+  }>(
+    `WITH line_totals AS (
+       SELECT order_id, COALESCE(SUM(quantity), 0) AS units
+         FROM order_lines
+        WHERE user_id = $1
+        GROUP BY order_id
+     )
+     SELECT COALESCE(NULLIF(lower(o.channel), ''), 'manual') AS channel,
+            COUNT(*)::text AS orders,
+            COALESCE(SUM(lt.units), 0)::text AS units,
+            COALESCE(SUM(COALESCE((o.totals->>'total')::numeric, 0)), 0)::text AS revenue,
+            COALESCE(SUM(
+              CASE WHEN o.paid = 'refunded'
+                THEN COALESCE((o.totals->>'total')::numeric, 0)
+                ELSE 0
+              END
+            ), 0)::text AS refunds
+       FROM orders o
+       LEFT JOIN line_totals lt ON lt.order_id = o.id
+      WHERE o.user_id = $1
+        AND COALESCE(o.placed_at, o.created_at) >= $2
+      GROUP BY 1
+      ORDER BY SUM(COALESCE((o.totals->>'total')::numeric, 0)) DESC, COUNT(*) DESC`,
+    [userId, start],
+  );
+  const totalRevenue = data.reduce((sum, row) => sum + number(row.revenue), 0);
+  return data.map((row) => ({
+    channel: row.channel || 'manual',
+    orders: number(row.orders),
+    units: number(row.units),
+    revenue: money(row.revenue),
+    refunds: money(row.refunds),
+    revenueSharePct: totalRevenue > 0 ? Math.round((number(row.revenue) / totalRevenue) * 1000) / 10 : 0,
+  }));
+}
+
 async function baseCounts(userId: string) {
   const data = await rows(
     `SELECT
@@ -1313,7 +1356,7 @@ function skuHistoryTimeline(item: Row, shipmentPlans: Row[], asns: Row[], activi
 export async function getCommandCenter(userId: string, range: RangeKey) {
   const start = rangeStart(range);
   const prevStart = previousRangeStart(range, start);
-  const [current, previous, units, previousUnits, currentMargin, previousMargin, revenueSeries, counts, items, plan, activityLedger] = await Promise.all([
+  const [current, previous, units, previousUnits, currentMargin, previousMargin, revenueSeries, channelMix, counts, items, plan, activityLedger] = await Promise.all([
     orderSummary(userId, start),
     orderSummary(userId, prevStart, start),
     getUnitsSold(userId, start),
@@ -1321,6 +1364,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
     getProductGrossProfit(userId, start),
     getProductGrossProfit(userId, prevStart, start),
     getRevenueSeries(userId, range, start),
+    getChannelMix(userId, start),
     baseCounts(userId),
     getItems(userId),
     getInventoryPlan(userId).catch(() => ({ skus: [] as any[] })),
@@ -1367,6 +1411,7 @@ export async function getCommandCenter(userId: string, range: RangeKey) {
       units,
       unitsDeltaPct: pctDelta(units, previousUnits),
       revenueSeries,
+      channelMix,
     },
     warnings: [
       ...(reorderCount ? [{ severity: 'high', title: 'Reorder needed', detail: `${reorderCount} product${reorderCount === 1 ? '' : 's'} will stock out within supplier lead time — review reorder suggestions.` }] : []),
