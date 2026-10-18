@@ -2,8 +2,8 @@
 set -euo pipefail
 
 APP_DIR="/var/www/unie-backend"
-RELEASES_DIR="/var/www/unie-backend-releases"
-CURRENT_LINK="/var/www/unie-backend-current"
+RELEASES_DIR="$APP_DIR/.releases"
+CURRENT_LINK="$APP_DIR/.current"
 REPO="https://github.com/unielogics/UnieConnectBackend.git"
 BRANCH="main"
 LOCK_FILE="/tmp/unieconnect-backend-deploy.lock"
