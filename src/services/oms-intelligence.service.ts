@@ -3759,6 +3759,15 @@ function buildGroundedAccountSnapshot(context: any) {
   const counts = readiness.counts || {};
   const samples = context?.samples || {};
   const connections = Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections : [];
+  const summarizedConnections = Array.from(connections.reduce((byChannel: Map<string, any>, connection: any) => {
+    const channel = String(connection?.channel || connection?.display_name || connection?.shop_domain || connection?.id || 'marketplace').toLowerCase();
+    if (!byChannel.has(channel)) byChannel.set(channel, connection);
+    return byChannel;
+  }, new Map<string, any>()).values()) as any[];
+  const activeConnections = summarizedConnections.filter((connection: any) => (
+    ['connected', 'active', 'synced'].includes(String(connection?.status || '').toLowerCase())
+  ));
+  const inactiveConnections = summarizedConnections.filter((connection: any) => !activeConnections.includes(connection));
   const orders = Array.isArray(samples.orders) ? samples.orders : [];
   const warehouses = Array.isArray(samples.warehouses) ? samples.warehouses : [];
   const billing = json(samples.billing, {});
@@ -3771,7 +3780,7 @@ function buildGroundedAccountSnapshot(context: any) {
     + number(categoryTotals.materials)
     - number(categoryTotals.refundsCaptured),
   );
-  const degradedConnections = connections.filter((connection: any) => Object.values(json(connection?.sync, {})).some((state: any) => (
+  const degradedConnections = activeConnections.filter((connection: any) => Object.values(json(connection?.sync, {})).some((state: any) => (
     state?.status === 'error' || Boolean(state?.error) || Boolean(state?.metadata?.degraded)
   )));
   const pendingOrders = orders.filter((order: any) => ![
@@ -3789,15 +3798,18 @@ function buildGroundedAccountSnapshot(context: any) {
     !chatCount(counts.wmsLinks) ? 'no connected warehouse or WMS truth' : null,
     chatCount(counts.amazonBlockedItems) ? `${chatPlural(chatCount(counts.amazonBlockedItems), 'Amazon SKU')} blocked for listing readiness` : null,
   ].filter(Boolean);
-  const marketplaceNames = connections
+  const marketplaceNames = activeConnections
+    .map((connection: any) => String(connection?.display_name || connection?.shop_domain || connection?.channel || '').trim())
+    .filter(Boolean);
+  const inactiveMarketplaceNames = inactiveConnections
     .map((connection: any) => String(connection?.display_name || connection?.shop_domain || connection?.channel || '').trim())
     .filter(Boolean);
   const lines = [
     'Account snapshot',
-    `Connected operations: ${chatPlural(chatCount(counts.catalogItems), 'SKU')}, ${chatPlural(chatCount(counts.orders), 'order')}, ${chatPlural(connections.length, 'marketplace connection')}, ${chatPlural(chatCount(counts.wmsLinks), 'warehouse link')}, and ${chatPlural(chatCount(counts.suppliers), 'supplier')}.`,
-    connections.length
-      ? `Marketplace health: ${marketplaceNames.join(', ')} ${connections.length === 1 ? 'is' : 'are'} connected${degradedConnections.length ? `; ${chatPlural(degradedConnections.length, 'connection')} has a degraded data area that needs review` : ' with no recorded sync degradation'}.`
-      : 'Marketplace health: no marketplace connection is active, so product and order synchronization is unavailable.',
+    `Connected operations: ${chatPlural(chatCount(counts.catalogItems), 'SKU')}, ${chatPlural(chatCount(counts.orders), 'order')}, ${chatPlural(activeConnections.length, 'active marketplace connection')}, ${chatPlural(chatCount(counts.wmsLinks), 'warehouse link')}, and ${chatPlural(chatCount(counts.suppliers), 'supplier')}.`,
+    activeConnections.length
+      ? `Marketplace health: ${marketplaceNames.join(', ')} ${activeConnections.length === 1 ? 'is' : 'are'} connected${degradedConnections.length ? `; ${chatPlural(degradedConnections.length, 'connection')} has a degraded data area that needs review` : ' with no recorded sync degradation'}${inactiveMarketplaceNames.length ? `. Awaiting authorization: ${inactiveMarketplaceNames.join(', ')}` : ''}.`
+      : `Marketplace health: no marketplace connection is active${inactiveMarketplaceNames.length ? `. Awaiting authorization: ${inactiveMarketplaceNames.join(', ')}` : ''}, so product and order synchronization is unavailable.`,
     `Order flow: ${chatPlural(orders.length || chatCount(counts.orders), 'order')} in the current account view; ${chatPlural(pendingOrders.length, 'order')} not yet in a completed, delivered, fulfilled, cancelled, closed, or refunded state.`,
     warehouses.length
       ? `Warehouse evidence: ${chatPlural(warehouses.length, 'connected warehouse')} reporting ${warehouseInventoryUnits.toLocaleString('en-US')} inventory units and ${chatPlural(warehouseAsns, 'ASN')}.`
@@ -3810,7 +3822,7 @@ function buildGroundedAccountSnapshot(context: any) {
   return {
     answer: polishCortexChatText(lines.join('\n\n')),
     sources: [
-      { source: 'oms_marketplace_connections', count: connections.length, degraded: degradedConnections.length },
+      { source: 'oms_marketplace_connections', count: summarizedConnections.length, active: activeConnections.length, awaitingAuthorization: inactiveConnections.length, degraded: degradedConnections.length },
       { source: 'oms_orders', count: orders.length || chatCount(counts.orders), pending: pendingOrders.length },
       { source: 'oms_warehouses', count: warehouses.length, inventoryUnits: warehouseInventoryUnits, asns: warehouseAsns },
       { source: 'oms_billing', window: '30d', netOperatingCost: operatingCost },
