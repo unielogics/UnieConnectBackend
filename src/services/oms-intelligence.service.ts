@@ -147,8 +147,10 @@ async function ensureCortexWorkspaceTables() {
       readiness_notes TEXT,
       cortex_status TEXT,
       cortex_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+      client_request_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE oms_cortex_chat_messages ADD COLUMN IF NOT EXISTS client_request_id TEXT;
     CREATE TABLE IF NOT EXISTS oms_cortex_tasks (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -174,6 +176,9 @@ async function ensureCortexWorkspaceTables() {
     );
     CREATE INDEX IF NOT EXISTS idx_oms_cortex_threads_user_screen ON oms_cortex_chat_threads(user_id, screen, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_oms_cortex_messages_thread_created ON oms_cortex_chat_messages(thread_id, created_at ASC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_oms_cortex_messages_user_request_role
+      ON oms_cortex_chat_messages(user_id, client_request_id, role)
+      WHERE client_request_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_oms_cortex_tasks_user_status ON oms_cortex_tasks(user_id, status, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_oms_cortex_tasks_user_screen ON oms_cortex_tasks(user_id, screen, status);
   `).catch(() => null);
@@ -5230,6 +5235,79 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   if (!message) throw new Error('Message is required');
   const entityType = body.entityType ? String(body.entityType).slice(0, 80) : null;
   const entityId = body.entityId ? String(body.entityId).slice(0, 160) : null;
+  const clientRequestId = String(body.requestId || '').trim().replace(/[^a-zA-Z0-9:_-]/g, '').slice(0, 120) || null;
+
+  const replayStoredAnswer = async () => {
+    if (!clientRequestId) return null;
+    const stored = await one(
+      `SELECT m.*, t.screen AS thread_screen, t.entity_type AS thread_entity_type,
+              t.entity_id AS thread_entity_id, t.title AS thread_title,
+              t.status AS thread_status, t.last_message_at AS thread_last_message_at,
+              t.created_at AS thread_created_at, t.updated_at AS thread_updated_at
+         FROM oms_cortex_chat_messages m
+         JOIN oms_cortex_chat_threads t ON t.id = m.thread_id AND t.user_id = m.user_id
+        WHERE m.user_id = $1 AND m.client_request_id = $2 AND m.role = 'assistant'
+          AND t.screen = $3
+          AND t.entity_type IS NOT DISTINCT FROM $4
+          AND t.entity_id IS NOT DISTINCT FROM $5
+        LIMIT 1`,
+      [userId, clientRequestId, screen, entityType, entityId],
+    ).catch(() => null);
+    if (!stored) return null;
+    const available = stored.cortex_status !== 'unavailable';
+    return {
+      thread: mapCortexThread({
+        id: stored.thread_id,
+        screen: stored.thread_screen,
+        entity_type: stored.thread_entity_type,
+        entity_id: stored.thread_entity_id,
+        title: stored.thread_title,
+        status: stored.thread_status,
+        last_message_at: stored.thread_last_message_at,
+        created_at: stored.thread_created_at,
+        updated_at: stored.thread_updated_at,
+      }),
+      message: mapCortexMessage(stored),
+      context: { screen },
+      cortex: {
+        ok: available,
+        status: available ? 200 : 503,
+        health: {
+          available,
+          chatIntegrated: available,
+          status: available ? 200 : 503,
+          reason: 'replayed_request',
+          mode: stored.cortex_status === 'live' ? 'live' : available ? 'account_scoped' : 'unavailable',
+          liveRouteAvailable: stored.cortex_status === 'live',
+        },
+      },
+    };
+  };
+
+  const replay = await replayStoredAnswer();
+  if (replay) return replay;
+
+  if (clientRequestId) {
+    const duplicateUserMessage = await one(
+      `SELECT m.id
+         FROM oms_cortex_chat_messages m
+         JOIN oms_cortex_chat_threads t ON t.id = m.thread_id AND t.user_id = m.user_id
+        WHERE m.user_id = $1 AND m.client_request_id = $2 AND m.role = 'user'
+          AND t.screen = $3
+          AND t.entity_type IS NOT DISTINCT FROM $4
+          AND t.entity_id IS NOT DISTINCT FROM $5
+        LIMIT 1`,
+      [userId, clientRequestId, screen, entityType, entityId],
+    ).catch(() => null);
+    if (duplicateUserMessage) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const completed = await replayStoredAnswer();
+        if (completed) return completed;
+      }
+      throw new Error('Cortex is still preparing the original answer. Retry in a moment; your question will not be duplicated.');
+    }
+  }
   let thread = body.threadId
     ? await one(
         `SELECT * FROM oms_cortex_chat_threads
@@ -5248,11 +5326,21 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     );
   }
 
-  await pgQuery(
-    `INSERT INTO oms_cortex_chat_messages (user_id, thread_id, role, content)
-     VALUES ($1, $2, 'user', $3)`,
-    [userId, thread?.id, message],
+  const insertedUserMessage = await one(
+    `INSERT INTO oms_cortex_chat_messages (user_id, thread_id, role, content, client_request_id)
+     VALUES ($1, $2, 'user', $3, $4)
+     ON CONFLICT (user_id, client_request_id, role) WHERE client_request_id IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [userId, thread?.id, message, clientRequestId],
   );
+  if (clientRequestId && !insertedUserMessage) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const completed = await replayStoredAnswer();
+      if (completed) return completed;
+    }
+    throw new Error('Cortex is still preparing the original answer. Retry in a moment; your question will not be duplicated.');
+  }
 
   const threadHistoryRows = (await rows(
     `SELECT role, content, sources, tasks, confidence, readiness_notes
@@ -5381,7 +5469,9 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     },
   }, {
     userId,
-    idempotencyKey: `oms-cortex-chat-${thread?.id}-${Date.now()}`,
+    idempotencyKey: clientRequestId
+      ? `oms-cortex-chat-${userId}-${clientRequestId}`
+      : `oms-cortex-chat-${thread?.id}-${Date.now()}`,
     timeoutMs: 35_000,
     maxAttempts: 1,
   }).catch((err) => ({ ok: false, status: 503, data: { error: err?.message || 'Cortex call failed' } }));
@@ -5732,8 +5822,16 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   };
   const saved = await one(
     `INSERT INTO oms_cortex_chat_messages
-       (user_id, thread_id, role, content, sources, tasks, confidence, readiness_notes, cortex_status, cortex_response)
-     VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9::jsonb)
+       (user_id, thread_id, role, content, sources, tasks, confidence, readiness_notes, cortex_status, cortex_response, client_request_id)
+     VALUES ($1, $2, 'assistant', $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9::jsonb, $10)
+     ON CONFLICT (user_id, client_request_id, role) WHERE client_request_id IS NOT NULL DO UPDATE SET
+       content = EXCLUDED.content,
+       sources = EXCLUDED.sources,
+       tasks = EXCLUDED.tasks,
+       confidence = EXCLUDED.confidence,
+       readiness_notes = EXCLUDED.readiness_notes,
+       cortex_status = EXCLUDED.cortex_status,
+       cortex_response = EXCLUDED.cortex_response
      RETURNING *`,
     [
       userId,
@@ -5744,7 +5842,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       normalized.confidence,
       normalized.readinessNotes,
       liveRouteAvailable ? 'live' : accountChatConfigured ? 'account_scoped' : 'unavailable',
-      JSON.stringify(cortex || {}),
+      JSON.stringify({ ...(cortex || {}), clientRequestId }),
+      clientRequestId,
     ],
   );
   await pgQuery(
@@ -6041,6 +6140,7 @@ function mapCortexMessage(row: any) {
     confidence: row.confidence == null ? null : Number(row.confidence),
     readinessNotes: row.readiness_notes,
     cortexStatus: row.cortex_status,
+    clientRequestId: row.client_request_id || undefined,
     cortexResponse: json(row.cortex_response, {}),
     createdAt: iso(row.created_at),
   };
