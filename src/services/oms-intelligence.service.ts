@@ -4039,6 +4039,50 @@ function buildCortexModelContext(context: any, focusContext: any) {
   };
 }
 
+const CORTEX_FOCUS_ARRAY_LIMITS: Record<string, number> = {
+  apps: 50,
+  asns: 25,
+  connections: 25,
+  customers: 40,
+  decisions: 20,
+  events: 30,
+  findings: 30,
+  orders: 60,
+  returns: 30,
+  runs: 20,
+  shipmentPlans: 25,
+  skus: 60,
+  suppliers: 30,
+  tickets: 30,
+  warehouses: 50,
+};
+
+function compactCortexFocusRecord(collection: string, record: any) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return record;
+  if (collection !== 'orders') return record;
+  // Raw marketplace order payloads can be very large and are not needed by the
+  // model after the OMS has normalized status, value, timing, and shipment fields.
+  const { metadata: _metadata, ...normalized } = record;
+  return normalized;
+}
+
+function buildCortexRequestFocusContext(focusContext: any) {
+  if (!focusContext || typeof focusContext !== 'object') return {};
+  const compact: Record<string, any> = {};
+  const coverage: Record<string, { provided: number; available: number }> = {};
+  for (const [key, value] of Object.entries(focusContext)) {
+    if (!Array.isArray(value)) {
+      compact[key] = value;
+      continue;
+    }
+    const limit = CORTEX_FOCUS_ARRAY_LIMITS[key] || 25;
+    compact[key] = value.slice(0, limit).map((record) => compactCortexFocusRecord(key, record));
+    if (value.length > limit) coverage[key] = { provided: limit, available: value.length };
+  }
+  if (Object.keys(coverage).length) compact.sampleCoverage = coverage;
+  return compact;
+}
+
 export async function createCortexChatMessage(userId: string, body: any = {}) {
   await ensureCortexWorkspaceTables();
   const screen = String(body.screen || 'command').slice(0, 80);
@@ -4085,10 +4129,13 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const threadHistory = threadHistoryRows
     .map((item: any) => ({ role: item.role, content: String(item.content || '').slice(0, 8000) }));
 
-  const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: true });
+  // The shell refreshes readiness tasks on load and after mutations. Chat reads
+  // that account state without regenerating every task for every user message.
+  const context = await getAccountOmsContextBundle(userId, screen, { refreshTasks: false });
   const focusQuery = conversationAwareChatQuery(message, threadHistory);
   const focusContext = await buildChatFocusContext(userId, focusQuery, screen, context, entityType, entityId);
   const modelContext = buildCortexModelContext(context, focusContext);
+  const cortexFocusContext = buildCortexRequestFocusContext(focusContext);
   const fallback = context.readiness?.cortex?.configured === false
     ? {
         answer: 'Cortex is not available for this account. Contact support or your account manager to enable Cortex intelligence.',
@@ -4139,7 +4186,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     thread_id: thread?.id,
     message,
     history: threadHistory,
-    focus_context: focusContext,
+    focus_context: cortexFocusContext,
     context: modelContext,
     response_contract: {
       answer: 'string',
