@@ -3876,7 +3876,10 @@ function buildGroundedOperationalRoadmap(context: any) {
   const priorityRank: Record<string, number> = { high: 0, normal: 1, low: 2 };
   const stageRank = (task: any) => {
     const target = String(task?.actionTarget || task?.screen || '');
-    if (!marketplaceReady && target === 'connections') return 0;
+    const entityType = String(task?.entityType || '').toLowerCase();
+    const taskText = `${task?.title || ''} ${task?.detail || ''}`.toLowerCase();
+    if (!marketplaceReady && target === 'connections'
+      && (['connection', 'marketplace_connection'].includes(entityType) || /connect (?:a |the )?marketplace/.test(taskText))) return 0;
     if (!catalogCount && ['skus', 'product-research'].includes(target)) return 1;
     if (!warehouseReady && ['warehouses', 'connections'].includes(target)) return 2;
     if (!supplierCount && target === 'suppliers') return 3;
@@ -4319,6 +4322,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
   const accountPriorityQuestion = priorityIntent && /\b(account|operational|issue|blocker|risk)\b/i.test(message);
+  const operationalRoadmapQuestion = chatRequestsOperationalRoadmap(focusQuery);
   const connectionScreenHealthQuestion = screen === 'connections'
     && ['shopify', 'amazon', 'ebay'].some((channel) => focusQuery.toLowerCase().includes(channel))
     && /(working|works?|healthy|health|down|degraded|status|happening|exactly|what does not)/i.test(message);
@@ -4330,7 +4334,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     || marketplaceAppStateQuestion
     || marketplaceInstalledRecommendation
     || accountSnapshotQuestion
-    || accountPriorityQuestion;
+    || accountPriorityQuestion
+    || operationalRoadmapQuestion;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
