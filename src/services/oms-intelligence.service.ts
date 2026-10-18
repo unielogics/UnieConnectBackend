@@ -4092,6 +4092,7 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
   const nextSteps = sortedTasks.slice(0, 3).map((task: any, idx: number) => compactTaskLine(task, idx + 1));
   const intentQuery = String(intentMessage || '').toLowerCase();
   const priorityIntent = chatRequestsPriority(intentMessage);
+  const snapshotIntent = chatRequestsAccountSnapshot(intentMessage);
   const actionIntent = chatRequestsActions(intentMessage) || intentQuery.includes('get the account going') || intentQuery.includes('start') || intentQuery.includes('blocking') || intentQuery.includes('confidence') || intentQuery.includes('missing');
   const requestedMarketplaceChannel = ['shopify', 'amazon', 'ebay'].find((channel) => q.includes(channel));
   const marketplaceAppIntent = chatRequestsMarketplaceApps(message, context?.screen);
@@ -4233,8 +4234,8 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
       ...(marketplaceAppIntent ? [{ source: 'oms_marketplace_apps', count: Array.isArray(samples.marketplaceApps) ? samples.marketplaceApps.length : 0 }] : []),
       ...(marketplaceConnectionIntent ? [{ source: 'oms_marketplace_connections', count: Array.isArray(samples.marketplaceConnections) ? samples.marketplaceConnections.length : 0 }] : []),
     ],
-    tasks: actionIntent || includeMarketplaceRepair
-      ? responseTasks.slice(0, marketplaceConnectionIntent || priorityIntent ? 1 : 3).map((task: any) => ({
+    tasks: actionIntent || includeMarketplaceRepair || snapshotIntent
+      ? responseTasks.slice(0, marketplaceConnectionIntent || priorityIntent || snapshotIntent ? 1 : 3).map((task: any) => ({
           id: task.id,
           dedupeKey: task.dedupeKey,
           title: task.title,
@@ -4672,7 +4673,7 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
       if (seenActions.has(key)) return false;
       seenActions.add(key);
       return true;
-    }).slice(0, priorityIntent ? 1 : 3);
+    }).slice(0, priorityIntent || accountSnapshotQuestion ? 1 : 3);
   }
   if (actionIntent && normalized.tasks.length) {
     const alreadyActionable = /\b(first action|next step|start by|open|upload|add|connect|reconnect|review|complete)\b/i.test(normalized.answer);
