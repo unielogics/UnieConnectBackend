@@ -1964,13 +1964,15 @@ function recommendationTaskDetail(rec: any, readiness: any) {
     rec?.requiredAction || rec?.optimizedValue?.action || rec?.summary || '',
   )
     .replace(/^[A-Z][a-z]+ with:\s*/i, '')
+    .replace(/\s*\(SKU, order id, timestamps, charge details\)/i, '')
     .replace(/[.;\s]+$/, '');
   const score = Math.max(0, Math.min(100, Math.round(number(readiness?.score, 0))));
   const title = String(rec?.title || '').toLowerCase();
   const readinessPrefix = /(feed|data) completeness|confidence/.test(title)
     ? `Account readiness is currently ${score}%. `
     : '';
-  const instruction = action || humanizeInternalLanguage(rec?.summary || 'Complete the missing account data');
+  const rawInstruction = action || humanizeInternalLanguage(rec?.summary || 'Complete the missing account data');
+  const instruction = rawInstruction.charAt(0).toUpperCase() + rawInstruction.slice(1);
   return `${readinessPrefix}${instruction}. Cortex will verify the new evidence automatically.`;
 }
 
