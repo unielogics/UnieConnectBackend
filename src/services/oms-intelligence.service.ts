@@ -3165,7 +3165,9 @@ function buildGroundedAiPlanApprovalResponse(context: any, focusContext: any) {
     ].includes(String(task?.dedupeKey || '')))
     .sort((a: any, b: any) => String(a.dedupeKey).localeCompare(String(b.dedupeKey)));
 
-  if (plan?.noChangeRecommended === true || String(plan?.impactStatus || '') === 'no_change') {
+  const groundedNoChange = plan?.decisionReady === true
+    && (plan?.noChangeRecommended === true || String(plan?.impactStatus || '') === 'no_change');
+  if (groundedNoChange) {
     return {
       answer: [
         'The AI Plan is complete, but there is nothing to approve. Cortex recommends retaining the current warehouse network because the latest model did not find a material, traceable improvement.',

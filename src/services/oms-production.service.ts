@@ -1523,11 +1523,14 @@ export async function getBusinessDouble(userId: string) {
   const networkGrounded = connectedWarehouseNodes > 0
     && modelBaselineWarehouseNodes > 0
     && connectedWarehouseNodes === modelBaselineWarehouseNodes;
-  const groundingIssues = noChangeRecommended ? [] : [
+  // A no-change verdict is still a business decision. It must reconcile to current account
+  // evidence before the UI can present it as safe; otherwise a stale model can incorrectly
+  // approve the status quo while its cost or warehouse baseline no longer matches reality.
+  const groundingIssues = [
     ...(!costGrounded ? ['Modeled baseline cost does not reconcile with observed 30-day billing.'] : []),
     ...(!networkGrounded ? ['Modeled baseline warehouse count does not match connected warehouse truth.'] : []),
   ];
-  const decisionReady = snapshotIsModeled && (noChangeRecommended || (costGrounded && networkGrounded));
+  const decisionReady = snapshotIsModeled && costGrounded && networkGrounded;
   const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
     ? {
         ...localPlan,
@@ -1550,7 +1553,7 @@ export async function getBusinessDouble(userId: string) {
         recommendationVerdict: recommendationVerdict || null,
         approvalRequired: snapshotIsModeled && !noChangeRecommended && decisionReady,
         decisionReady,
-        impactStatus: noChangeRecommended ? 'no_change' : decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
+        impactStatus: decisionReady && noChangeRecommended ? 'no_change' : decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
         grounding: {
           observedMonthlyCost,
           modelBaselineMonthlyCost,
@@ -1633,13 +1636,13 @@ export async function approveBusinessDouble(userId: string, planId: string, appr
     error.statusCode = 409;
     throw error;
   }
-  if (plan.noChangeRecommended === true) {
-    const error: any = new Error('Cortex recommends retaining the current network. There is no material plan change to approve.');
+  if (plan.decisionReady !== true) {
+    const error: any = new Error(`This modeled scenario is not ready for approval. ${(plan.grounding?.issues || []).join(' ')}`.trim());
     error.statusCode = 409;
     throw error;
   }
-  if (plan.decisionReady !== true) {
-    const error: any = new Error(`This modeled scenario is not ready for approval. ${(plan.grounding?.issues || []).join(' ')}`.trim());
+  if (plan.noChangeRecommended === true) {
+    const error: any = new Error('Cortex recommends retaining the current network. There is no material plan change to approve.');
     error.statusCode = 409;
     throw error;
   }
@@ -1711,13 +1714,13 @@ export async function rejectBusinessDouble(userId: string, planId: string, rejec
     error.statusCode = 409;
     throw error;
   }
-  if (plan.noChangeRecommended === true) {
-    const error: any = new Error('Cortex recommends retaining the current network. There is no material plan change to deny.');
+  if (plan.decisionReady !== true) {
+    const error: any = new Error('This is a reference scenario, not an approval decision. Reconcile its billing and warehouse baseline before accepting or denying it.');
     error.statusCode = 409;
     throw error;
   }
-  if (plan.decisionReady !== true) {
-    const error: any = new Error('This is a reference scenario, not an approval decision. Reconcile its billing and warehouse baseline before accepting or denying it.');
+  if (plan.noChangeRecommended === true) {
+    const error: any = new Error('Cortex recommends retaining the current network. There is no material plan change to deny.');
     error.statusCode = 409;
     throw error;
   }
