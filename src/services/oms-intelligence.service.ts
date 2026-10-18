@@ -1959,6 +1959,21 @@ function recommendationBelongsInTaskInbox(rec: any) {
   return false;
 }
 
+function recommendationTaskDetail(rec: any, readiness: any) {
+  const action = humanizeInternalLanguage(
+    rec?.requiredAction || rec?.optimizedValue?.action || rec?.summary || '',
+  )
+    .replace(/^[A-Z][a-z]+ with:\s*/i, '')
+    .replace(/[.;\s]+$/, '');
+  const score = Math.max(0, Math.min(100, Math.round(number(readiness?.score, 0))));
+  const title = String(rec?.title || '').toLowerCase();
+  const readinessPrefix = /(feed|data) completeness|confidence/.test(title)
+    ? `Account readiness is currently ${score}%. `
+    : '';
+  const instruction = action || humanizeInternalLanguage(rec?.summary || 'Complete the missing account data');
+  return `${readinessPrefix}${instruction}. Cortex will verify the new evidence automatically.`;
+}
+
 function priorityForTask(text: string, score?: number) {
   const value = text.toLowerCase();
   if (value.includes('connect') || value.includes('missing') || value.includes('blocked') || (score != null && score < 50)) return 'high';
@@ -2166,7 +2181,7 @@ export async function refreshCortexTasks(userId: string) {
       entityType: rec.entityType || rec.recommendationType,
       entityId: rec.entityId || rec.id,
       title: rec.title,
-      detail: rec.summary,
+      detail: recommendationTaskDetail(rec, readiness),
       priority: Number(rec.confidence || 0) >= 0.8 ? 'normal' : 'low',
       actionLabel: target.actionLabel,
       actionTarget: target.screen,
