@@ -3686,8 +3686,12 @@ function chatRequestsMarginGuidance(message: string) {
 
 function chatRequestsFinancialLeakage(message: string) {
   const q = String(message || '').toLowerCase();
-  return /\b(where|how|why|what)\b/.test(q)
-    && /\b(losing money|money (?:is )?going|cost drivers?|largest costs?|biggest costs?|spend concentration|operating spend|expense concentration)\b/.test(q);
+  const asksForPeriodSpend = /\b(how much|what(?: did|'s| is)?|show|summari[sz]e)\b/.test(q)
+    && /\b(spend|spent|spending|cost|costs|charges?|expenses?)\b/.test(q)
+    && /\b(last|past|recent|30\s*days?|month|monthly)\b/.test(q);
+  const asksForCostDriver = /\b(where|how|why|what)\b/.test(q)
+    && /\b(losing money|money (?:is )?going|cost drivers?|driving (?:it|costs?|spend)|largest costs?|biggest costs?|spend concentration|operating spend|expense concentration)\b/.test(q);
+  return asksForPeriodSpend || asksForCostDriver;
 }
 
 function chatRequestsShipmentReadiness(message: string) {
