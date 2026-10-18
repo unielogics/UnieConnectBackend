@@ -1509,9 +1509,9 @@ export async function getBusinessDouble(userId: string) {
       || snapshot?.summary?.networkRecommendation
       || '',
   ).trim().toLowerCase();
-  const noChangeRecommended = /^(?:no[ _-]?op|keep[ _-]current|none|no[ _-]change)$/.test(recommendationVerdict);
+  const modelNoChangeVerdict = /^(?:no[ _-]?op|keep[ _-]current|none|no[ _-]change)$/.test(recommendationVerdict);
   const snapshotIsModeled = hasMaterialOptimizedPlan(snapshotCurrent, snapshotOptimized, snapshotSavings)
-    || (noChangeRecommended && hasPlanPayload(snapshotCurrent) && hasPlanPayload(snapshotOptimized));
+    || (modelNoChangeVerdict && hasPlanPayload(snapshotCurrent) && hasPlanPayload(snapshotOptimized));
   const modelBaselineMonthlyCost = money(snapshotCurrent?.monthlyCost ?? snapshotCurrent?.estimatedMonthlyCost);
   const modelBaselineWarehouseNodes = number(snapshotCurrent?.warehouseNodes ?? snapshotCurrent?.warehouseCount);
   const observedMonthlyCost = money(localPlan.currentMetrics.monthlyCost);
@@ -1531,6 +1531,9 @@ export async function getBusinessDouble(userId: string) {
     ...(!networkGrounded ? ['Modeled baseline warehouse count does not match connected warehouse truth.'] : []),
   ];
   const decisionReady = snapshotIsModeled && costGrounded && networkGrounded;
+  // Preserve the source verdict for auditability, but expose it as account
+  // guidance only after the model baselines reconcile with current OMS truth.
+  const noChangeRecommended = decisionReady && modelNoChangeVerdict;
   const cortexBusinessDouble = hasPlanPayload(snapshot?.businessDouble)
     ? {
         ...localPlan,
@@ -1551,9 +1554,9 @@ export async function getBusinessDouble(userId: string) {
         modelStatus: snapshotIsModeled ? 'modeled' : 'not_modeled',
         noChangeRecommended,
         recommendationVerdict: recommendationVerdict || null,
-        approvalRequired: snapshotIsModeled && !noChangeRecommended && decisionReady,
+        approvalRequired: snapshotIsModeled && !modelNoChangeVerdict && decisionReady,
         decisionReady,
-        impactStatus: decisionReady && noChangeRecommended ? 'no_change' : decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
+        impactStatus: decisionReady && modelNoChangeVerdict ? 'no_change' : decisionReady ? 'traceable' : snapshotIsModeled ? 'scenario_only' : 'needs_model',
         grounding: {
           observedMonthlyCost,
           modelBaselineMonthlyCost,
