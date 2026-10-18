@@ -2156,7 +2156,9 @@ export async function refreshCortexTasks(userId: string) {
     const target = recommendationTaskTarget(rec);
     await upsertCortexTask(userId, {
       dedupeKey,
-      source: 'recommendation',
+      // Only prerequisite recommendations reach this loop. Present and verify
+      // them as readiness work; approve/deny decisions stay in decision views.
+      source: 'readiness',
       screen: target.screen,
       entityType: rec.entityType || rec.recommendationType,
       entityId: rec.entityId || rec.id,
