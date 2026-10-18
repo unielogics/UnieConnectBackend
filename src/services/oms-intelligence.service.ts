@@ -2536,6 +2536,8 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       { source: 'oms_data_readiness', screen: 'command', label: 'Account readiness' },
       { source: 'oms_cortex_tasks', screen: 'command', label: 'Cortex tasks' },
       { source: 'oms_recommendations', screen: 'double', label: 'Cortex guidance' },
+      { source: 'oms_business_double', screen: 'double', label: 'Business Double plan' },
+      { source: 'oms_inventory_plan', screen: 'plan', label: 'Inventory plan' },
       { source: 'oms_skus', screen: 'skus', label: 'SKU catalog' },
       { source: 'oms_orders', screen: 'orders', label: 'Orders' },
       { source: 'oms_customers', screen: 'customers', label: 'Customers' },
@@ -2631,6 +2633,8 @@ const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
   oms_data_readiness: { screen: 'command', label: 'Account readiness' },
   oms_cortex_tasks: { screen: 'command', label: 'Cortex tasks' },
   oms_recommendations: { screen: 'double', label: 'Cortex guidance' },
+  oms_business_double: { screen: 'double', label: 'Business Double plan' },
+  oms_inventory_plan: { screen: 'plan', label: 'Inventory plan' },
   oms_context_samples: { screen: 'command', label: 'OMS account context' },
   oms_skus: { screen: 'skus', label: 'SKU catalog' },
   oms_orders: { screen: 'orders', label: 'Orders' },
@@ -3016,6 +3020,37 @@ async function buildChatFocusContext(
   const q = String(message || '').toLowerCase();
   const samples = context?.samples || {};
   const resolvedEntities = await resolveChatEntities(userId, [message, entityId].filter(Boolean).join(' '));
+  if (screen === 'double' || /\b(business double|six[- ]month (?:operating )?plan|optimized business plan)\b/.test(q)) {
+    const businessDouble = await getBusinessDouble(userId).catch(() => null);
+    return {
+      topic: 'business_double',
+      instruction: 'Answer from the current Business Double plan first. Clearly separate observed current metrics, modeled optimized metrics, traceable impact, grounding blockers, and approval state. Never present scenario-only values as executable savings.',
+      businessDouble,
+      requiredSource: 'oms_business_double',
+    };
+  }
+  if (screen === 'plan' || /\b(inventory plan|replenishment plan|stockout plan)\b/.test(q)) {
+    const inventoryPlan: any = await getInventoryPlan(userId, '6m').catch(() => null);
+    return {
+      topic: 'inventory_plan',
+      instruction: 'Answer from the current six-month inventory plan first. Clearly separate observed demand and inventory from proposed replenishment or placement, and state every grounding blocker before suggesting execution.',
+      inventoryPlan: inventoryPlan ? {
+        horizon: inventoryPlan.horizon,
+        modelStatus: inventoryPlan.modelStatus,
+        decisionReady: inventoryPlan.decisionReady,
+        impactStatus: inventoryPlan.impactStatus,
+        generatedAt: inventoryPlan.generatedAt,
+        current: inventoryPlan.current,
+        proposed: inventoryPlan.proposed,
+        months: Array.isArray(inventoryPlan.months) ? inventoryPlan.months.slice(0, 6) : [],
+        skus: Array.isArray(inventoryPlan.skus) ? inventoryPlan.skus.slice(0, 25) : [],
+        warehouses: Array.isArray(inventoryPlan.warehouses) ? inventoryPlan.warehouses.slice(0, 25) : [],
+        grounding: inventoryPlan.grounding,
+        source: inventoryPlan.source,
+      } : null,
+      requiredSource: 'oms_inventory_plan',
+    };
+  }
   if (chatRequestsDecision(message)) {
     const decisions = (Array.isArray(context?.recommendations) ? context.recommendations : [])
       .filter(chatRecommendationIsDecision);
