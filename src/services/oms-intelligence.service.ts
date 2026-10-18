@@ -3559,13 +3559,19 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
     : buildLocalCortexChatFallback(focusQuery, context);
   const marketplaceHealthQuestion = String(focusContext?.topic || '').endsWith('_connection_health')
     && /(working|healthy|health|down|degraded|status|happening|exactly)/i.test(message);
+  const marketplaceAppStateQuestion = String(focusContext?.topic || '') === 'marketplace_apps'
+    && /(installed|available|gated|active|activated|activation|status|what (?:does|is)|which apps? (?:are|is))/i.test(message)
+    && !/(should|recommend|best|most value|worth|priority|prioritize)/i.test(message);
   const priorityIntent = chatRequestsPriority(message);
   const accountSnapshotQuestion = chatRequestsAccountSnapshot(message);
   const accountPriorityQuestion = priorityIntent && /\b(account|operational|issue|blocker|risk)\b/i.test(message);
   // Connection health and account snapshots are already authoritative in the tenant-scoped OMS
   // context. Answer them locally for consistent, fast guidance; open-ended analysis still flows
   // through Cortex orchestration below.
-  const accountGroundedFastPath = marketplaceHealthQuestion || accountSnapshotQuestion || accountPriorityQuestion;
+  const accountGroundedFastPath = marketplaceHealthQuestion
+    || marketplaceAppStateQuestion
+    || accountSnapshotQuestion
+    || accountPriorityQuestion;
   const cortex = accountGroundedFastPath ? {
     ok: false,
     status: 200,
