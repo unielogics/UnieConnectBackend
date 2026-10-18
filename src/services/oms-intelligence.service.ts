@@ -1868,10 +1868,18 @@ export async function getScreenIntelligenceContext(userId: string, screen: strin
     labels: ['Which labels should be audited first?', 'What refund evidence is missing?', 'Where are carrier costs leaking?'],
     billing: ['Where am I losing margin?', 'Which costs need invoice evidence?', 'What billing decision is ready to approve?'],
     suppliers: ['Which suppliers need pickup profiles?', 'What supplier data blocks execution?', 'Which supplier should I work on next?'],
+    customers: ['Which customers need attention?', 'Who are my highest-value customers?', 'Which customer orders have service risk?'],
+    returns: ['Which returns need attention?', 'What return reasons are increasing?', 'Which RMAs are blocked?'],
+    heatmap: ['Where is demand concentrated?', 'Which states have the most orders?', 'How well do my warehouses cover demand?'],
     'product-research': ['Research a single product', 'What CSV should I upload next?', 'Which product fields are missing most often?'],
     marketplace: ['Which apps should be installed?', 'What is gated until activation?', 'Which connection unlocks the most value?'],
     connections: ['Which connection should I add next?', 'Is Cortex available for this account?', 'Which services are system managed?'],
     double: ['What changed from current to optimized?', 'Which approval has measurable impact?', 'What can be automated after approval?'],
+    plan: ['What should the inventory plan prioritize?', 'Which SKUs are at risk?', 'What plan inputs are still missing?'],
+    audits: ['Which audit findings need attention?', 'Where are refunds recoverable?', 'What evidence is missing for claims?'],
+    ledger: ['What did Cortex change recently?', 'Which actions are waiting for approval?', 'Show the latest execution outcomes'],
+    support: ['Which support tickets need attention?', 'What issues are tied to active operations?', 'Which tickets are high priority?'],
+    profile: ['Is my account configuration complete?', 'Which account settings block operations?', 'What should an administrator review?'],
   };
   const baseSummary = `On ${screenLabel}, Cortex sees ${readiness.score}% readiness with ${number(counts.catalogItems)} SKUs, ${number(counts.orders)} orders, ${number(counts.wmsLinks)} warehouse links, and ${number(counts.marketplaceConnections)} marketplace connections.`;
   return {
@@ -2363,7 +2371,11 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     orders,
     warehouses,
     suppliers,
+    customers,
+    returns,
+    supportTickets,
     labelRuns,
+    labelFindings,
     marketplaces,
     shipmentPlans,
     asns,
@@ -2377,7 +2389,35 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
     rows(`SELECT id, order_number, channel, status, totals, shipping_address, created_at FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT warehouse_code, status, facility_id, metadata, connected_at FROM oms_warehouse_links WHERE user_id = $1 ORDER BY connected_at DESC NULLS LAST LIMIT 25`, [userId]).catch(() => []),
     rows(`SELECT id, name, status, email, metadata, updated_at FROM suppliers WHERE user_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(
+      `SELECT c.id, c.name, c.company, c.channel, c.updated_at,
+              count(o.id)::int AS order_count,
+              COALESCE(sum(CASE
+                WHEN COALESCE(o.totals->>'total', o.totals->>'grandTotal', '') ~ '^-?[0-9]+(?:\\.[0-9]+)?$'
+                  THEN COALESCE(o.totals->>'total', o.totals->>'grandTotal')::numeric
+                ELSE 0
+              END), 0)::numeric AS lifetime_value,
+              max(COALESCE(o.placed_at, o.created_at)) AS last_order_at
+         FROM customers c
+         LEFT JOIN orders o ON o.user_id = c.user_id AND o.customer_id = c.id
+        WHERE c.user_id = $1
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC NULLS LAST
+        LIMIT 25`,
+      [userId],
+    ).catch(() => []),
+    rows(`SELECT id, rma_number, status, payload, updated_at FROM returns WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 25`, [userId]).catch(() => []),
+    rows(
+      `SELECT id, subject, entity_type, entity_id, priority, status, owner, updated_at
+         FROM support_tickets WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 25`,
+      [userId],
+    ).catch(() => []),
     rows(`SELECT id, filename, status, row_count, findings_count, estimated_refunds, optimized_service_savings, created_at FROM oms_label_audit_runs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10`, [userId]).catch(() => []),
+    rows(
+      `SELECT id, carrier, tracking_number, finding_type, severity, refund_amount, status, evidence, updated_at
+         FROM oms_label_audit_findings WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 25`,
+      [userId],
+    ).catch(() => []),
     rows(
       `SELECT m.id, m.channel, m.status, m.display_name, m.shop_domain, m.marketplace_id,
               m.scopes, m.last_sync_at,
@@ -2438,7 +2478,47 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       })),
       warehouses,
       suppliers,
+      customers: customers.map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        company: row.company,
+        channel: row.channel,
+        orderCount: number(row.order_count),
+        lifetimeValue: money(row.lifetime_value),
+        lastOrderAt: iso(row.last_order_at),
+        updatedAt: iso(row.updated_at),
+      })),
+      returns: returns.map((row: any) => ({
+        id: row.id,
+        rmaNumber: row.rma_number,
+        status: row.status,
+        reason: row.payload?.reason || row.payload?.returnReason || null,
+        orderId: row.payload?.orderId || row.payload?.order_id || null,
+        updatedAt: iso(row.updated_at),
+      })),
+      supportTickets: supportTickets.map((row: any) => ({
+        id: row.id,
+        subject: row.subject,
+        entityType: row.entity_type,
+        entityId: row.entity_id,
+        priority: row.priority,
+        status: row.status,
+        owner: row.owner,
+        updatedAt: iso(row.updated_at),
+      })),
       labelAuditRuns: labelRuns,
+      labelAuditFindings: labelFindings.map((row: any) => ({
+        id: row.id,
+        carrier: row.carrier,
+        trackingNumber: row.tracking_number,
+        findingType: row.finding_type,
+        severity: row.severity,
+        refundAmount: money(row.refund_amount),
+        status: row.status,
+        orderId: row.evidence?.orderId || row.evidence?.order_id || null,
+        runId: row.evidence?.runId || null,
+        updatedAt: iso(row.updated_at),
+      })),
       marketplaceConnections: marketplaces,
       shipmentPlans: shipmentPlans.map((row: any) => ({
         ...row,
@@ -2458,6 +2538,8 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       { source: 'oms_recommendations', screen: 'double', label: 'Cortex guidance' },
       { source: 'oms_skus', screen: 'skus', label: 'SKU catalog' },
       { source: 'oms_orders', screen: 'orders', label: 'Orders' },
+      { source: 'oms_customers', screen: 'customers', label: 'Customers' },
+      { source: 'oms_returns', screen: 'returns', label: 'Returns' },
       { source: 'oms_warehouses', screen: 'warehouses', label: 'Warehouses' },
       { source: 'oms_suppliers', screen: 'suppliers', label: 'Suppliers' },
       { source: 'oms_marketplace_connections', screen: 'connections', label: 'Marketplace connections' },
@@ -2466,6 +2548,8 @@ async function getAccountOmsContextBundle(userId: string, screen: string, option
       { source: 'oms_label_audits', screen: 'labels', label: 'Label audits' },
       { source: 'oms_billing', screen: 'billing', label: 'Billing' },
       { source: 'oms_execution_ledger', screen: 'ledger', label: 'Execution ledger' },
+      { source: 'oms_support_tickets', screen: 'support', label: 'Support tickets' },
+      { source: 'oms_demand_heatmap', screen: 'heatmap', label: 'Demand heatmap' },
     ],
   };
 }
@@ -2550,6 +2634,8 @@ const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
   oms_context_samples: { screen: 'command', label: 'OMS account context' },
   oms_skus: { screen: 'skus', label: 'SKU catalog' },
   oms_orders: { screen: 'orders', label: 'Orders' },
+  oms_customers: { screen: 'customers', label: 'Customers' },
+  oms_returns: { screen: 'returns', label: 'Returns' },
   oms_warehouses: { screen: 'warehouses', label: 'Warehouses' },
   oms_suppliers: { screen: 'suppliers', label: 'Suppliers' },
   oms_marketplace_connections: { screen: 'connections', label: 'Marketplace connections' },
@@ -2558,6 +2644,8 @@ const CORTEX_CHAT_SOURCES: Record<string, { screen: string; label: string }> = {
   oms_label_audits: { screen: 'labels', label: 'Label audits' },
   oms_billing: { screen: 'billing', label: 'Billing' },
   oms_execution_ledger: { screen: 'ledger', label: 'Execution ledger' },
+  oms_support_tickets: { screen: 'support', label: 'Support tickets' },
+  oms_demand_heatmap: { screen: 'heatmap', label: 'Demand heatmap' },
 };
 
 const CORTEX_CHAT_SCREENS = new Set([
@@ -2840,6 +2928,64 @@ async function buildChatFocusContext(
       connections,
     };
   }
+  if (screen === 'labels' || screen === 'audits' || /\b(carrier|label|refund|claim|late delivery|delivery audit)\b/.test(q)) {
+    return {
+      topic: 'carrier_label_audits',
+      instruction: 'Answer from carrier label audit runs and findings first. Separate observed refunds and service failures from suggested actions, and state when claim evidence is missing.',
+      runs: samples.labelAuditRuns || [],
+      findings: samples.labelAuditFindings || [],
+      requiredSource: 'oms_label_audits',
+    };
+  }
+  if (screen === 'suppliers' || /\b(supplier|vendor|pickup profile)\b/.test(q)) {
+    return {
+      topic: 'suppliers',
+      instruction: 'Answer from the account supplier records first. Distinguish missing supplier setup from an actual supplier performance issue.',
+      suppliers: samples.suppliers || [],
+      requiredSource: 'oms_suppliers',
+    };
+  }
+  if (screen === 'returns' || /\b(return|returns|rma|restock)\b/.test(q)) {
+    return {
+      topic: 'returns',
+      instruction: 'Answer from account return and RMA records first. State the status, reason, linked order when available, and the next operational action.',
+      returns: samples.returns || [],
+      requiredSource: 'oms_returns',
+    };
+  }
+  if (screen === 'customers' || /\b(customer|customers|buyer|lifetime value|ltv)\b/.test(q)) {
+    return {
+      topic: 'customers',
+      instruction: 'Answer from account customer and order-history summaries first. Do not infer customer value or service risk when the supporting orders are absent.',
+      customers: samples.customers || [],
+      requiredSource: 'oms_customers',
+    };
+  }
+  if (screen === 'support' || /\b(support ticket|support tickets|ticket|tickets)\b/.test(q)) {
+    return {
+      topic: 'support_tickets',
+      instruction: 'Answer from account support tickets first. Prioritize open high-priority tickets and preserve the linked operational entity when available.',
+      tickets: samples.supportTickets || [],
+      requiredSource: 'oms_support_tickets',
+    };
+  }
+  if (screen === 'ledger' || /\b(ledger|execution history|what changed|recent actions?)\b/.test(q)) {
+    return {
+      topic: 'execution_ledger',
+      instruction: 'Answer from the account execution ledger first. Clearly distinguish proposed, approved, executed, failed, and observed events.',
+      events: context?.ledger || [],
+      requiredSource: 'oms_execution_ledger',
+    };
+  }
+  if (screen === 'heatmap' || /\b(heatmap|demand by state|demand concentration|warehouse coverage)\b/.test(q)) {
+    return {
+      topic: 'demand_heatmap',
+      instruction: 'Answer from order destination states and connected warehouse records first. Do not claim geographic coverage when order or warehouse coordinates are unavailable.',
+      orders: samples.orders || [],
+      warehouses: samples.warehouses || [],
+      requiredSource: 'oms_demand_heatmap',
+    };
+  }
   if (entityType === 'asn' || screen === 'shipments' || /(shipment|asn|inbound)/.test(q)) {
     return {
       topic: 'shipments_and_asns',
@@ -2879,7 +3025,12 @@ async function buildChatFocusContext(
     };
   }
   if (screen === 'warehouses' || /\b(warehouse|wms|facility)\b/.test(q)) {
-    return { topic: 'warehouses', instruction: 'Answer from connected warehouse evidence first.', warehouses: samples.warehouses || [] };
+    return {
+      topic: 'warehouses',
+      instruction: 'Answer from connected warehouse evidence first. Distinguish actual connected facilities from suggested network nodes.',
+      warehouses: samples.warehouses || [],
+      requiredSource: 'oms_warehouses',
+    };
   }
   return {
     topic: 'account_summary',
