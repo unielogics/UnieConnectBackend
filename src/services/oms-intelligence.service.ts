@@ -2076,8 +2076,11 @@ async function upsertCortexTask(userId: string, task: any) {
        action_target = EXCLUDED.action_target,
        evidence = EXCLUDED.evidence,
        recommendation_id = EXCLUDED.recommendation_id,
+       status = 'open',
+       completed_at = NULL,
+       auto_completed_at = NULL,
        updated_at = now()
-     WHERE oms_cortex_tasks.status = 'open'
+     WHERE oms_cortex_tasks.status <> 'dismissed'
      RETURNING *`,
     [
       userId,
