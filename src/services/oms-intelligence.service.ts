@@ -5078,7 +5078,8 @@ export async function createCortexChatMessage(userId: string, body: any = {}) {
         `Next action: ${actionLabel}.`,
       ].join('\n\n'));
     } else {
-      normalized.answer = polishCortexChatText(`Open ${actionLabel} to work on "${title}."\n\nThe same account-scoped action from the previous answer is available below.`);
+      const navigationLabel = /^(?:open|go to|review|view)\b/i.test(actionLabel) ? actionLabel : `Open ${actionLabel}`;
+      normalized.answer = polishCortexChatText(`${navigationLabel} to work on "${title}."\n\nThe same account-scoped action from the previous answer is available below.`);
     }
     normalized.tasks = groundedAction ? [groundedAction] : [];
     normalized.sources = [
