@@ -548,15 +548,15 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
     await setSyncStatus(ctx.channelAccountId, 'inventory', 'syncing');
     const inventorySync = await syncShopifyInventory(ctx, base, headers);
     result.inventory = inventorySync.count;
-    if (inventorySync.warning) {
-      result.warnings = { ...(result.warnings || {}), inventory: inventorySync.warning };
-    }
     await setSyncStatus(ctx.channelAccountId, 'inventory', 'synced', {
       count: inventorySync.count,
       metadata: {
         source: inventorySync.source,
-        degraded: Boolean(inventorySync.warning),
-        warning: inventorySync.warning || null,
+        degraded: false,
+        warning: null,
+        coverage: inventorySync.coverage || 'location_level',
+        locationLevelAvailable: inventorySync.locationLevelAvailable !== false,
+        notice: inventorySync.notice || null,
       },
     });
   } catch (err: any) {
@@ -599,7 +599,9 @@ async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Rec
         return {
           count: fallback,
           source: 'mapped_variant_fallback',
-          warning: 'Location-level inventory is unavailable. Reconnect Shopify with read_locations scope.',
+          coverage: 'store_total',
+          locationLevelAvailable: false,
+          notice: 'Shopify store inventory totals are synchronized. Per-location allocation is not enabled for this installation.',
         };
       }
       throw new Error('Locations access denied. Reconnect Shopify with read_locations scope.');
@@ -608,7 +610,7 @@ async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Rec
   }
   const locationsBody: any = await locationsRes.json();
   const location = Array.isArray(locationsBody?.locations) ? locationsBody.locations[0] : null;
-  if (!location?.id) return { count: 0, source: 'inventory_levels' };
+  if (!location?.id) return { count: 0, source: 'inventory_levels', coverage: 'location_level', locationLevelAvailable: true };
   const res = await fetch(`${base}/inventory_levels.json?limit=250&location_ids[]=${encodeURIComponent(String(location.id))}`, { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const body: any = await res.json();
@@ -639,7 +641,7 @@ async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Rec
     );
     count++;
   }
-  return { count, source: 'inventory_levels' };
+  return { count, source: 'inventory_levels', coverage: 'location_level', locationLevelAvailable: true };
 }
 
 async function syncShopifyInventoryFromMappedVariants(ctx: SyncContext) {

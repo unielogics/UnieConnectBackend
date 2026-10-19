@@ -2435,10 +2435,16 @@ export async function refreshCortexTasks(userId: string) {
     ));
     const missingShopifyLocations = channel === 'shopify'
       && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations');
+    const inventoryState = json(sync?.inventory, {});
+    const aggregateInventoryHealthy = missingShopifyLocations
+      && String(inventoryState?.status || '').toLowerCase() === 'synced'
+      && String(inventoryState?.metadata?.source || '') === 'mapped_variant_fallback'
+      && !inventoryState?.error;
+    const missingShopifyLocationsBlocking = missingShopifyLocations && !aggregateInventoryHealthy;
     const disconnected = !['connected', 'active', 'synced'].includes(String(connection.status || '').toLowerCase());
-    if (!missingShopifyLocations && !degradedEntries.length && !disconnected) continue;
+    if (!missingShopifyLocationsBlocking && !degradedEntries.length && !disconnected) continue;
 
-    const issueKind = missingShopifyLocations ? 'location-inventory-access' : disconnected ? 'authorization' : 'sync-health';
+    const issueKind = missingShopifyLocationsBlocking ? 'location-inventory-access' : disconnected ? 'authorization' : 'sync-health';
     const dedupeKey = `connection:${channel}:${issueKind}`;
     const connectionState = String(connection.status || 'not connected').replace(/_/g, ' ');
     activeKeys.add(dedupeKey);
@@ -2449,18 +2455,18 @@ export async function refreshCortexTasks(userId: string) {
       screen: 'connections',
       entityType: 'marketplace_connection',
       entityId: connection.id,
-      title: missingShopifyLocations
+      title: missingShopifyLocationsBlocking
         ? `Reconnect ${displayName} for warehouse-level inventory`
         : disconnected
           ? `Authorize ${channel.charAt(0).toUpperCase()}${channel.slice(1)} marketplace connection`
           : `Repair ${displayName} ${degradedNames.join(' and ')} sync`,
-      detail: missingShopifyLocations
+      detail: missingShopifyLocationsBlocking
         ? 'Shopify products and orders are connected, but warehouse-level inventory is using fallback quantities because Shopify location inventory access has not been approved.'
         : disconnected
           ? `The ${channel} connection is ${connectionState === 'needs authorization' ? 'waiting for authorization' : connectionState}.`
           : `${degradedNames.join(', ')} data is degraded or reporting an error. Open Connections to review the provider evidence and repair the feed.`,
       priority: 'high',
-      actionLabel: missingShopifyLocations
+      actionLabel: missingShopifyLocationsBlocking
         ? 'Repair Shopify access'
         : disconnected && ['shopify', 'amazon', 'ebay'].includes(channel)
           ? `Authorize ${channel.charAt(0).toUpperCase()}${channel.slice(1)}`
@@ -2469,10 +2475,10 @@ export async function refreshCortexTasks(userId: string) {
       evidence: {
         channel,
         connectionStatus: connection.status,
-        navigationPayload: (missingShopifyLocations || (disconnected && ['shopify', 'amazon', 'ebay'].includes(channel)))
+        navigationPayload: (missingShopifyLocationsBlocking || (disconnected && ['shopify', 'amazon', 'ebay'].includes(channel)))
           ? `action:repair:${connection.id}`
           : undefined,
-        missingScopes: missingShopifyLocations ? ['read_locations'] : [],
+        missingScopes: missingShopifyLocationsBlocking ? ['read_locations'] : [],
         degradedEntities: degradedEntries.map(([entity, state]) => ({
           entity,
           status: state?.status,
@@ -5170,8 +5176,12 @@ function buildLocalCortexChatFallback(message: string, context: any, focusContex
           .filter(Boolean);
         if (issues.length) lines.push(`Attention required: ${issues.join('; ').replace(/[.\s]+$/, '')}.`);
         const scopes = Array.isArray(connection.scopes) ? connection.scopes.map((scope: any) => String(scope)) : [];
-        if (channel === 'shopify' && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations')) {
-          lines.push('Next step: open Connections, select Repair Shopify access, and approve location inventory access. This enables inventory by warehouse instead of store-level totals.');
+        const inventoryState = json(connection.sync?.inventory, {});
+        const locationBreakdownUnavailable = channel === 'shopify'
+          && !scopes.some((scope: string) => scope === 'read_locations' || scope === 'write_locations')
+          && inventoryState?.metadata?.locationLevelAvailable === false;
+        if (locationBreakdownUnavailable && /\b(location|warehouse|store inventory)\b/i.test(q)) {
+          lines.push('Shopify store inventory totals are synchronized. A per-location breakdown is not enabled for this installation.');
         }
       }
     }
