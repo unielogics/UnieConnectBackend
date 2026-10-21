@@ -55,13 +55,13 @@ export async function ensureShopifyAccessToken(connection: {
   if (!shopDomain) throw new Error('Shopify connection is missing its store domain.');
   const response = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+    body: new URLSearchParams({
       grant_type: 'refresh_token',
       client_id: config.shopify.clientId,
       client_secret: config.shopify.clientSecret,
       refresh_token: refreshToken,
-    }),
+    }).toString(),
   });
   const body = (await response.json().catch(() => ({}))) as TokenResponse & { error?: string; error_description?: string };
   if (!response.ok || !body.access_token) {

@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import bcrypt from 'bcryptjs';
 import { FastifyInstance } from 'fastify';
 import fetch from 'node-fetch';
+import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
 import { pgQuery, withPgTransaction } from '../db/postgres';
 import { CAN_MANAGE_USERS, isValidRole, normalizeRole } from '../lib/roles';
@@ -237,6 +238,97 @@ function verifyShopifyOAuthHmac(query: AnyRow) {
     .join('&');
   const expected = createHmac('sha256', config.shopify.clientSecret).update(message).digest('hex');
   return safeEqual(provided, expected);
+}
+
+function normalizeShopifyDomain(value: unknown) {
+  const shop = trim(value).toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop) ? shop : '';
+}
+
+function shopifyAuthorizeUrl(shop: string, state: string) {
+  const redirectUri = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/shopify/callback`;
+  const params = new URLSearchParams({
+    client_id: config.shopify.clientId,
+    scope: 'read_products,read_orders,read_inventory,read_locations,read_customers,read_fulfillments,write_inventory,write_fulfillments',
+    redirect_uri: redirectUri,
+    state,
+  });
+  return `https://${shop}/admin/oauth/authorize?${params.toString()}`;
+}
+
+function setShopifyInstallAuthCookie(reply: any, req: any, token: string) {
+  const host = String(req.headers.host || '');
+  const isProdHost = host.endsWith('unieconnect.com');
+  const parts = [
+    `unie-token=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${7 * 24 * 60 * 60}`,
+    isProdHost ? 'Secure' : '',
+    isProdHost ? 'SameSite=None' : 'SameSite=Lax',
+    isProdHost ? 'Domain=.unieconnect.com' : '',
+  ].filter(Boolean);
+  reply.header('Set-Cookie', parts.join('; '));
+}
+
+async function resolveShopifyInstallUser(shop: string, accessToken: string, log: any) {
+  const existingConnection = await one<{ user_id: string }>(
+    `SELECT user_id FROM marketplace_connections
+     WHERE channel = 'shopify' AND lower(shop_domain) = lower($1)
+     ORDER BY updated_at DESC LIMIT 1`,
+    [shop],
+  );
+  if (existingConnection?.user_id) return { userId: existingConnection.user_id, created: false };
+
+  const shopResponse = await fetch(`https://${shop}/admin/api/${config.shopify.apiVersion}/shop.json`, {
+    headers: { 'X-Shopify-Access-Token': accessToken, Accept: 'application/json' },
+  });
+  const shopPayload: any = await shopResponse.json().catch(() => ({}));
+  if (!shopResponse.ok) throw new Error(`Unable to read the authorized Shopify store (${shopResponse.status}).`);
+  const profile = shopPayload?.shop || {};
+  const email = normalizedEmail(profile.email || profile.customer_email);
+  if (!email) throw new Error('The authorized Shopify store does not provide an account email. Contact UnieConnect support.');
+
+  const existingUser = await one<{ id: string }>('SELECT id FROM app_users WHERE lower(email) = lower($1) LIMIT 1', [email]);
+  if (existingUser?.id) return { userId: existingUser.id, created: false };
+
+  const ownerParts = trim(profile.shop_owner).split(/\s+/).filter(Boolean);
+  const userId = randomUUID();
+  const passwordHash = await bcrypt.hash(randomBytes(32).toString('hex'), 10);
+  const inserted = await one<{ id: string }>(
+    `INSERT INTO app_users (id, email, password_hash, role, first_name, last_name, llc_name, origin, owning_warehouse_code)
+     VALUES ($1, $2, $3, 'ecommerce_client', $4, $5, $6, 'direct', NULL)
+     ON CONFLICT (email) DO NOTHING
+     RETURNING id`,
+    [
+      userId,
+      email,
+      passwordHash,
+      ownerParts[0] || null,
+      ownerParts.slice(1).join(' ') || null,
+      trim(profile.name) || shop.replace(/\.myshopify\.com$/, ''),
+    ],
+  );
+  const resolvedUserId = inserted?.id || (await one<{ id: string }>('SELECT id FROM app_users WHERE lower(email) = lower($1) LIMIT 1', [email]))?.id;
+  if (!resolvedUserId) throw new Error('Unable to create the UnieConnect account for this Shopify store.');
+
+  const directFeatures = [...CORE_FEATURE_IDS, 'optimize-suite', 'product-research'];
+  await pgQuery(
+    `INSERT INTO user_features (user_id, feature_id, status, payload)
+     SELECT $1, f.id, 'enabled', '{"source":"shopify_install"}'::jsonb
+     FROM features f WHERE f.id = ANY($2::TEXT[])
+     ON CONFLICT (user_id, feature_id) DO NOTHING`,
+    [resolvedUserId, directFeatures],
+  ).catch(() => null);
+  await pgQuery('UPDATE app_users SET enabled_features = $2::TEXT[] WHERE id = $1', [resolvedUserId, directFeatures]).catch(() => null);
+  await pgQuery(
+    'INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)',
+    [resolvedUserId, 'shopify_install_signup', JSON.stringify({ shop })],
+  ).catch(() => null);
+  void ensureCortexCredentialForUser(resolvedUserId).catch((err: any) => {
+    log?.warn?.({ err, userId: resolvedUserId }, 'cortex credential auto-provision failed during Shopify install');
+  });
+  return { userId: resolvedUserId, created: Boolean(inserted?.id) };
 }
 
 function verifyShopifyWebhookHmac(req: any) {
@@ -2604,11 +2696,28 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     }
   });
 
+  app.get('/auth/shopify/install', async (req: any, reply) => {
+    const shop = normalizeShopifyDomain(req.query?.shop);
+    if (!shop) return reply.code(400).send({ error: 'A valid myshopify.com shop is required.' });
+    if (req.query?.hmac && !verifyShopifyOAuthHmac(req.query || {})) {
+      return reply.code(401).send({ error: 'Invalid Shopify install signature.' });
+    }
+    if (!config.shopify.clientId || !config.shopify.clientSecret || !config.shopify.appBaseUrl) {
+      return reply.code(503).send({ error: 'Shopify OAuth is missing server configuration.' });
+    }
+    const state = randomBytes(18).toString('hex');
+    await pgQuery(
+      'INSERT INTO oauth_states (user_id, channel, state, payload) VALUES (NULL, $1, $2, $3::jsonb)',
+      ['shopify', state, JSON.stringify({ shop, source: 'shopify_app_install' })],
+    );
+    return redirectOrJson(req, reply, shopifyAuthorizeUrl(shop, state), { channel: 'shopify', state });
+  });
+
   app.get('/auth/shopify/start', async (req: any, reply) => {
     const userId = requireUser(req, reply);
     if (!userId) return;
-    const shop = trim(req.query?.shop).replace(/^https?:\/\//, '').replace(/\/+$/, '');
-    if (!shop) return reply.code(400).send({ error: 'shop is required' });
+    const shop = normalizeShopifyDomain(req.query?.shop);
+    if (!shop) return reply.code(400).send({ error: 'A valid myshopify.com shop is required.' });
     const frontendBase = new URL(config.frontendOrigin);
     let redirectTo = new URL('/oms?view=connections', frontendBase).toString();
     try {
@@ -2632,14 +2741,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       );
       return reply.code(503).send({ error: 'Shopify OAuth is missing server configuration', state });
     }
-    const redirectUri = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/shopify/callback`;
-    const params = new URLSearchParams({
-      client_id: config.shopify.clientId,
-      scope: 'read_products,read_orders,read_inventory,read_locations,read_customers,read_fulfillments,write_inventory,write_fulfillments',
-      redirect_uri: redirectUri,
-      state,
-    });
-    return redirectOrJson(req, reply, `https://${shop}/admin/oauth/authorize?${params.toString()}`, {
+    return redirectOrJson(req, reply, shopifyAuthorizeUrl(shop, state), {
       channel: 'shopify',
       state,
     });
@@ -2648,10 +2750,12 @@ export async function sqlModeRoutes(app: FastifyInstance) {
   app.get('/auth/shopify/callback', async (req: any, reply) => {
     const state = trim(req.query?.state);
     const code = trim(req.query?.code);
-    const shop = trim(req.query?.shop);
+    const shop = normalizeShopifyDomain(req.query?.shop);
     const saved = await one('SELECT * FROM oauth_states WHERE state = $1 AND channel = $2 AND used_at IS NULL AND expires_at > now()', [state, 'shopify']);
     if (!saved || !code || !shop) return reply.code(400).send({ error: 'Invalid Shopify OAuth state' });
     if (!verifyShopifyOAuthHmac(req.query || {})) return reply.code(401).send({ error: 'Invalid Shopify OAuth signature' });
+    const savedPayload = json(saved.payload, {});
+    if (normalizeShopifyDomain(savedPayload.shop) !== shop) return reply.code(400).send({ error: 'Shopify store does not match the OAuth request.' });
     let tokenPayload: any = {};
     try {
       const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
@@ -2663,6 +2767,17 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       if (!res.ok) throw new Error(tokenPayload?.error || 'Shopify token exchange failed');
     } catch (err: any) {
       return reply.code(400).send({ error: err?.message || 'Shopify token exchange failed' });
+    }
+    let accountUserId = trim(saved.user_id);
+    let installCreatedUser = false;
+    if (!accountUserId) {
+      try {
+        const resolved = await resolveShopifyInstallUser(shop, tokenPayload.access_token, req.log);
+        accountUserId = resolved.userId;
+        installCreatedUser = resolved.created;
+      } catch (err: any) {
+        return reply.code(400).send({ error: err?.message || 'Unable to prepare the UnieConnect account.' });
+      }
     }
     let account = await one(
       `UPDATE marketplace_connections
@@ -2677,7 +2792,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
        WHERE user_id = $1 AND channel = 'shopify' AND lower(shop_domain) = lower($2)
        RETURNING *`,
       [
-        saved.user_id,
+        accountUserId,
         shop,
         shop,
         tokenPayload.access_token || null,
@@ -2699,7 +2814,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
          VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5, $6, $7::jsonb)
          RETURNING *`,
         [
-          saved.user_id,
+          accountUserId,
           shop,
           tokenPayload.access_token || null,
           tokenPayload.refresh_token || null,
@@ -2735,7 +2850,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
            WHERE id = $1 AND user_id = $2`,
           [
             account.id,
-            saved.user_id,
+            accountUserId,
             JSON.stringify({
               shopifyWebhookRegisteredAt: new Date().toISOString(),
               shopifyWebhookReconciliation: webhookResult,
@@ -2751,7 +2866,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
            WHERE id = $1 AND user_id = $2`,
           [
             account.id,
-            saved.user_id,
+            accountUserId,
             JSON.stringify({
               shopifyWebhookRegistrationError: err?.message || 'Webhook registration failed',
               shopifyWebhookDelivery: shopifyWebhookHealth(),
@@ -2764,7 +2879,6 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       // Run this after the token and webhooks are durable, without holding the provider redirect
       // open for larger catalogs. The Connections screen polls the resulting sync state.
       const accountId = account.id;
-      const accountUserId = saved.user_id;
       const accessToken = tokenPayload.access_token;
       const initialSync = !account.last_sync_at;
       const log = req.log;
@@ -2803,8 +2917,16 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       });
     }
     await pgQuery('UPDATE oauth_states SET used_at = now() WHERE state = $1', [state]);
-    await writeLedger(saved.user_id, { entityType: 'marketplace_connection', entityId: account?.id, eventType: 'connected', summary: `Shopify marketplace connected for ${shop}.` });
-    const savedPayload = json(saved.payload, {});
+    await writeLedger(accountUserId, { entityType: 'marketplace_connection', entityId: account?.id, eventType: 'connected', summary: `Shopify marketplace connected for ${shop}.` });
+    if (!saved.user_id) {
+      const installedUser = await one<{ email: string; role: string }>('SELECT email, role FROM app_users WHERE id = $1', [accountUserId]);
+      const authToken = jwt.sign(
+        { userId: accountUserId, email: normalizedEmail(installedUser?.email), role: installedUser?.role || 'ecommerce_client', authSource: 'aurora_postgres' },
+        config.authSecret,
+        { expiresIn: '7d' },
+      );
+      setShopifyInstallAuthCookie(reply, req, authToken);
+    }
     const frontendBase = new URL(config.frontendOrigin);
     let destination = new URL('/oms?view=connections', frontendBase);
     try {
@@ -2815,6 +2937,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     }
     destination.searchParams.set('view', 'connections');
     destination.searchParams.set('connected', 'shopify');
+    if (installCreatedUser) destination.searchParams.set('welcome', 'shopify');
     return reply.redirect(destination.toString());
   });
 
