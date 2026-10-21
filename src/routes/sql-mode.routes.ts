@@ -10,11 +10,16 @@ import { registerWmsCredential, getWmsCredentialHeaders, getAnyWmsCredentialHead
 import { ensureCortexCredentialForUser } from '../services/cortex-credentials.service';
 import { postCortex } from '../services/cortex-orchestration';
 import { buildEbayAuthUrl, exchangeEbayCodeForToken, refreshEbayAccessToken } from '../services/ebay';
-import { registerWebhooks as registerShopifyWebhooks, shopifyWebhookHealth } from '../services/shopify';
+import { ensureShopifyAccessToken, registerWebhooks as registerShopifyWebhooks, shopifyWebhookHealth } from '../services/shopify';
 import { exchangeCodeForTokens as exchangeAmazonCodeForTokens } from '../services/amazon-auth';
 import { getSyncStatus, setSyncStatus } from '../services/channel-sync-status';
 import { applyShopifyWebhook, markMarketplaceRefresh, pullEbaySql, pullShopifySql } from '../services/marketplace-sql-sync';
 import { amazonAppIdKind, getAmazonAccountHealth, getAmazonInboundLabels, pullAmazonSql } from '../services/amazon-spapi';
+import {
+  enqueueShopifyComplianceWebhook,
+  ensureShopifyComplianceSchema,
+  processQueuedShopifyComplianceWebhook,
+} from '../services/shopify-compliance';
 
 type AnyRow = Record<string, any>;
 
@@ -235,12 +240,14 @@ function verifyShopifyOAuthHmac(query: AnyRow) {
 }
 
 function verifyShopifyWebhookHmac(req: any) {
-  if (!config.shopify.webhookSecret) return false;
   const provided = trim(req.headers?.['x-shopify-hmac-sha256']);
   const raw = req.rawBody;
   if (!provided || !Buffer.isBuffer(raw)) return false;
-  const expected = createHmac('sha256', config.shopify.webhookSecret).update(raw).digest('base64');
-  return safeEqual(provided, expected);
+  const secrets = [...new Set([config.shopify.clientSecret, config.shopify.webhookSecret].filter(Boolean))];
+  return secrets.some((secret) => {
+    const expected = createHmac('sha256', secret).update(raw).digest('base64');
+    return safeEqual(provided, expected);
+  });
 }
 
 function amazonSellerCentralBase(region?: string) {
@@ -2397,6 +2404,7 @@ const DEFAULT_WMS_BRIDGE_SCOPES = [
 ];
 
 export async function sqlModeRoutes(app: FastifyInstance) {
+  await ensureShopifyComplianceSchema();
   app.get('/legacy/status', async () => ({
     database: "aurora_postgres",
     message: 'Legacy feature groups are served by Aurora SQL routes.',
@@ -2481,11 +2489,12 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         if (!account.shop_domain || !account.access_token_enc) {
           return reply.code(400).send({ error: 'Shopify connection is missing shop domain or access token' });
         }
+        const shopifyAccessToken = await ensureShopifyAccessToken(account);
         syncResult = await pullShopifySql({
           userId,
           channelAccountId: account.id,
           shopDomain: account.shop_domain,
-          accessToken: account.access_token_enc,
+          accessToken: shopifyAccessToken,
           initialSync: !account.last_sync_at,
           log: req.log,
         });
@@ -2493,7 +2502,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         try {
           webhookResult = await registerShopifyWebhooks({
             shop: account.shop_domain,
-            accessToken: account.access_token_enc,
+            accessToken: shopifyAccessToken,
             address: webhookAddress,
             topics: config.shopify.webhookTopics,
             log: req.log,
@@ -2648,7 +2657,7 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ client_id: config.shopify.clientId, client_secret: config.shopify.clientSecret, code }),
+        body: JSON.stringify({ client_id: config.shopify.clientId, client_secret: config.shopify.clientSecret, code, expiring: 1 }),
       } as any);
       tokenPayload = await res.json();
       if (!res.ok) throw new Error(tokenPayload?.error || 'Shopify token exchange failed');
@@ -2660,8 +2669,10 @@ export async function sqlModeRoutes(app: FastifyInstance) {
        SET status = 'connected',
            display_name = $3,
            access_token_enc = $4,
-           scopes = $5,
-           metadata = metadata || $6::jsonb,
+           refresh_token_enc = COALESCE($5, refresh_token_enc),
+           token_expires_at = $6,
+           scopes = $7,
+           metadata = metadata || $8::jsonb,
            updated_at = now()
        WHERE user_id = $1 AND channel = 'shopify' AND lower(shop_domain) = lower($2)
        RETURNING *`,
@@ -2670,17 +2681,36 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         shop,
         shop,
         tokenPayload.access_token || null,
+        tokenPayload.refresh_token || null,
+        tokenPayload.expires_in ? new Date(Date.now() + Number(tokenPayload.expires_in) * 1000) : null,
         String(tokenPayload.scope || '').split(',').filter(Boolean),
-        JSON.stringify({ oauthCompletedAt: new Date().toISOString(), reconnect: true }),
+        JSON.stringify({
+          oauthCompletedAt: new Date().toISOString(),
+          reconnect: true,
+          shopifyTokenType: tokenPayload.expires_in ? 'expiring_offline' : 'offline',
+          shopifyRefreshTokenExpiresIn: tokenPayload.refresh_token_expires_in || null,
+        }),
       ],
     );
     if (!account) {
       account = await one(
         `INSERT INTO marketplace_connections
-          (user_id, channel, status, display_name, shop_domain, access_token_enc, scopes, metadata)
-         VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5::jsonb)
+          (user_id, channel, status, display_name, shop_domain, access_token_enc, refresh_token_enc, token_expires_at, scopes, metadata)
+         VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5, $6, $7::jsonb)
          RETURNING *`,
-        [saved.user_id, shop, tokenPayload.access_token || null, String(tokenPayload.scope || '').split(',').filter(Boolean), JSON.stringify({ oauthCompletedAt: new Date().toISOString() })],
+        [
+          saved.user_id,
+          shop,
+          tokenPayload.access_token || null,
+          tokenPayload.refresh_token || null,
+          tokenPayload.expires_in ? new Date(Date.now() + Number(tokenPayload.expires_in) * 1000) : null,
+          String(tokenPayload.scope || '').split(',').filter(Boolean),
+          JSON.stringify({
+            oauthCompletedAt: new Date().toISOString(),
+            shopifyTokenType: tokenPayload.expires_in ? 'expiring_offline' : 'offline',
+            shopifyRefreshTokenExpiresIn: tokenPayload.refresh_token_expires_in || null,
+          }),
+        ],
       );
     }
     if (account?.id) {
@@ -3036,6 +3066,29 @@ export async function sqlModeRoutes(app: FastifyInstance) {
         processingError: err?.message || 'Shopify webhook processing failed',
       });
     }
+  });
+  app.post('/webhooks/shopify/compliance', async (req: any, reply) => {
+    if (!verifyShopifyWebhookHmac(req)) return reply.code(401).send({ error: 'Invalid Shopify webhook signature' });
+    const topic = trim(req.headers?.['x-shopify-topic']).toLowerCase();
+    const supportedTopics = new Set(['customers/data_request', 'customers/redact', 'shop/redact']);
+    if (!supportedTopics.has(topic)) return reply.code(400).send({ error: 'Unsupported Shopify compliance topic' });
+    const shopDomain = trim(req.headers?.['x-shopify-shop-domain'] || req.body?.shop_domain);
+    if (!shopDomain) return reply.code(400).send({ error: 'Shopify shop domain is required' });
+    const webhookId = trim(req.headers?.['x-shopify-webhook-id'])
+      || createHash('sha256').update(req.rawBody).digest('hex');
+    const queued = await enqueueShopifyComplianceWebhook({
+      webhookId,
+      shopDomain,
+      topic: topic as 'customers/data_request' | 'customers/redact' | 'shop/redact',
+      payload: req.body || {},
+    });
+    setImmediate(() => {
+      if (!queued?.id || queued.status === 'completed') return;
+      void processQueuedShopifyComplianceWebhook(queued.id).catch((error: any) => {
+        req.log.error({ err: error, shopDomain, topic, webhookId }, 'Shopify compliance webhook processing failed');
+      });
+    });
+    return reply.code(200).send({ accepted: true });
   });
   app.post('/webhooks/ebay/account-deletion', async (_req: any, reply) => reply.code(200).send({ accepted: true }));
 

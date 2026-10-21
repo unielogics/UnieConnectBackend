@@ -1,0 +1,21 @@
+# Review-safe reference configuration for the UnieConnect Shopify app.
+# Apply these values in Shopify Dev Dashboard or copy them into the Shopify CLI app project.
+client_id = "REPLACE_WITH_SHOPIFY_CLIENT_ID"
+name = "UnieConnect"
+application_url = "https://user.unieconnect.com/oms?view=connections"
+embedded = false
+
+[access_scopes]
+scopes = "read_products,read_orders,read_inventory,read_locations,read_customers,read_fulfillments,write_inventory,write_fulfillments"
+
+[auth]
+redirect_urls = [
+  "https://api.unieconnect.com/api/v1/auth/shopify/callback"
+]
+
+[webhooks]
+api_version = "2026-10"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "https://api.unieconnect.com/api/v1/webhooks/shopify/compliance"

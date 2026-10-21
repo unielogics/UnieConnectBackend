@@ -1,7 +1,14 @@
 import fetch from 'node-fetch';
 import { config } from '../config/env';
+import { pgQuery } from '../db/postgres';
 
-type TokenResponse = { access_token: string; scope: string };
+type TokenResponse = {
+  access_token: string;
+  scope?: string;
+  expires_in?: number;
+  refresh_token?: string;
+  refresh_token_expires_in?: number;
+};
 type WebhookLog = { info: (o: object, msg?: string) => void; warn: (o: object, msg?: string) => void };
 
 export async function exchangeCodeForToken(shop: string, code: string): Promise<string> {
@@ -13,6 +20,7 @@ export async function exchangeCodeForToken(shop: string, code: string): Promise<
       client_id: config.shopify.clientId,
       client_secret: config.shopify.clientSecret,
       code,
+      expiring: 1,
     }),
   });
   if (!res.ok) {
@@ -20,6 +28,67 @@ export async function exchangeCodeForToken(shop: string, code: string): Promise<
     throw new Error(`Token exchange failed (${res.status}): ${text}`);
   }
   const body = (await res.json()) as TokenResponse;
+  return body.access_token;
+}
+
+export async function ensureShopifyAccessToken(connection: {
+  id?: string | null;
+  user_id?: string | null;
+  shop_domain?: string | null;
+  access_token_enc?: string | null;
+  refresh_token_enc?: string | null;
+  token_expires_at?: string | Date | null;
+}) {
+  const connectionId = String(connection.id || '').trim();
+  const userId = String(connection.user_id || '').trim();
+  if (!connectionId || !userId) throw new Error('Shopify connection identity is incomplete.');
+  const accessToken = String(connection.access_token_enc || '').trim();
+  const expiresAt = connection.token_expires_at ? new Date(connection.token_expires_at).getTime() : null;
+  if (accessToken && (!expiresAt || expiresAt > Date.now() + 5 * 60 * 1000)) return accessToken;
+
+  const refreshToken = String(connection.refresh_token_enc || '').trim();
+  const shopDomain = String(connection.shop_domain || '').trim();
+  if (!refreshToken) {
+    if (accessToken && !expiresAt) return accessToken;
+    throw new Error('Shopify authorization expired. Reconnect the store to continue synchronization.');
+  }
+  if (!shopDomain) throw new Error('Shopify connection is missing its store domain.');
+  const response = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      client_id: config.shopify.clientId,
+      client_secret: config.shopify.clientSecret,
+      refresh_token: refreshToken,
+    }),
+  });
+  const body = (await response.json().catch(() => ({}))) as TokenResponse & { error?: string; error_description?: string };
+  if (!response.ok || !body.access_token) {
+    throw new Error(body.error_description || body.error || `Shopify token refresh failed (${response.status})`);
+  }
+  const tokenExpiresAt = new Date(Date.now() + Math.max(60, Number(body.expires_in || 3600)) * 1000);
+  await pgQuery(
+    `UPDATE marketplace_connections
+        SET access_token_enc = $3,
+            refresh_token_enc = COALESCE($4, refresh_token_enc),
+            token_expires_at = $5,
+            metadata = metadata || $6::jsonb,
+            updated_at = now()
+      WHERE id = $1 AND user_id = $2`,
+    [
+      connectionId,
+      userId,
+      body.access_token,
+      body.refresh_token || null,
+      tokenExpiresAt,
+      JSON.stringify({
+        shopifyTokenType: 'expiring_offline',
+        shopifyTokenRefreshedAt: new Date().toISOString(),
+        shopifyRefreshTokenExpiresIn: body.refresh_token_expires_in || null,
+      }),
+    ],
+  );
   return body.access_token;
 }
 
@@ -195,7 +264,7 @@ export function shopifyWebhookHealth() {
         : 'missing';
   return {
     oauthReady: Boolean(config.shopify.clientId && config.shopify.clientSecret && config.shopify.appBaseUrl),
-    hasWebhookSecret: Boolean(config.shopify.webhookSecret),
+    hasWebhookSecret: Boolean(config.shopify.clientSecret || config.shopify.webhookSecret),
     hasAutomationToken: Boolean(config.shopify.appAutomationToken),
     apiVersion: config.shopify.apiVersion,
     webhookUri: uri || null,

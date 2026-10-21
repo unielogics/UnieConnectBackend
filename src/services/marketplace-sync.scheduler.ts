@@ -1,5 +1,6 @@
 import { pgQuery } from '../db/postgres';
 import { markMarketplaceRefresh, pullShopifySql } from './marketplace-sql-sync';
+import { ensureShopifyAccessToken } from './shopify';
 
 const DEFAULT_INTERVAL_MINUTES = 6 * 60;
 const FIRST_RUN_DELAY_MS = 2 * 60 * 1000;
@@ -11,6 +12,8 @@ type ShopifyConnection = {
   user_id: string;
   shop_domain: string;
   access_token_enc: string;
+  refresh_token_enc: string | null;
+  token_expires_at: string | null;
   historical_backfill_complete: boolean;
 };
 
@@ -23,7 +26,7 @@ function intervalMs() {
 export async function runMarketplaceSyncOnce() {
   const result = { connections: 0, synced: 0, partial: 0, failed: 0 };
   const query = await pgQuery<ShopifyConnection>(
-    `SELECT m.id, m.user_id, m.shop_domain, m.access_token_enc,
+    `SELECT m.id, m.user_id, m.shop_domain, m.access_token_enc, m.refresh_token_enc, m.token_expires_at,
             COALESCE((
               SELECT s.metadata ? 'historicalBackfillCompletedAt'
               FROM channel_sync_status s
@@ -41,11 +44,12 @@ export async function runMarketplaceSyncOnce() {
   for (const connection of query?.rows || []) {
     result.connections++;
     try {
+      const accessToken = await ensureShopifyAccessToken(connection);
       const syncResult = await pullShopifySql({
         userId: connection.user_id,
         channelAccountId: connection.id,
         shopDomain: connection.shop_domain,
-        accessToken: connection.access_token_enc,
+        accessToken,
         initialSync: !connection.historical_backfill_complete,
       });
       await markMarketplaceRefresh(connection.id, connection.user_id, syncResult);
