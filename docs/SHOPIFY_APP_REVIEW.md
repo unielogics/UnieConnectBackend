@@ -5,12 +5,14 @@
 - Distribution: public Shopify App Store app
 - App URL: `https://api.unieconnect.com/api/v1/auth/shopify/install`
 - Allowed redirect URL: `https://api.unieconnect.com/api/v1/auth/shopify/callback`
-- Embedded app: disabled
+- Embedded app: migration required before submission
 - Primary listing language: English
 
 The App URL validates the `shop` domain and any Shopify signature supplied with the request, creates a one-use OAuth state, and immediately redirects to Shopify authorization. The signed callback exchanges the authorization code, links the shop to its existing UnieConnect account or provisions a direct seller account, sets the UnieConnect session cookie, and redirects to the OMS Connections screen.
 
-Because UnieConnect is configured as a standalone app, the embedded App Bridge and session-token checks do not apply. Do not enable the embedded-app setting unless the frontend is migrated to Shopify App Bridge authentication.
+The public install endpoint currently supports the authorization-code flow and is safe to use for development-store testing. It is not, by itself, sufficient for a new public App Store submission. Shopify's current App Store requirements expect a consistent embedded experience using the latest App Bridge and session-token authentication. Do not submit or set `embedded = true` until the OMS frontend and backend have completed that migration.
+
+The production Shopify synchronization code also still contains REST Admin API calls. New public apps must use the GraphQL Admin API exclusively. Product, order, customer, location, inventory, shop-profile, and HTTPS webhook-registration calls must be migrated before submission.
 
 ## Compliance and public URLs
 
@@ -42,6 +44,15 @@ These values cannot be inferred or submitted by the application:
 - Final capability selections and review submission
 
 Use a monitored technical contact and phone number. Do not enter a developer's temporary address or an unmonitored support alias.
+
+## Current submission blockers
+
+- Add the latest Shopify App Bridge script to the OMS app surface and run it embedded in Shopify Admin.
+- Exchange and verify Shopify session tokens on every embedded launch; do not rely only on the UnieConnect cookie.
+- Replace all remaining REST Admin API synchronization calls with GraphQL Admin API queries and mutations.
+- Decide whether Shopify-originated accounts use Shopify as their only sign-in method or complete a secure password-setup flow for direct UnieConnect login.
+- Confirm Shopify Billing API or managed pricing behavior before listing any paid plans.
+- Add the emergency contact, primary language, listing content, screenshots, pricing, capabilities, and reviewer instructions in Dev Dashboard.
 
 ## Review test
 
