@@ -101,85 +101,9 @@ export async function registerWebhooks(params: {
 }) {
   const { shop, accessToken, address, topics, log } = params;
   const uri = config.shopify.webhookUri || address;
-  if (uri !== address || uri.startsWith('pubsub://') || uri.startsWith('arn:aws:events:')) {
-    const graphParams: { shop: string; accessToken: string; uri: string; topics: string[]; log?: WebhookLog } = { shop, accessToken, uri, topics };
-    if (log) graphParams.log = log;
-    return registerGraphqlWebhooks(graphParams);
-  }
-  const version = config.shopify.apiVersion;
-  log?.info?.({ shop, address, version, topicCount: topics.length }, '[Shopify] registerWebhooks start');
-
-  // Fetch existing webhooks to make registration idempotent
-  const existingRes = await fetch(
-    `https://${shop}/admin/api/${version}/webhooks.json?limit=250`,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': accessToken,
-      },
-    },
-  );
-  if (!existingRes.ok) {
-    const errText = await existingRes.text();
-    log?.warn?.({ shop, version, status: existingRes.status }, '[Shopify] webhook list failed');
-    throw new Error(`Webhook list failed (${existingRes.status}): ${errText.slice(0, 200)}`);
-  }
-  const existingJson = await existingRes.json();
-  const existing = Array.isArray(existingJson?.webhooks) ? existingJson.webhooks : [];
-  const existingSet = new Set(
-    existing
-      .filter((w: any) => w?.topic && w?.address)
-      .map((w: any) => `${String(w.topic)}|${String(w.address)}`),
-  );
-  log?.info?.({ shop, existingCount: existing.length }, '[Shopify] registerWebhooks existing count');
-
-  // Remove callbacks left behind by older UnieConnect deployments. The exact UnieConnect
-  // webhook path identifies callbacks owned by this app; topic filtering would leave obsolete
-  // fulfillment subscriptions pointing at dead preview/ngrok hosts. Unrelated merchant webhook
-  // paths remain untouched.
-  const stale = existing.filter((webhook: any) => {
-    const existingAddress = String(webhook?.address || '');
-    return Boolean(
-      webhook?.id
-      && existingAddress !== address
-      && existingAddress.includes('/api/v1/webhooks/shopify'),
-    );
-  });
-  let removed = 0;
-  for (const webhook of stale) {
-    const res = await fetch(`https://${shop}/admin/api/${version}/webhooks/${encodeURIComponent(String(webhook.id))}.json`, {
-      method: 'DELETE',
-      headers: { 'X-Shopify-Access-Token': accessToken },
-    });
-    if (res.ok || res.status === 404) removed++;
-    else log?.warn?.({ webhookId: webhook.id, topic: webhook.topic, status: res.status }, '[Shopify] stale webhook removal failed');
-  }
-
-  let created = 0;
-  for (const topic of topics) {
-    if (existingSet.has(`${topic}|${address}`)) {
-      continue;
-    }
-    const res = await fetch(`https://${shop}/admin/api/${version}/webhooks.json`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': accessToken,
-      },
-      body: JSON.stringify({
-        webhook: { topic, address, format: 'json' },
-      }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      if (res.status === 422) continue;
-      log?.warn?.({ topic, status: res.status, text: text.slice(0, 300) }, '[Shopify] webhook create failed');
-      throw new Error(`Webhook create failed for ${topic} (${res.status}): ${text.slice(0, 200)}`);
-    }
-    created++;
-  }
-  log?.info?.({ shop, created, removed, totalTopics: topics.length }, '[Shopify] registerWebhooks done');
-  return { created, removed, existingCount: existing.length };
+  const graphParams: { shop: string; accessToken: string; uri: string; topics: string[]; log?: WebhookLog } = { shop, accessToken, uri, topics };
+  if (log) graphParams.log = log;
+  return registerGraphqlWebhooks(graphParams);
 }
 
 function topicToEnum(topic: string) {
@@ -248,6 +172,7 @@ export async function registerGraphqlWebhooks(params: {
     throw new Error(`Shopify webhook registration partially failed: ${JSON.stringify(errors)}`);
   }
   log?.info?.({ shop, uri, created, totalTopics: topics.length }, '[Shopify] registerGraphqlWebhooks done');
+  return { created, existingCount: existing.length, deliveryUri: uri };
 }
 
 export function shopifyWebhookHealth() {

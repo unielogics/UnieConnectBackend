@@ -1,0 +1,19 @@
+client_id = "af780ecf92da02ddbc1fa15580d2b68b"
+name = "UnieConnect"
+application_url = "https://user.unieconnect.com/shopify"
+embedded = true
+
+[access_scopes]
+scopes = "read_products,read_orders,read_inventory,read_locations,read_customers,read_fulfillments,write_inventory,write_fulfillments"
+
+[auth]
+redirect_urls = [
+  "https://api.unieconnect.com/api/v1/auth/shopify/callback"
+]
+
+[webhooks]
+api_version = "2026-10"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "https://api.unieconnect.com/api/v1/webhooks/shopify/compliance"

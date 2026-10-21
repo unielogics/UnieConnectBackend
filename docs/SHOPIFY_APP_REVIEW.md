@@ -3,16 +3,16 @@
 ## Distribution and authentication
 
 - Distribution: public Shopify App Store app
-- App URL: `https://api.unieconnect.com/api/v1/auth/shopify/install`
+- App URL: `https://user.unieconnect.com/shopify`
 - Allowed redirect URL: `https://api.unieconnect.com/api/v1/auth/shopify/callback`
-- Embedded app: migration required before submission
+- Embedded app: enabled in `shopify.app.production.toml`
 - Primary listing language: English
 
 The App URL validates the `shop` domain and any Shopify signature supplied with the request, creates a one-use OAuth state, and immediately redirects to Shopify authorization. The signed callback exchanges the authorization code, links the shop to its existing UnieConnect account or provisions a direct seller account, sets the UnieConnect session cookie, and redirects to the OMS Connections screen.
 
-The public install endpoint currently supports the authorization-code flow and is safe to use for development-store testing. It is not, by itself, sufficient for a new public App Store submission. Shopify's current App Store requirements expect a consistent embedded experience using the latest App Bridge and session-token authentication. Do not submit or set `embedded = true` until the OMS frontend and backend have completed that migration.
+The embedded entry page loads the latest App Bridge script from Shopify's CDN, obtains an ID token, and exchanges it server-side for an expiring offline token. Every subsequent embedded request is authenticated with a newly supplied Shopify ID token and mapped to the connected store's UnieConnect account. The authorization-code endpoint remains available for existing standalone account reconnection, but must not be presented as the public App Store installation path.
 
-The production Shopify synchronization code also still contains REST Admin API calls. New public apps must use the GraphQL Admin API exclusively. Product, order, customer, location, inventory, shop-profile, and HTTPS webhook-registration calls must be migrated before submission.
+The production Shopify synchronization path uses the GraphQL Admin API for shop profile, products, orders, customers, inventory, and webhook registration. The operations are captured in `docs/shopify-admin-sync.graphql` and validated against API version 2026-10.
 
 ## Compliance and public URLs
 
@@ -47,9 +47,6 @@ Use a monitored technical contact and phone number. Do not enter a developer's t
 
 ## Current submission blockers
 
-- Add the latest Shopify App Bridge script to the OMS app surface and run it embedded in Shopify Admin.
-- Exchange and verify Shopify session tokens on every embedded launch; do not rely only on the UnieConnect cookie.
-- Replace all remaining REST Admin API synchronization calls with GraphQL Admin API queries and mutations.
 - Decide whether Shopify-originated accounts use Shopify as their only sign-in method or complete a secure password-setup flow for direct UnieConnect login.
 - Confirm Shopify Billing API or managed pricing behavior before listing any paid plans.
 - Add the emergency contact, primary language, listing content, screenshots, pricing, capabilities, and reviewer instructions in Dev Dashboard.
@@ -58,7 +55,7 @@ Use a monitored technical contact and phone number. Do not enter a developer's t
 
 1. Open the app from an authorized Shopify development store.
 2. Confirm Shopify authorization appears immediately when the app is not installed.
-3. Approve scopes and confirm the callback opens `https://user.unieconnect.com/oms?view=connections&connected=shopify` without a separate login gate.
+3. Approve scopes and confirm Shopify opens `https://user.unieconnect.com/shopify`, which exchanges the ID token and opens the account-scoped OMS without a separate login gate.
 4. Confirm the store appears connected and initial synchronization begins.
 5. Create or update a product and order, then confirm webhook activity is reflected in UnieConnect.
 6. Send correctly signed test compliance webhooks and confirm HTTP 200; send an invalid signature and confirm HTTP 401.

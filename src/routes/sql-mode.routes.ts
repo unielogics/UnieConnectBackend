@@ -245,6 +245,21 @@ function normalizeShopifyDomain(value: unknown) {
   return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop) ? shop : '';
 }
 
+function verifyShopifyIdToken(token: string) {
+  if (!config.shopify.clientId || !config.shopify.clientSecret) {
+    throw new Error('Shopify authentication is not configured.');
+  }
+  const claims: any = jwt.verify(token, config.shopify.clientSecret, {
+    algorithms: ['HS256'],
+    audience: config.shopify.clientId,
+  });
+  const issuer = new URL(trim(claims.iss));
+  const destination = new URL(trim(claims.dest));
+  const shop = normalizeShopifyDomain(destination.hostname);
+  if (!shop || issuer.hostname.toLowerCase() !== shop) throw new Error('Invalid Shopify ID token destination.');
+  return { claims, shop };
+}
+
 function shopifyAuthorizeUrl(shop: string, state: string) {
   const redirectUri = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/auth/shopify/callback`;
   const params = new URLSearchParams({
@@ -280,19 +295,22 @@ async function resolveShopifyInstallUser(shop: string, accessToken: string, log:
   );
   if (existingConnection?.user_id) return { userId: existingConnection.user_id, created: false };
 
-  const shopResponse = await fetch(`https://${shop}/admin/api/${config.shopify.apiVersion}/shop.json`, {
-    headers: { 'X-Shopify-Access-Token': accessToken, Accept: 'application/json' },
-  });
+  const shopResponse = await fetch(`https://${shop}/admin/api/${config.shopify.apiVersion}/graphql.json`, {
+    method: 'POST',
+    headers: { 'X-Shopify-Access-Token': accessToken, Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: 'query UnieConnectShopProfile { shop { name email contactEmail shopOwnerName myshopifyDomain } }' }),
+  } as any);
   const shopPayload: any = await shopResponse.json().catch(() => ({}));
   if (!shopResponse.ok) throw new Error(`Unable to read the authorized Shopify store (${shopResponse.status}).`);
-  const profile = shopPayload?.shop || {};
-  const email = normalizedEmail(profile.email || profile.customer_email);
+  if (shopPayload?.errors?.length) throw new Error(shopPayload.errors[0]?.message || 'Unable to read the authorized Shopify store.');
+  const profile = shopPayload?.data?.shop || {};
+  const email = normalizedEmail(profile.email || profile.contactEmail);
   if (!email) throw new Error('The authorized Shopify store does not provide an account email. Contact UnieConnect support.');
 
   const existingUser = await one<{ id: string }>('SELECT id FROM app_users WHERE lower(email) = lower($1) LIMIT 1', [email]);
   if (existingUser?.id) return { userId: existingUser.id, created: false };
 
-  const ownerParts = trim(profile.shop_owner).split(/\s+/).filter(Boolean);
+  const ownerParts = trim(profile.shopOwnerName).split(/\s+/).filter(Boolean);
   const userId = randomUUID();
   const passwordHash = await bcrypt.hash(randomBytes(32).toString('hex'), 10);
   const inserted = await one<{ id: string }>(
@@ -2694,6 +2712,131 @@ export async function sqlModeRoutes(app: FastifyInstance) {
       });
       return reply.code(502).send({ error: 'Marketplace refresh failed', detail: err?.message || 'Refresh failed' });
     }
+  });
+
+  app.post('/auth/shopify/session', async (req: any, reply) => {
+    const authorization = trim(req.headers.authorization);
+    const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    if (!idToken) return reply.code(401).send({ error: 'A Shopify ID token is required.' });
+
+    let shop = '';
+    try {
+      ({ shop } = verifyShopifyIdToken(idToken));
+    } catch (err: any) {
+      return reply.code(401).send({ error: err?.message || 'Invalid Shopify ID token.' });
+    }
+
+    const existing = await one(
+      `SELECT * FROM marketplace_connections
+       WHERE channel = 'shopify' AND lower(shop_domain) = lower($1) AND status = 'connected'
+       ORDER BY updated_at DESC LIMIT 1`,
+      [shop],
+    );
+    if (existing?.user_id) {
+      return { success: true, shop, account: mapChannel(existing), installed: true };
+    }
+
+    let tokenPayload: any = {};
+    try {
+      const params = new URLSearchParams({
+        client_id: config.shopify.clientId,
+        client_secret: config.shopify.clientSecret,
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token: idToken,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
+        requested_token_type: 'urn:shopify:params:oauth:token-type:offline-access-token',
+        expiring: '1',
+      });
+      const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      } as any);
+      tokenPayload = await response.json().catch(() => ({}));
+      if (!response.ok || !tokenPayload?.access_token) {
+        throw new Error(tokenPayload?.error_description || tokenPayload?.error || 'Shopify token exchange failed.');
+      }
+    } catch (err: any) {
+      req.log.warn({ err, shop }, 'Shopify embedded token exchange failed');
+      return reply.code(502).send({ error: err?.message || 'Shopify token exchange failed.' });
+    }
+
+    let userId = '';
+    try {
+      userId = (await resolveShopifyInstallUser(shop, tokenPayload.access_token, req.log)).userId;
+    } catch (err: any) {
+      return reply.code(400).send({ error: err?.message || 'Unable to prepare the UnieConnect account.' });
+    }
+
+    let account = await one(
+      `UPDATE marketplace_connections
+       SET status = 'connected', display_name = $3, access_token_enc = $4,
+           refresh_token_enc = COALESCE($5, refresh_token_enc), token_expires_at = $6,
+           scopes = $7, metadata = metadata || $8::jsonb, updated_at = now()
+       WHERE user_id = $1 AND channel = 'shopify' AND lower(shop_domain) = lower($2)
+       RETURNING *`,
+      [
+        userId,
+        shop,
+        shop,
+        tokenPayload.access_token,
+        tokenPayload.refresh_token || null,
+        tokenPayload.expires_in ? new Date(Date.now() + Number(tokenPayload.expires_in) * 1000) : null,
+        String(tokenPayload.scope || '').split(',').filter(Boolean),
+        JSON.stringify({ embeddedInstalledAt: new Date().toISOString(), shopifyTokenType: 'expiring_offline' }),
+      ],
+    );
+    if (!account) {
+      account = await one(
+        `INSERT INTO marketplace_connections
+          (user_id, channel, status, display_name, shop_domain, access_token_enc, refresh_token_enc, token_expires_at, scopes, metadata)
+         VALUES ($1, 'shopify', 'connected', $2, $2, $3, $4, $5, $6, $7::jsonb)
+         RETURNING *`,
+        [
+          userId,
+          shop,
+          tokenPayload.access_token,
+          tokenPayload.refresh_token || null,
+          tokenPayload.expires_in ? new Date(Date.now() + Number(tokenPayload.expires_in) * 1000) : null,
+          String(tokenPayload.scope || '').split(',').filter(Boolean),
+          JSON.stringify({ embeddedInstalledAt: new Date().toISOString(), shopifyTokenType: 'expiring_offline' }),
+        ],
+      );
+    }
+    if (!account?.id) return reply.code(500).send({ error: 'Unable to save the Shopify connection.' });
+
+    await Promise.all((['products', 'orders', 'customers', 'inventory'] as const).map((resource) => setSyncStatus(account.id, resource, 'pending')));
+    await writeLedger(userId, {
+      entityType: 'marketplace_connection',
+      entityId: account.id,
+      eventType: 'connected',
+      summary: `Shopify marketplace connected for ${shop}.`,
+      payload: { source: 'embedded_id_token' },
+    });
+
+    const accountId = account.id;
+    const accessToken = tokenPayload.access_token;
+    const log = req.log;
+    setImmediate(() => {
+      void (async () => {
+        const webhookAddress = `${config.shopify.appBaseUrl.replace(/\/+$/, '')}/api/v1/webhooks/shopify`;
+        const webhookResult = await registerShopifyWebhooks({
+          shop,
+          accessToken,
+          address: webhookAddress,
+          topics: config.shopify.webhookTopics,
+          log,
+        });
+        const syncResult = await pullShopifySql({ userId, channelAccountId: accountId, shopDomain: shop, accessToken, initialSync: true, log });
+        await markMarketplaceRefresh(accountId, userId, syncResult);
+        await pgQuery(
+          `UPDATE marketplace_connections SET metadata = metadata || $3::jsonb, updated_at = now() WHERE id = $1 AND user_id = $2`,
+          [accountId, userId, JSON.stringify({ shopifyWebhookRegisteredAt: new Date().toISOString(), shopifyWebhookReconciliation: webhookResult })],
+        );
+      })().catch((err: any) => log.warn({ err, shop, accountId }, 'Shopify embedded post-install setup failed'));
+    });
+
+    return { success: true, shop, account: mapChannel(account), installed: false };
   });
 
   app.get('/auth/shopify/install', async (req: any, reply) => {

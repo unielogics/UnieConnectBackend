@@ -1,0 +1,89 @@
+query UnieConnectProducts($first: Int!, $after: String) {
+  products(first: $first, after: $after, sortKey: UPDATED_AT) {
+    nodes {
+      id
+      legacyResourceId
+      title
+      descriptionHtml
+      handle
+      status
+      images(first: 20) { nodes { url } }
+      variants(first: 100) {
+        nodes {
+          id
+          legacyResourceId
+          sku
+          price
+          inventoryQuantity
+          inventoryItem { id legacyResourceId }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+query UnieConnectOrders($first: Int!, $after: String, $query: String!) {
+  orders(first: $first, after: $after, query: $query, sortKey: CREATED_AT, reverse: true) {
+    nodes {
+      id
+      legacyResourceId
+      name
+      createdAt
+      displayFulfillmentStatus
+      displayFinancialStatus
+      currencyCode
+      currentSubtotalPriceSet { shopMoney { amount } }
+      currentTotalTaxSet { shopMoney { amount } }
+      totalShippingPriceSet { shopMoney { amount } }
+      currentTotalDiscountsSet { shopMoney { amount } }
+      currentTotalPriceSet { shopMoney { amount } }
+      customer {
+        id
+        legacyResourceId
+        firstName
+        lastName
+        email
+        phone
+        defaultAddress { address1 address2 city provinceCode zip countryCodeV2 }
+      }
+      shippingAddress { address1 address2 city provinceCode zip countryCodeV2 }
+      billingAddress { address1 address2 city provinceCode zip countryCodeV2 }
+      lineItems(first: 100) {
+        nodes { id sku title quantity originalUnitPriceSet { shopMoney { amount } } }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+query UnieConnectCustomers($first: Int!, $after: String, $query: String!) {
+  customers(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
+    nodes {
+      id
+      legacyResourceId
+      firstName
+      lastName
+      email
+      phone
+      defaultAddress { address1 address2 city provinceCode zip countryCodeV2 }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+query UnieConnectInventory($first: Int!, $after: String) {
+  inventoryItems(first: $first, after: $after) {
+    nodes {
+      id
+      legacyResourceId
+      inventoryLevels(first: 100) {
+        nodes {
+          location { id legacyResourceId name }
+          quantities(names: ["available"]) { name quantity }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}

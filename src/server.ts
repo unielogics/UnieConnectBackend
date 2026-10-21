@@ -12,6 +12,7 @@ import { startDirectOptimizeScheduler } from './services/direct-optimize.schedul
 import { startMarketplaceSyncScheduler } from './services/marketplace-sync.scheduler';
 import { authRoutes } from './routes/auth.routes';
 import { config } from './config/env';
+import { pgQuery } from './db/postgres';
 
 async function start() {
   const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
@@ -84,7 +85,30 @@ async function start() {
         try {
           req.user = jwt.verify(token, config.authSecret);
         } catch {
-          /* ignore */
+          try {
+            const claims: any = jwt.verify(token, config.shopify.clientSecret, {
+              algorithms: ['HS256'],
+              audience: config.shopify.clientId,
+            });
+            const issuer = new URL(String(claims.iss || ''));
+            const destination = new URL(String(claims.dest || ''));
+            const shop = destination.hostname.toLowerCase();
+            if (issuer.hostname.toLowerCase() !== shop || !/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop)) throw new Error('Invalid Shopify ID token destination');
+            const result = await pgQuery<{ user_id: string; email: string; role: string }>(
+              `SELECT c.user_id, u.email, u.role
+               FROM marketplace_connections c
+               JOIN app_users u ON u.id = c.user_id
+               WHERE c.channel = 'shopify' AND lower(c.shop_domain) = lower($1) AND c.status = 'connected'
+               ORDER BY c.updated_at DESC LIMIT 1`,
+              [shop],
+            );
+            const account = result?.rows?.[0];
+            if (account?.user_id) {
+              req.user = { userId: account.user_id, email: account.email, role: account.role, authSource: 'shopify_id_token', shop };
+            }
+          } catch {
+            /* The route-level authentication guard returns the appropriate response. */
+          }
         }
       }
     });

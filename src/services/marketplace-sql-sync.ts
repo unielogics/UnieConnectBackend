@@ -52,10 +52,78 @@ function shopifyVariantSku(product: any, variant: any) {
   return `SHOPIFY-${handle || 'VARIANT'}-${trim(variant?.id || variant?.inventory_item_id || 'NOID')}`;
 }
 
-function parseNextPageInfo(linkHeader: string | null): string | null {
-  if (!linkHeader) return null;
-  const match = linkHeader.match(/<[^>]+[?&]page_info=([^>&]+)[^>]*>\s*;\s*rel="next"/i);
-  return match?.[1] ? decodeURIComponent(match[1]) : null;
+async function shopifyGraphql(
+  base: string,
+  headers: Record<string, string>,
+  query: string,
+  variables: Record<string, unknown>,
+) {
+  const response = await fetch(`${base}/graphql.json`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ query, variables }),
+  });
+  const body: any = await response.json().catch(() => ({}));
+  if (!response.ok || body?.errors?.length) {
+    const message = body?.errors?.map((error: any) => error?.message).filter(Boolean).join('; ');
+    throw new Error(message || `Shopify GraphQL HTTP ${response.status}`);
+  }
+  return body?.data || {};
+}
+
+function shopifyLegacyId(node: any) {
+  return trim(node?.legacyResourceId || node?.id);
+}
+
+function shopifyAddress(address: any) {
+  if (!address) return {};
+  return {
+    address1: address.address1 || null,
+    address2: address.address2 || null,
+    city: address.city || null,
+    province_code: address.provinceCode || null,
+    zip: address.zip || null,
+    country_code: address.countryCodeV2 || null,
+  };
+}
+
+function shopifyCustomer(customer: any) {
+  if (!customer) return null;
+  return {
+    id: shopifyLegacyId(customer),
+    first_name: customer.firstName || null,
+    last_name: customer.lastName || null,
+    email: customer.email || customer.defaultEmailAddress?.emailAddress || null,
+    phone: customer.phone || customer.defaultPhoneNumber?.phoneNumber || null,
+    default_address: shopifyAddress(customer.defaultAddress),
+  };
+}
+
+function shopifyOrder(order: any) {
+  const money = (set: any) => set?.shopMoney?.amount ?? 0;
+  return {
+    id: shopifyLegacyId(order),
+    name: order?.name,
+    created_at: order?.createdAt,
+    fulfillment_status: String(order?.displayFulfillmentStatus || 'UNFULFILLED').toLowerCase(),
+    financial_status: String(order?.displayFinancialStatus || 'PENDING').toLowerCase(),
+    currency: order?.currencyCode || 'USD',
+    subtotal_price: money(order?.currentSubtotalPriceSet),
+    total_tax: money(order?.currentTotalTaxSet),
+    total_discounts: money(order?.currentTotalDiscountsSet),
+    total_price: money(order?.currentTotalPriceSet),
+    shipping_lines: [{ price: money(order?.totalShippingPriceSet) }],
+    customer: shopifyCustomer(order?.customer),
+    shipping_address: shopifyAddress(order?.shippingAddress),
+    billing_address: shopifyAddress(order?.billingAddress),
+    line_items: (order?.lineItems?.nodes || []).map((line: any) => ({
+      id: shopifyLegacyId(line),
+      sku: line?.sku || null,
+      title: line?.title || null,
+      quantity: line?.quantity || 0,
+      price: money(line?.originalUnitPriceSet),
+    })),
+  };
 }
 
 function normalizeNext(next?: string): string | undefined {
@@ -443,15 +511,27 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
   try {
     await setSyncStatus(ctx.channelAccountId, 'products', 'syncing');
     let count = 0;
-    let pageInfo: string | null = null;
+    let cursor: string | null = null;
     do {
-      const url = pageInfo ? `${base}/products.json?limit=250&page_info=${encodeURIComponent(pageInfo)}` : `${base}/products.json?limit=250`;
-      const res = await fetch(url, { headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const body: any = await res.json();
-      for (const product of Array.isArray(body?.products) ? body.products : []) {
-        const images = Array.isArray(product?.images) ? product.images.map((image: any) => image?.src || image?.url).filter(Boolean) : [];
-        for (const variant of Array.isArray(product?.variants) ? product.variants : []) {
+      const data = await shopifyGraphql(base, headers, `query UnieConnectProducts($first: Int!, $after: String) {
+        products(first: $first, after: $after, sortKey: UPDATED_AT) {
+          nodes { id legacyResourceId title descriptionHtml handle status images(first: 20) { nodes { url } }
+            variants(first: 100) { nodes { id legacyResourceId sku price inventoryQuantity inventoryItem { id legacyResourceId } } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`, { first: 100, after: cursor });
+      for (const node of data?.products?.nodes || []) {
+        const product = {
+          id: shopifyLegacyId(node), title: node.title, body_html: node.descriptionHtml, handle: node.handle,
+          status: String(node.status || '').toLowerCase(),
+        };
+        const images = (node?.images?.nodes || []).map((image: any) => image?.url).filter(Boolean);
+        for (const variantNode of node?.variants?.nodes || []) {
+          const variant = {
+            id: shopifyLegacyId(variantNode), sku: variantNode.sku, price: variantNode.price,
+            inventory_quantity: variantNode.inventoryQuantity,
+            inventory_item_id: shopifyLegacyId(variantNode.inventoryItem),
+          };
           const sku = shopifyVariantSku(product, variant);
           const item: any = await upsertCatalogItem({
             userId: ctx.userId,
@@ -479,8 +559,9 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
           }
         }
       }
-      pageInfo = parseNextPageInfo(res.headers.get('link'));
-    } while (pageInfo);
+      const pageInfo = data?.products?.pageInfo;
+      cursor = pageInfo?.hasNextPage ? pageInfo?.endCursor || null : null;
+    } while (cursor);
     result.products = count;
     await setSyncStatus(ctx.channelAccountId, 'products', 'synced', { count });
   } catch (err: any) {
@@ -496,20 +577,29 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
     const windowDays = initialSync ? backfillDays : 7;
     const since = new Date(Date.now() - windowDays * MS_PER_DAY).toISOString();
     let count = 0;
-    let pageInfo: string | null = null;
+    let cursor: string | null = null;
     do {
-      const url = pageInfo
-        ? `${base}/orders.json?status=any&limit=250&page_info=${encodeURIComponent(pageInfo)}`
-        : `${base}/orders.json?status=any&limit=250&order=created_at%20desc&created_at_min=${encodeURIComponent(since)}`;
-      const res = await fetch(url, { headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const body: any = await res.json();
-      for (const order of Array.isArray(body?.orders) ? body.orders : []) {
-        await upsertOrder(ctx, 'shopify', order);
+      const data = await shopifyGraphql(base, headers, `query UnieConnectOrders($first: Int!, $after: String, $query: String!) {
+        orders(first: $first, after: $after, query: $query, sortKey: CREATED_AT, reverse: true) {
+          nodes { id legacyResourceId name createdAt displayFulfillmentStatus displayFinancialStatus currencyCode
+            currentSubtotalPriceSet { shopMoney { amount } } currentTotalTaxSet { shopMoney { amount } }
+            totalShippingPriceSet { shopMoney { amount } } currentTotalDiscountsSet { shopMoney { amount } }
+            currentTotalPriceSet { shopMoney { amount } }
+            customer { id legacyResourceId firstName lastName email phone defaultAddress { address1 address2 city provinceCode zip countryCodeV2 } }
+            shippingAddress { address1 address2 city provinceCode zip countryCodeV2 }
+            billingAddress { address1 address2 city provinceCode zip countryCodeV2 }
+            lineItems(first: 100) { nodes { id sku title quantity originalUnitPriceSet { shopMoney { amount } } } }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`, { first: 100, after: cursor, query: `created_at:>=${since}` });
+      for (const order of data?.orders?.nodes || []) {
+        await upsertOrder(ctx, 'shopify', shopifyOrder(order));
         count++;
       }
-      pageInfo = parseNextPageInfo(res.headers.get('link'));
-    } while (pageInfo);
+      const pageInfo = data?.orders?.pageInfo;
+      cursor = pageInfo?.hasNextPage ? pageInfo?.endCursor || null : null;
+    } while (cursor);
     result.orders = count;
     const totalImportedRow = await one<{ count: number }>(
       `SELECT count(*)::int AS count
@@ -560,9 +650,25 @@ export async function pullShopifySql(params: SyncContext & { shopDomain: string;
       },
     });
   } catch (err: any) {
-    const error = err?.message || 'Inventory sync failed';
-    result.errors!.inventory = error;
-    await setSyncStatus(ctx.channelAccountId, 'inventory', 'error', { error });
+    const fallback = await syncShopifyInventoryFromMappedVariants(ctx).catch(() => 0);
+    if (fallback > 0) {
+      result.inventory = fallback;
+      result.warnings = { ...(result.warnings || {}), inventory: 'Per-location inventory is unavailable; synchronized store totals from product variants.' };
+      await setSyncStatus(ctx.channelAccountId, 'inventory', 'synced', {
+        count: fallback,
+        metadata: {
+          source: 'mapped_variant_fallback',
+          degraded: false,
+          coverage: 'store_total',
+          locationLevelAvailable: false,
+          notice: 'Shopify store inventory totals are synchronized. Per-location allocation is not enabled for this installation.',
+        },
+      });
+    } else {
+      const error = err?.message || 'Inventory sync failed';
+      result.errors!.inventory = error;
+      await setSyncStatus(ctx.channelAccountId, 'inventory', 'error', { error });
+    }
   }
 
   if (Object.keys(result.errors || {}).length === 0) delete result.errors;
@@ -573,75 +679,71 @@ async function syncShopifyCustomers(ctx: SyncContext, base: string, headers: Rec
   if (!initialSync) return 0;
   const since = new Date(Date.now() - 90 * MS_PER_DAY).toISOString();
   let count = 0;
-  let pageInfo: string | null = null;
+  let cursor: string | null = null;
   do {
-    const url = pageInfo
-      ? `${base}/customers.json?limit=250&page_info=${encodeURIComponent(pageInfo)}`
-      : `${base}/customers.json?limit=250&created_at_min=${encodeURIComponent(since)}`;
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body: any = await res.json();
-    for (const customer of Array.isArray(body?.customers) ? body.customers : []) {
+    const data = await shopifyGraphql(base, headers, `query UnieConnectCustomers($first: Int!, $after: String, $query: String!) {
+      customers(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
+        nodes { id legacyResourceId firstName lastName email phone defaultAddress { address1 address2 city provinceCode zip countryCodeV2 } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }`, { first: 100, after: cursor, query: `created_at:>=${since}` });
+    for (const customerNode of data?.customers?.nodes || []) {
+      const customer = shopifyCustomer(customerNode);
       await ensureCustomer(ctx, 'shopify', trim(customer?.id) || null, customer);
       count++;
     }
-    pageInfo = parseNextPageInfo(res.headers.get('link'));
-  } while (pageInfo);
+    const pageInfo = data?.customers?.pageInfo;
+    cursor = pageInfo?.hasNextPage ? pageInfo?.endCursor || null : null;
+  } while (cursor);
   return count;
 }
 
 async function syncShopifyInventory(ctx: SyncContext, base: string, headers: Record<string, string>) {
-  const locationsRes = await fetch(`${base}/locations.json`, { headers });
-  if (!locationsRes.ok) {
-    if (locationsRes.status === 401 || locationsRes.status === 403) {
-      const fallback = await syncShopifyInventoryFromMappedVariants(ctx);
-      if (fallback > 0) {
-        return {
-          count: fallback,
-          source: 'mapped_variant_fallback',
-          coverage: 'store_total',
-          locationLevelAvailable: false,
-          notice: 'Shopify store inventory totals are synchronized. Per-location allocation is not enabled for this installation.',
-        };
-      }
-      throw new Error('Locations access denied. Reconnect Shopify with read_locations scope.');
-    }
-    throw new Error(`HTTP ${locationsRes.status}`);
-  }
-  const locationsBody: any = await locationsRes.json();
-  const location = Array.isArray(locationsBody?.locations) ? locationsBody.locations[0] : null;
-  if (!location?.id) return { count: 0, source: 'inventory_levels', coverage: 'location_level', locationLevelAvailable: true };
-  const res = await fetch(`${base}/inventory_levels.json?limit=250&location_ids[]=${encodeURIComponent(String(location.id))}`, { headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const body: any = await res.json();
   let count = 0;
-  for (const level of Array.isArray(body?.inventory_levels) ? body.inventory_levels : []) {
-    const mapping: any = await one(
-      `SELECT m.*, i.wms_inventory
-       FROM item_channel_mappings m
-       JOIN catalog_items i ON i.id = m.item_id
-       WHERE m.user_id = $1 AND m.channel_connection_id = $2 AND m.payload->>'inventory_item_id' = $3
-       LIMIT 1`,
-      [ctx.userId, ctx.channelAccountId, trim(level?.inventory_item_id)],
-    );
-    if (!mapping?.item_id) continue;
-    await pgQuery(
-      `UPDATE catalog_items
-       SET wms_inventory = wms_inventory || $3::jsonb || jsonb_build_object('shopifyStores', COALESCE(wms_inventory->'shopifyStores', '{}'::jsonb) || $5::jsonb),
-           metadata = metadata || $4::jsonb,
-           updated_at = now()
-       WHERE id = $1 AND user_id = $2`,
-      [
-        mapping.item_id,
-        ctx.userId,
-        JSON.stringify({ shopify: { locationId: String(level.location_id), available: num(level.available), channelAccountId: ctx.channelAccountId } }),
-        JSON.stringify({ shopifyInventorySyncedAt: new Date().toISOString() }),
-        JSON.stringify({ [ctx.channelAccountId]: { locationId: String(level.location_id), available: num(level.available), channelAccountId: ctx.channelAccountId, source: 'inventory_levels' } }),
-      ],
-    );
-    count++;
-  }
-  return { count, source: 'inventory_levels', coverage: 'location_level', locationLevelAvailable: true };
+  let cursor: string | null = null;
+  do {
+    const data = await shopifyGraphql(base, headers, `query UnieConnectInventory($first: Int!, $after: String) {
+      inventoryItems(first: $first, after: $after) {
+        nodes { id legacyResourceId inventoryLevels(first: 100) { nodes {
+          location { id legacyResourceId name } quantities(names: ["available"]) { name quantity }
+        } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }`, { first: 100, after: cursor });
+    for (const inventoryItem of data?.inventoryItems?.nodes || []) {
+      const inventoryItemId = shopifyLegacyId(inventoryItem);
+      const mapping: any = await one(
+        `SELECT m.*, i.wms_inventory FROM item_channel_mappings m
+         JOIN catalog_items i ON i.id = m.item_id
+         WHERE m.user_id = $1 AND m.channel_connection_id = $2 AND m.payload->>'inventory_item_id' = $3 LIMIT 1`,
+        [ctx.userId, ctx.channelAccountId, inventoryItemId],
+      );
+      if (!mapping?.item_id) continue;
+      const locations = (inventoryItem?.inventoryLevels?.nodes || []).map((level: any) => ({
+        locationId: shopifyLegacyId(level?.location),
+        locationName: level?.location?.name || null,
+        available: num((level?.quantities || []).find((quantity: any) => quantity?.name === 'available')?.quantity),
+      }));
+      const available = locations.reduce((sum: number, location: any) => sum + num(location.available), 0);
+      await pgQuery(
+        `UPDATE catalog_items
+         SET wms_inventory = wms_inventory || $3::jsonb || jsonb_build_object('shopifyStores', COALESCE(wms_inventory->'shopifyStores', '{}'::jsonb) || $5::jsonb),
+             metadata = metadata || $4::jsonb, updated_at = now()
+         WHERE id = $1 AND user_id = $2`,
+        [
+          mapping.item_id,
+          ctx.userId,
+          JSON.stringify({ shopify: { available, locations, channelAccountId: ctx.channelAccountId } }),
+          JSON.stringify({ shopifyInventorySyncedAt: new Date().toISOString() }),
+          JSON.stringify({ [ctx.channelAccountId]: { available, locations, channelAccountId: ctx.channelAccountId, source: 'inventory_levels_graphql' } }),
+        ],
+      );
+      count++;
+    }
+    const pageInfo = data?.inventoryItems?.pageInfo;
+    cursor = pageInfo?.hasNextPage ? pageInfo?.endCursor || null : null;
+  } while (cursor);
+  return { count, source: 'inventory_levels_graphql', coverage: 'location_level', locationLevelAvailable: true, notice: null };
 }
 
 async function syncShopifyInventoryFromMappedVariants(ctx: SyncContext) {
