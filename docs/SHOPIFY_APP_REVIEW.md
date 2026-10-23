@@ -8,9 +8,9 @@
 - Embedded app: enabled in `shopify.app.production.toml`
 - Primary listing language: English
 
-The App URL validates the `shop` domain and any Shopify signature supplied with the request, creates a one-use OAuth state, and immediately redirects to Shopify authorization. The signed callback exchanges the authorization code, links the shop to its existing UnieConnect account or provisions a direct seller account, sets the UnieConnect session cookie, and redirects to the OMS Connections screen.
+Installation starts on Shopify's owned install/store-selection surface. Shopify then loads the embedded App URL, `https://user.unieconnect.com/shopify`, with App Bridge context. The app immediately requests a Shopify ID token, exchanges it for an expiring offline access token when needed, links the shop to its UnieConnect account, and redirects to the account-scoped OMS workspace.
 
-The embedded entry page loads the latest App Bridge script from Shopify's CDN, obtains an ID token, and exchanges it server-side for an expiring offline token. Every subsequent embedded request is authenticated with a newly supplied Shopify ID token and mapped to the connected store's UnieConnect account. The authorization-code endpoint remains available for existing standalone account reconnection, but must not be presented as the public App Store installation path.
+The embedded entry page loads the latest App Bridge script from Shopify's CDN. Every subsequent embedded request obtains a fresh Shopify ID token and is mapped to the connected store's UnieConnect account. The authorization-code endpoint remains available for existing standalone account reconnection, but is not presented as the public App Store installation path.
 
 The production Shopify synchronization path uses the GraphQL Admin API for shop profile, products, orders, customers, inventory, and webhook registration. The operations are captured in `docs/shopify-admin-sync.graphql` and validated against API version 2026-10.
 
@@ -47,7 +47,6 @@ Use a monitored technical contact and phone number. Do not enter a developer's t
 
 ## Current submission blockers
 
-- Decide whether Shopify-originated accounts use Shopify as their only sign-in method or complete a secure password-setup flow for direct UnieConnect login.
 - Confirm Shopify Billing API or managed pricing behavior before listing any paid plans.
 - Add the emergency contact, primary language, listing content, screenshots, pricing, capabilities, and reviewer instructions in Dev Dashboard.
 

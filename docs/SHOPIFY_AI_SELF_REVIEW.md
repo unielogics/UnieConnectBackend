@@ -1,6 +1,6 @@
 # Shopify App Store AI Self Review
 
-Review date: 2026-10-21
+Review date: 2026-10-22
 
 Source: `docs/shopify-app-store-ai-self-review-requirements.md`, fetched with the latest Shopify CLI as required by Shopify's AI self-review workflow.
 
@@ -44,7 +44,8 @@ This review covers Shopify's locally checkable requirements. Shopify will evalua
 - Embedded launch uses a Shopify ID token. The backend verifies signature, audience, issuer, destination, expiry, and tenant mapping before granting account access.
 - First embedded launch exchanges the ID token for an expiring offline access token and stores it against the authenticated shop/account.
 - Shopify catalog, order, customer, inventory, shop-profile, and webhook-registration calls use the GraphQL Admin API; the legacy REST pull module was removed.
-- The OMS no longer asks merchants to enter a `myshopify.com` domain. New installations leave UnieConnect for the Shopify App Store surface.
+- The OMS does not ask merchants to enter a `myshopify.com` domain. The Connect action opens Shopify's owned install/store-selection surface at `admin.shopify.com`.
+- Embedded API requests obtain a fresh Shopify ID token through App Bridge; the backend verifies and maps that token to the connected account on every request.
 - OAuth callback state and HMAC validation remain in place for the legacy standalone reconnection path.
 - Public privacy, terms, support, and data-deletion pages exist.
 
@@ -67,6 +68,7 @@ This review covers Shopify's locally checkable requirements. Shopify will evalua
 - Select English as the primary listing language.
 - Complete listing content, screenshots, capabilities, pricing, and reviewer instructions.
 - Log in to the development store and exercise the embedded app so Shopify's two-hour App Bridge and ID-token checks receive session evidence.
+- Confirm whether Stripe invoices are exclusively physical warehouse, carrier, or fulfillment-service charges. If any charge pays for access to UnieConnect app functionality, replace that app charge with Shopify Managed Pricing or the Billing API.
 - Do not mark the AI self-review complete until the three billing requirements are resolved for the intended App Store pricing model.
 
 ## Resources
