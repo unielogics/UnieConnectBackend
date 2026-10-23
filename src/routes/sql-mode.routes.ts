@@ -74,6 +74,17 @@ function requireManager(req: any, reply: any): string | null {
   return userId;
 }
 
+async function requireSuperAdmin(req: any, reply: any): Promise<string | null> {
+  const userId = requireUser(req, reply);
+  if (!userId) return null;
+  const administrator = await pgQuery<{ role: string }>('SELECT role FROM app_users WHERE id = $1 LIMIT 1', [userId]);
+  if (normalizeRole(administrator?.rows[0]?.role) !== 'super_admin') {
+    reply.code(403).send({ error: 'Forbidden', message: 'Super administrator access is required.' });
+    return null;
+  }
+  return userId;
+}
+
 async function one<T extends AnyRow = AnyRow>(sql: string, values: unknown[] = []): Promise<T | null> {
   const res = await pgQuery<T>(sql, values);
   return res?.rows[0] || null;
@@ -82,6 +93,73 @@ async function one<T extends AnyRow = AnyRow>(sql: string, values: unknown[] = [
 async function rows<T extends AnyRow = AnyRow>(sql: string, values: unknown[] = []): Promise<T[]> {
   const res = await pgQuery<T>(sql, values);
   return res?.rows || [];
+}
+
+const quotedIdentifier = (value: string) => `"${value.replace(/"/g, '""')}"`;
+
+async function purgeAccount(targetUserId: string, preserveLogin: boolean) {
+  return withPgTransaction(async (client) => {
+    const targetResult = await client.query<AnyRow>('SELECT * FROM app_users WHERE id = $1 FOR UPDATE', [targetUserId]);
+    const target = targetResult.rows[0];
+    if (!target) return null;
+
+    const references = await client.query<{ table_schema: string; table_name: string; column_name: string }>(
+      `SELECT DISTINCT kcu.table_schema, kcu.table_name, kcu.column_name
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON kcu.constraint_name = tc.constraint_name AND kcu.constraint_schema = tc.constraint_schema
+       JOIN information_schema.constraint_column_usage ccu
+         ON ccu.constraint_name = tc.constraint_name AND ccu.constraint_schema = tc.constraint_schema
+       WHERE tc.constraint_type = 'FOREIGN KEY'
+         AND ccu.table_schema = 'public'
+         AND ccu.table_name = 'app_users'
+         AND ccu.column_name = 'id'`,
+    );
+    for (const reference of references.rows) {
+      const table = `${quotedIdentifier(reference.table_schema)}.${quotedIdentifier(reference.table_name)}`;
+      await client.query(`DELETE FROM ${table} WHERE ${quotedIdentifier(reference.column_name)} = $1`, [targetUserId]);
+    }
+
+    await client.query('DELETE FROM app_users WHERE id = $1', [targetUserId]);
+
+    if (preserveLogin) {
+      const restored = {
+        ...target,
+        last_login_at: null,
+        reset_token: null,
+        reset_token_expires: null,
+        updated_at: new Date().toISOString(),
+      };
+      await client.query('INSERT INTO app_users SELECT * FROM json_populate_record(NULL::app_users, $1::json)', [JSON.stringify(restored)]);
+    }
+
+    const scopedTables = await client.query<{ table_schema: string; table_name: string }>(
+      `SELECT DISTINCT c.table_schema, c.table_name
+       FROM information_schema.columns c
+       JOIN information_schema.tables t
+         ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+       WHERE c.table_schema = 'public'
+         AND c.column_name = 'user_id'
+         AND c.table_name <> 'app_users'
+         AND t.table_type = 'BASE TABLE'`,
+    );
+    for (const scopedTable of scopedTables.rows) {
+      const table = `${quotedIdentifier(scopedTable.table_schema)}.${quotedIdentifier(scopedTable.table_name)}`;
+      await client.query(`DELETE FROM ${table} WHERE user_id = $1`, [targetUserId]);
+    }
+
+    if (preserveLogin && Array.isArray(target.enabled_features) && target.enabled_features.length > 0) {
+      await client.query(
+        `INSERT INTO user_features (user_id, feature_id, status, payload)
+         SELECT $1, f.id, 'enabled', '{"source":"admin_account_reset"}'::jsonb
+         FROM features f
+         WHERE f.id = ANY($2::text[])`,
+        [targetUserId, target.enabled_features],
+      );
+    }
+
+    return { id: target.id, email: target.email };
+  });
 }
 
 function pagination(query: any) {
@@ -5402,6 +5480,49 @@ export async function sqlModeRoutes(app: FastifyInstance) {
     if (!requireManager(req, reply)) return;
     const data = await rows('SELECT * FROM app_user_activity_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200', [req.params.userId]);
     return { events: data.map((e) => ({ _id: e.id, id: e.id, action: e.action, metadata: json(e.metadata, {}), createdAt: iso(e.created_at) })), total: data.length };
+  });
+
+  app.post('/users/:userId/reset', async (req: any, reply) => {
+    const administratorId = await requireSuperAdmin(req, reply);
+    if (!administratorId) return;
+    const targetUserId = trim(req.params.userId);
+    if (!targetUserId) return reply.code(400).send({ error: 'userId is required' });
+    if (targetUserId === administratorId) return reply.code(400).send({ error: 'You cannot reset your own account.' });
+    const target = await one<{ id: string; email: string }>('SELECT id, email FROM app_users WHERE id = $1', [targetUserId]);
+    if (!target) return reply.code(404).send({ error: 'Account not found' });
+    if (normalizedEmail(req.body?.confirmationEmail) !== normalizedEmail(target.email)) {
+      return reply.code(400).send({ error: 'Type the account email exactly to confirm reset.' });
+    }
+    const reset = await purgeAccount(targetUserId, true);
+    if (!reset) return reply.code(404).send({ error: 'Account not found' });
+    await ensureCortexCredentialForUser(targetUserId).catch((err) => {
+      req.log.warn({ err, userId: targetUserId }, 'cortex credential reprovision failed after account reset');
+    });
+    await pgQuery(
+      'INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)',
+      [targetUserId, 'account_reset_by_admin', JSON.stringify({ administratorId })],
+    );
+    return { success: true, account: reset, message: 'Account data was reset. Login and profile were preserved.' };
+  });
+
+  app.delete('/users/:userId', async (req: any, reply) => {
+    const administratorId = await requireSuperAdmin(req, reply);
+    if (!administratorId) return;
+    const targetUserId = trim(req.params.userId);
+    if (!targetUserId) return reply.code(400).send({ error: 'userId is required' });
+    if (targetUserId === administratorId) return reply.code(400).send({ error: 'You cannot delete your own account.' });
+    const target = await one<{ id: string; email: string }>('SELECT id, email FROM app_users WHERE id = $1', [targetUserId]);
+    if (!target) return reply.code(404).send({ error: 'Account not found' });
+    if (normalizedEmail(req.body?.confirmationEmail) !== normalizedEmail(target.email)) {
+      return reply.code(400).send({ error: 'Type the account email exactly to confirm deletion.' });
+    }
+    const deleted = await purgeAccount(targetUserId, false);
+    if (!deleted) return reply.code(404).send({ error: 'Account not found' });
+    await pgQuery(
+      'INSERT INTO app_user_activity_log (user_id, action, metadata) VALUES ($1, $2, $3::jsonb)',
+      [administratorId, 'account_deleted_by_admin', JSON.stringify({ deletedUserId: targetUserId, deletedEmail: target.email })],
+    ).catch(() => null);
+    return { success: true, account: deleted };
   });
 
   app.post('/oms/connect', async (req: any, reply) => {
