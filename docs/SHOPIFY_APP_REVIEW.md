@@ -34,21 +34,33 @@ The endpoint verifies the Shopify HMAC against the raw request body before queui
 
 Use the scopes in `shopify.app.toml.example`. Protected customer data access must match the merchant data used by order and customer synchronization.
 
+## Pricing and external service charges
+
+- UnieConnect is free for Shopify merchants to install and use.
+- There are no paid Shopify app plans, app feature fees, or one-time app purchases.
+- Warehouse providers fund the merchant's access to the UnieConnect ecosystem.
+- Stripe is used only for separately ordered warehouse, carrier, and physical fulfillment services.
+- Stripe is never used to charge for installing, accessing, or unlocking functionality in the Shopify app.
+
+Set the App Store listing price to **Free**. Use this disclosure in the reviewer instructions:
+
+> UnieConnect is free for Shopify merchants. The app does not charge for installation, access, or software features. Any optional Stripe payment method is limited to separately ordered real-world warehouse, carrier, or physical fulfillment services. Warehouse providers fund merchant access to the UnieConnect ecosystem.
+
 ## Manual Partner Dashboard fields
 
 These values cannot be inferred or submitted by the application:
 
 - Emergency contact email
 - Emergency contact phone number
-- App Store listing content, screenshots, pricing, and review instructions
+- App Store listing content, screenshots, and review instructions
 - Final capability selections and review submission
 
 Use a monitored technical contact and phone number. Do not enter a developer's temporary address or an unmonitored support alias.
 
-## Current submission blockers
+## Remaining submission work
 
-- Confirm Shopify Billing API or managed pricing behavior before listing any paid plans.
-- Add the emergency contact, primary language, listing content, screenshots, pricing, capabilities, and reviewer instructions in Dev Dashboard.
+- Set App Store pricing to **Free**.
+- Add the emergency contact, primary language, listing content, screenshots, capabilities, and reviewer instructions in Dev Dashboard.
 
 ## Review test
 

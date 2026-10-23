@@ -6,35 +6,29 @@ Source: `docs/shopify-app-store-ai-self-review-requirements.md`, fetched with th
 
 ## Summary
 
-Likely passing: 28
+Likely passing: 31
 
 Likely failing: 0
 
-Needs review: 3
+Needs review: 0
 
 Groups skipped: 10
 
 This review covers Shopify's locally checkable requirements. Shopify will evaluate these and additional requirements during App Store review.
 
-## Requirements That Need Review
+## Billing Policy Determination
 
-### Use Shopify App Pricing Or The Shopify Billing API
+UnieConnect is free for Shopify merchants to install and use. There are no paid Shopify app plans, feature-access fees, or one-time app purchases.
 
-**Why this needs attention:** The codebase contains Stripe-backed OMS billing and operational warehouse charges. A human must confirm whether any of those charges are fees for the Shopify app itself. App charges must use Shopify App Pricing or the Billing API.
+Warehouse providers fund the merchant's access to the UnieConnect ecosystem. Stripe is used only for separately ordered real-world logistics services, such as warehouse handling, carrier charges, and physical fulfillment. Stripe is not used to sell access to the Shopify app or its software features.
 
-**What was detected:** Stripe billing code and paid OMS functionality exist, but the intended Shopify App Store plan and whether fulfillment-service charges are separate from app access are not documented.
+Based on this confirmed commercial model, the three app-billing requirements are satisfied for the free listing:
 
-### Implement Shopify App Pricing Or The Shopify Billing API Correctly
+- **Use Shopify App Pricing or the Shopify Billing API:** no Shopify app charge exists.
+- **Implement Shopify app billing correctly:** no paid app plan or app purchase is offered.
+- **Allow pricing-plan changes:** not applicable because the app has no paid plans.
 
-**Why this needs attention:** Correct implementation depends on the unresolved pricing model. This cannot be proven from the current code.
-
-**What was detected:** No Shopify app subscription or one-time app purchase implementation was found.
-
-### Allow Pricing Plan Changes
-
-**Why this needs attention:** If the Shopify app has paid plans, merchants must be able to change plans through Shopify-compatible billing. If the listing is free, this requirement does not apply in practice.
-
-**What was detected:** OMS billing controls exist, but no Shopify app-plan lifecycle is defined.
+Merchant-facing payment copy must continue to identify Stripe charges as optional physical logistics-service charges and state that Shopify app access is free.
 
 ## Verified Shopify Checks
 
@@ -66,10 +60,10 @@ This review covers Shopify's locally checkable requirements. Shopify will evalua
 
 - Add the monitored emergency contact email and phone number.
 - Select English as the primary listing language.
-- Complete listing content, screenshots, capabilities, pricing, and reviewer instructions.
+- Complete listing content, screenshots, capabilities, and reviewer instructions. Set the App Store pricing to **Free**.
 - Log in to the development store and exercise the embedded app so Shopify's two-hour App Bridge and ID-token checks receive session evidence.
-- Confirm whether Stripe invoices are exclusively physical warehouse, carrier, or fulfillment-service charges. If any charge pays for access to UnieConnect app functionality, replace that app charge with Shopify Managed Pricing or the Billing API.
-- Do not mark the AI self-review complete until the three billing requirements are resolved for the intended App Store pricing model.
+- In reviewer notes, disclose that Stripe is limited to separately ordered warehouse, carrier, and physical fulfillment services and is never used for app access.
+- The locally checkable AI self-review requirements are complete. The Partner Dashboard checkbox can be marked after the remaining manual fields above are completed and verified.
 
 ## Resources
 
